@@ -1,0 +1,27 @@
+# data
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.csv
+*.tar
+*.tar.gz
+
+# generated figures/videos
+*.png
+*.mp4
+*.gif
+
+# logs
+logs/
+*.out
+*.err
+
+# python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# environment
+.env
+.venv/
