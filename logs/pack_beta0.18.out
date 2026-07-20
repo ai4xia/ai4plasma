@@ -1,0 +1,8 @@
+beta = 0.18
+Found official runs for beta=0.18: 250
+Output: /pscratch/sd/b/binxia/VPIC_PPPL_HDF5_by_beta_official2500_lzf/VPIC_PPPL_CSV_Data_official2500_beta0.18_lzf.h5
+Compression: lzf
+Workers: 24
+Batch frames: 4
+Channels: ['Bx', 'By', 'Bz', 'Density']
+Done.
