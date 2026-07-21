@@ -1,0 +1,1 @@
+{"best_val_mse":0.005755744731016081,"_runtime":561,"epoch":20,"val/mae":0.051151637665250084,"optimization/learning_rate":0.0002,"_wandb":{"runtime":561},"train/mse":0.005566150823037216,"_timestamp":1.7846611563602273e+09,"train/mae":0.05011941739143476,"val/mse":0.005755744731016081,"_step":19}

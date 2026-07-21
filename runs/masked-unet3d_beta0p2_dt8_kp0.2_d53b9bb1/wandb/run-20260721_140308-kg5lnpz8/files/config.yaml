@@ -1,0 +1,217 @@
+_wandb:
+    value:
+        cli_version: 0.26.1
+        e:
+            31nd0o77o9a9m5h3ei3o61rwgihu7hj1:
+                codePath: train_masked_unet3d.py
+                codePathLocal: train_masked_unet3d.py
+                cpu_count: 64
+                cpu_count_logical: 128
+                cudaVersion: "13.0"
+                disk:
+                    /:
+                        total: "134865870848"
+                        used: "1886097408"
+                email: xiabin.phy@gmail.com
+                executable: /global/common/software/nersc9/pytorch/2.11.0/bin/python
+                git:
+                    commit: 85d5f67bc97502399abb515d282873b622fa10f8
+                    remote: https://github.com/Xsmos/ai4plasma.git
+                gpu: NVIDIA A100-SXM4-80GB
+                gpu_count: 4
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A100-SXM4-80GB
+                      uuid: GPU-4b7af7a1-4e3d-d0f6-44ba-2b3e75beaa6d
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A100-SXM4-80GB
+                      uuid: GPU-6e4228ab-c515-2d93-ecbd-f5ad0efd7ce7
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A100-SXM4-80GB
+                      uuid: GPU-b903ac47-507e-50c0-5b47-abd67035923b
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A100-SXM4-80GB
+                      uuid: GPU-5791ccc2-f67f-03b8-7d7e-600fcfd434ad
+                host: nid008216
+                memory:
+                    total: "269731741696"
+                os: Linux-6.4.0-150600.23.103_15.0.25-cray_shasta_c-x86_64-with-glibc2.38
+                program: /pscratch/sd/b/binxia/ai4plasma/train_masked_unet3d.py
+                python: CPython 3.12.13
+                root: /pscratch/sd/b/binxia/ai4plasma/runs/masked-unet3d_beta0p2_dt8_kp0.2_d53b9bb1
+                slurm:
+                    cluster_name: perlmutter
+                    cpus_on_node: "128"
+                    gpus_on_node: "4"
+                    gtids: "0"
+                    job_account: cusp_g
+                    job_cpus_per_node: "128"
+                    job_end_time: "1784672658"
+                    job_gid: "105704"
+                    job_gpus: 0,1,2,3
+                    job_group: binxia
+                    job_id: "56273624"
+                    job_licenses: scratch:1
+                    job_name: interactive
+                    job_nodelist: nid008216
+                    job_num_nodes: "1"
+                    job_partition: urgent_gpu_ss11
+                    job_qos: gpu_interactive
+                    job_start_time: "1784658258"
+                    job_uid: "105704"
+                    job_user: binxia
+                    jobid: "56273624"
+                    launch_node_ipaddr: 128.55.64.46
+                    localid: "0"
+                    mpi_type: cray_shasta
+                    nnodes: "1"
+                    nodeid: "0"
+                    nodelist: nid008216
+                    oom_kill_step: "0"
+                    prio_process: "0"
+                    procid: "0"
+                    pty_port: "44283"
+                    pty_win_col: "180"
+                    pty_win_row: "26"
+                    script_context: prolog_task
+                    srun_comm_host: 128.55.64.46
+                    srun_comm_port: "44583"
+                    step_id: "4294967290"
+                    step_launcher_port: "44583"
+                    step_nodelist: nid008216
+                    step_num_nodes: "1"
+                    step_num_tasks: "1"
+                    step_tasks_per_node: "1"
+                    stepid: "4294967290"
+                    stepmgr: nid008216
+                    submit_dir: /pscratch/sd/b/binxia/ai4plasma
+                    submit_host: login37
+                    task_pid: "421262"
+                    tasks_per_node: "128"
+                    topology_addr: global.group41.nid008216
+                    topology_addr_pattern: switch.switch.node
+                startedAt: "2026-07-21T19:03:08.689290Z"
+                writerId: 31nd0o77o9a9m5h3ei3o61rwgihu7hj1
+        m:
+            - "1": epoch
+              "6":
+                - 3
+              "7": []
+            - "2": val/*
+              "5": 1
+              "6":
+                - 1
+              "7": []
+            - "2": optimization/*
+              "5": 1
+              "6":
+                - 1
+              "7": []
+            - "2": train/*
+              "5": 1
+              "6":
+                - 1
+              "7": []
+        python_version: 3.12.13
+        t:
+            "1":
+                - 1
+            "2":
+                - 1
+            "3":
+                - 2
+                - 7
+                - 13
+                - 16
+                - 62
+            "4": 3.12.13
+            "5": 0.26.1
+            "12": 0.26.1
+            "13": linux-x86_64
+amp:
+    value: false
+auto_resume:
+    value: true
+base_channels:
+    value: 16
+batch_size:
+    value: 4
+betas:
+    value:
+        - 0.2
+channel_mean:
+    value:
+        - 0.002183022676035762
+        - 0.009581559337675571
+        - -0.020118316635489464
+        - 0.6015437245368958
+channel_std:
+    value:
+        - 0.2096487581729889
+        - 0.07880543917417526
+        - 0.2812931537628174
+        - 0.3957202434539795
+delta_t:
+    value: 8
+device:
+    value: cuda
+epochs:
+    value: 20
+grad_clip:
+    value: 1
+h5_dir:
+    value: $SCRATCH/VPIC_PPPL_HDF5_by_beta_official2500_none_compat
+keep_prob:
+    value: 0.2
+lr:
+    value: 0.0002
+model_parameters:
+    value: 578564
+num_total_windows:
+    value: 9650
+num_train_runs:
+    value: 225
+num_train_windows:
+    value: 8859
+num_val_runs:
+    value: 25
+num_val_windows:
+    value: 791
+num_workers:
+    value: 4
+out_dir:
+    value: null
+seed:
+    value: 1234
+stats_batches:
+    value: 50
+stride_t:
+    value: 2
+val_frac:
+    value: 0.1
+wandb:
+    value: true
+wandb_entity:
+    value: null
+wandb_group:
+    value: null
+wandb_log_model:
+    value: false
+wandb_mode:
+    value: online
+wandb_name:
+    value: null
+wandb_project:
+    value: ai4plasma
+wandb_tags:
+    value: null
+weight_decay:
+    value: 0.0001
