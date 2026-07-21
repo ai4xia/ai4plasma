@@ -2,7 +2,7 @@
 
 set -u
 
-cd /pscratch/sd/b/binxia/plasma
+cd /pscratch/sd/b/binxia/ai4plasma
 
 mkdir -p logs
 
@@ -33,7 +33,7 @@ for BETA in "${BETAS[@]}"; do
         --runs-dir /pscratch/sd/d/dcfy/VPIC_PPPL/runs \
         --out-dir "${OUT_DIR}" \
         --beta "${BETA}" \
-        --compression lzf \
+        --compression none \
         --workers 24 \
         --batch-frames 4 \
       > "logs/pack_beta${BETA}.out" \

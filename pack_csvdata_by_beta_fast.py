@@ -375,7 +375,7 @@ def main():
     ctx = mp.get_context("spawn")
 
     with ProcessPoolExecutor(max_workers=args.workers, mp_context=ctx) as pool:
-        with h5py.File(out, "a", libver="latest") as h5:
+        with h5py.File(out, "a") as h5:
             h5.attrs["description"] = f"Official VPIC PPPL runs for beta={beta_tag}; CSV_Data Bx, By, Bz, Density only"
             h5.attrs["source_runs_dir"] = str(runs_dir)
             h5.attrs["field_shape"] = "(T, 4, Nx, Nz)"
