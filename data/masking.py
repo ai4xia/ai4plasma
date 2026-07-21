@@ -39,7 +39,7 @@ def masked_mse_loss(
     eps: float = 1e-8,
 ) -> torch.Tensor:
     """
-    Loss only on hidden region.
+    MSE only on hidden region.
 
     visible_mask:
         1 = visible input
@@ -56,9 +56,32 @@ def masked_mae_loss(
     visible_mask: torch.Tensor,
     eps: float = 1e-8,
 ) -> torch.Tensor:
+    """
+    MAE only on hidden region.
+    """
     hidden_mask = 1.0 - visible_mask
     loss = torch.abs(pred - target) * hidden_mask
     return loss.sum() / (hidden_mask.sum() + eps)
+
+
+def full_mse_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """
+    MSE over all voxels, including visible and hidden regions.
+    """
+    return torch.mean((pred - target) ** 2)
+
+
+def full_mae_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """
+    MAE over all voxels, including visible and hidden regions.
+    """
+    return torch.mean(torch.abs(pred - target))
 
 
 def temporal_interpolation_mask(

@@ -16,7 +16,12 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from data.vpic_hdf5_dataset import VPICWindowDataset
-from data.masking import random_voxel_mask, make_visible_input, masked_mse_loss, masked_mae_loss
+from data.masking import (
+    random_voxel_mask,
+    make_visible_input,
+    full_mse_loss,
+    full_mae_loss,
+)
 from models.unet3d import UNet3D
 
 
@@ -309,8 +314,11 @@ def train_one_epoch(
 
         with torch.cuda.amp.autocast(enabled=(amp and device.type == "cuda")):
             pred = model(model_input)
-            loss_mse = masked_mse_loss(pred, y, mask)
-            loss_mae = masked_mae_loss(pred, y, mask)
+            # loss_mse = masked_mse_loss(pred, y, mask)
+            # loss_mae = masked_mae_loss(pred, y, mask)
+            # loss = loss_mse
+            loss_mse = full_mse_loss(pred, y)
+            loss_mae = full_mae_loss(pred, y)
             loss = loss_mse
 
         scaler.scale(loss).backward()
@@ -366,8 +374,10 @@ def validate(
 
         with torch.cuda.amp.autocast(enabled=(amp and device.type == "cuda")):
             pred = model(model_input)
-            loss_mse = masked_mse_loss(pred, y, mask)
-            loss_mae = masked_mae_loss(pred, y, mask)
+            # loss_mse = masked_mse_loss(pred, y, mask)
+            # loss_mae = masked_mae_loss(pred, y, mask)
+            loss_mse = full_mse_loss(pred, y)
+            loss_mae = full_mae_loss(pred, y)
 
         total_mse += float(loss_mse.detach().cpu())
         total_mae += float(loss_mae.detach().cpu())

@@ -12,6 +12,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 import numpy as np
 import torch
 
@@ -90,6 +91,36 @@ def parse_args():
 
     p.add_argument("--probe-nx", type=int, default=8)
     p.add_argument("--probe-nz", type=int, default=8)
+
+    p.add_argument(
+        "--plot-units",
+        type=str,
+        default="physical",
+        choices=["physical", "normalized"],
+        help=(
+            "physical: plot original/denormalized field values. "
+            "normalized: plot channel-normalized values, matching training loss units."
+        ),
+    )
+
+    p.add_argument(
+        "--field-q",
+        type=float,
+        default=99.0,
+        help="Percentile used for robust field color limits.",
+    )
+    p.add_argument(
+        "--residual-q",
+        type=float,
+        default=99.0,
+        help="Percentile used for robust residual color limits.",
+    )
+    p.add_argument(
+        "--residual-vmax",
+        type=float,
+        default=None,
+        help="Optional fixed symmetric residual color limit. If set, use [-vmax, vmax].",
+    )
 
     p.add_argument(
         "--out-dir",
@@ -178,7 +209,12 @@ def make_nan_cmap(name: str, bad_color: str = "lightgray"):
     return cmap
 
 
-def robust_limits(arrays: Sequence[np.ndarray], channel: int, q: float = 99.0):
+def robust_limits(
+    arrays: Sequence[np.ndarray],
+    channel: int,
+    q: float = 99.0,
+    symmetric: bool | None = None,
+):
     vals = []
     for a in arrays:
         aa = np.asarray(a)
@@ -191,8 +227,24 @@ def robust_limits(arrays: Sequence[np.ndarray], channel: int, q: float = 99.0):
 
     vals = np.concatenate(vals)
 
+    if symmetric is True:
+        vmax = np.nanpercentile(np.abs(vals), q)
+        if not np.isfinite(vmax) or vmax <= 0:
+            vmax = 1.0
+        return float(-vmax), float(vmax)
+
+    if symmetric is False:
+        vmin = np.nanpercentile(vals, 100.0 - q)
+        vmax = np.nanpercentile(vals, q)
+        if np.isclose(vmin, vmax):
+            vmax = vmin + 1.0
+        return float(vmin), float(vmax)
+
+    # Default behavior:
+    # Density is positive-ish, use asymmetric scale.
+    # Magnetic fields are signed, use symmetric scale.
     if channel == 3:
-        vmin = np.nanpercentile(vals, 1.0)
+        vmin = np.nanpercentile(vals, 100.0 - q)
         vmax = np.nanpercentile(vals, q)
         if np.isclose(vmin, vmax):
             vmax = vmin + 1.0
@@ -211,6 +263,7 @@ def random_visible_mask(block: torch.Tensor, keep_prob: float) -> torch.Tensor:
 def superres_visible_mask(block: torch.Tensor, factor: int = 4) -> torch.Tensor:
     """
     Keep every factor-th spatial grid point.
+
     block shape: (B, C, T, X, Z)
     """
     if factor < 1:
@@ -233,7 +286,10 @@ def temporal_interpolation_visible_mask(block: torch.Tensor, keep_every: int = 2
     return mask
 
 
-def temporal_extrapolation_visible_mask(block: torch.Tensor, num_context_frames: int | None = None) -> torch.Tensor:
+def temporal_extrapolation_visible_mask(
+    block: torch.Tensor,
+    num_context_frames: int | None = None,
+) -> torch.Tensor:
     """
     Keep first num_context_frames and hide future frames.
     """
@@ -331,7 +387,7 @@ def build_mask_patterns(
 
         elif name == "superres":
             mask = superres_visible_mask(block, factor=superres_factor)
-            label = f"Super-resolution\nspatial stride={superres_factor}"
+            label = f"Super-resolution\nstride={superres_factor}"
 
         elif name == "inpainting":
             mask = inpainting_visible_mask(
@@ -339,7 +395,7 @@ def build_mask_patterns(
                 x_frac=inpaint_x_frac,
                 z_frac=inpaint_z_frac,
             )
-            label = f"Spatial inpainting\ncentral hole"
+            label = "Spatial inpainting\ncentral hole"
 
         elif name == "interpolation":
             mask = temporal_interpolation_visible_mask(block, keep_every=interp_keep_every)
@@ -348,11 +404,11 @@ def build_mask_patterns(
         elif name == "extrapolation":
             mask = temporal_extrapolation_visible_mask(block, num_context_frames=extrap_context)
             context = extrap_context if extrap_context is not None else block.shape[2] // 2
-            label = f"Temporal extrapolation\ncontext={context} frames"
+            label = f"Temporal extrapolation\ncontext={context}"
 
         elif name == "probe":
             mask = probe_like_visible_mask(block, probe_nx=probe_nx, probe_nz=probe_nz)
-            label = f"Probe-like sparse\n{probe_nx}×{probe_nz} points"
+            label = f"Probe-like sparse\n{probe_nx}×{probe_nz}"
 
         else:
             raise ValueError(f"Unknown mask pattern: {name}")
@@ -362,106 +418,154 @@ def build_mask_patterns(
     return rows
 
 
-def compute_hidden_metrics(
+def compute_full_metrics(
     pred: np.ndarray,
     target: np.ndarray,
-    mask: np.ndarray,
 ) -> Tuple[float, float]:
     """
-    pred, target, mask are 2D arrays for one channel and one time.
-    mask: 1 visible, 0 hidden.
-    Return physical-unit RMSE and MAE over hidden region.
+    pred and target are 2D arrays for one channel and one time.
+
+    Return RMSE and MAE over all pixels, including both visible and hidden regions.
+    Units follow the plotted arrays: physical or normalized.
     """
-    hidden = mask < 0.5
-    if hidden.sum() == 0:
+    err = pred - target
+    err = err[np.isfinite(err)]
+
+    if err.size == 0:
         return float("nan"), float("nan")
 
-    err = pred[hidden] - target[hidden]
     rmse = float(np.sqrt(np.mean(err ** 2)))
     mae = float(np.mean(np.abs(err)))
     return rmse, mae
 
 
 def plot_channel_by_mask_patterns(
-    y_phys: np.ndarray,
+    y_plot: np.ndarray,
     rows: List[Dict],
     metadata: Dict,
     channel: int,
     local_time: int,
     out_path: Path,
     extent,
+    plot_units: str,
+    field_q: float = 99.0,
+    residual_q: float = 99.0,
+    residual_vmax: float | None = None,
     dpi: int = 180,
 ):
     """
-    y_phys: (C, T, X, Z)
+    y_plot: (C, T, X, Z)
 
     rows is list of dicts with:
-        name, label, pred_phys, visible_phys, mask
+        name, label, pred_plot, visible_plot, mask
     each array has shape (C, T, X, Z)
     """
     channel_name = CHANNEL_NAMES[channel]
 
     n_rows = len(rows)
-    n_cols = 4
+    n_data_cols = 4
 
-    fig, axes = plt.subplots(
-        n_rows,
-        n_cols,
-        figsize=(4.4 * n_cols, 3.2 * n_rows),
-        squeeze=False,
-        constrained_layout=True,
+    # Layout:
+    #   Target | Visible | Prediction | field cbar | Residual | residual cbar
+    # This gives one colorbar for the first three field columns and one for residuals.
+    fig = plt.figure(
+        figsize=(13.0, 2.15 * n_rows + 1.2),
+        constrained_layout=False,
     )
+
+    gs = gridspec.GridSpec(
+        nrows=n_rows,
+        ncols=6,
+        figure=fig,
+        width_ratios=[1.0, 1.0, 1.0, 0.035, 1.0, 0.035],
+        wspace=0.055,
+        hspace=0.075,
+        left=0.16,
+        right=0.965,
+        bottom=0.075,
+        top=0.90,
+    )
+
+    axes = np.empty((n_rows, n_data_cols), dtype=object)
+    base_ax = None
+
+    data_cols_to_grid_cols = [0, 1, 2, 4]
+    for r in range(n_rows):
+        for c, gcol in enumerate(data_cols_to_grid_cols):
+            if base_ax is None:
+                ax = fig.add_subplot(gs[r, gcol])
+                base_ax = ax
+            else:
+                ax = fig.add_subplot(gs[r, gcol], sharex=base_ax, sharey=base_ax)
+            axes[r, c] = ax
+
+    cax_field = fig.add_subplot(gs[:, 3])
+    cax_residual = fig.add_subplot(gs[:, 5])
 
     field_cmap = make_nan_cmap("viridis" if channel == 3 else "PuOr")
     residual_cmap = make_nan_cmap("PRGn")
 
-    target = y_phys[channel, local_time]
+    target = y_plot[channel, local_time]
 
     all_field_arrays = [target]
     all_residual_arrays = []
 
     for row in rows:
-        pred = row["pred_phys"][channel, local_time]
-        mask = row["mask"][channel, local_time]
-        residual_hidden = pred - target
-        residual_hidden = residual_hidden.copy()
-        residual_hidden[mask > 0.5] = np.nan
+        pred = row["pred_plot"][channel, local_time]
+        residual = pred - target
 
         all_field_arrays.append(pred)
-        all_residual_arrays.append(residual_hidden)
+        all_residual_arrays.append(residual)
 
-    field_vmin, field_vmax = robust_limits(all_field_arrays, channel=channel)
-    res_vmin, res_vmax = robust_limits(all_residual_arrays, channel=0)
+    field_vmin, field_vmax = robust_limits(
+        all_field_arrays,
+        channel=channel,
+        q=field_q,
+        symmetric=None,
+    )
 
-    col_titles = ["Target", "Visible input", "Prediction", "Residual, hidden only"]
+    if residual_vmax is not None:
+        res_vmin, res_vmax = -float(residual_vmax), float(residual_vmax)
+    else:
+        res_vmin, res_vmax = robust_limits(
+            all_residual_arrays,
+            channel=channel,
+            q=residual_q,
+            symmetric=True,
+        )
+
+    col_titles = ["Target", "Visible input", "Prediction", "Residual"]
+
+    field_im = None
+    residual_im = None
 
     for r, row in enumerate(rows):
         mask = row["mask"][channel, local_time]
-        visible = row["visible_phys"][channel, local_time]
-        pred = row["pred_phys"][channel, local_time]
+        visible = row["visible_plot"][channel, local_time]
+        pred = row["pred_plot"][channel, local_time]
 
-        residual_hidden = pred - target
-        residual_hidden = residual_hidden.copy()
-        residual_hidden[mask > 0.5] = np.nan
+        residual = pred - target
 
-        rmse, mae = compute_hidden_metrics(pred, target, mask)
+        rmse, mae = compute_full_metrics(pred, target)
         visible_pct = 100.0 * float(np.nanmean(mask))
 
         row_label = (
             f"{row['label']}\n"
             f"visible={visible_pct:.2f}%\n"
-            f"RMSE={rmse:.3g}, MAE={mae:.3g}"
+            f"RMSE={rmse:.3g}\n"
+            f"MAE={mae:.3g}"
         )
 
         panels = [
             (target, field_cmap, field_vmin, field_vmax),
             (visible, field_cmap, field_vmin, field_vmax),
             (pred, field_cmap, field_vmin, field_vmax),
-            (residual_hidden, residual_cmap, res_vmin, res_vmax),
+            (residual, residual_cmap, res_vmin, res_vmax),
         ]
 
         for c, (image, cmap, vmin, vmax) in enumerate(panels):
             ax = axes[r, c]
+
             im = ax.imshow(
                 image,
                 origin="lower",
@@ -473,17 +577,60 @@ def plot_channel_by_mask_patterns(
                 interpolation="nearest",
             )
 
-            if r == 0:
-                ax.set_title(col_titles[c], fontsize=12)
-
-            ax.set_xlabel("z [cm]")
-
-            if c == 0:
-                ax.set_ylabel(row_label + "\n\nx [cm]", fontsize=10)
+            if c < 3:
+                field_im = im
             else:
-                ax.set_ylabel("x [cm]")
+                residual_im = im
 
-            fig.colorbar(im, ax=ax, shrink=0.82)
+            if r == 0:
+                ax.set_title(col_titles[c], fontsize=11, pad=4)
+
+            # Only show tick labels on outer axes.
+            if r < n_rows - 1:
+                ax.tick_params(labelbottom=False)
+            if c > 0:
+                ax.tick_params(labelleft=False)
+
+            ax.tick_params(axis="both", which="both", labelsize=8, length=2.5)
+
+            # Row label on the far left, not repeated axis units.
+            if c == 0:
+                ax.text(
+                    -0.33,
+                    0.5,
+                    row_label,
+                    transform=ax.transAxes,
+                    ha="right",
+                    va="center",
+                    rotation=90,
+                    fontsize=8,
+                    linespacing=1.05,
+                )
+
+    # Shared colorbars.
+    if field_im is not None:
+        cb_field = fig.colorbar(field_im, cax=cax_field)
+        cb_field.ax.tick_params(labelsize=8, length=2.5)
+        cb_field.set_label(
+            f"{channel_name} ({plot_units})",
+            fontsize=9,
+            rotation=90,
+            labelpad=8,
+        )
+
+    if residual_im is not None:
+        cb_res = fig.colorbar(residual_im, cax=cax_residual)
+        cb_res.ax.tick_params(labelsize=8, length=2.5)
+        cb_res.set_label(
+            f"Prediction − target ({plot_units})",
+            fontsize=9,
+            rotation=90,
+            labelpad=8,
+        )
+
+    # Shared axis labels.
+    fig.text(0.545, 0.032, "z [cm]", ha="center", va="center", fontsize=10)
+    fig.text(0.055, 0.50, "x [cm]", ha="center", va="center", rotation=90, fontsize=10)
 
     run_name = metadata.get("run_name", "unknown")
     t0 = metadata.get("t0", "unknown")
@@ -495,10 +642,12 @@ def plot_channel_by_mask_patterns(
     global_frame = int(t0) + int(local_time)
 
     fig.suptitle(
-        f"{channel_name} reconstruction under different mask patterns\n"
+        f"{channel_name} reconstruction under different mask patterns "
+        f"({plot_units} units)\n"
         f"{run_name}, block t0={t0}, local t={local_time}, global frame={global_frame}, "
         f"beta={beta}, nu={nu}, Bz0={Bz0}, tau={tau}",
-        fontsize=14,
+        fontsize=12,
+        y=0.985,
     )
 
     fig.savefig(out_path, dpi=dpi)
@@ -547,6 +696,7 @@ def main():
     print("keep_prob:", keep_prob)
     print("mask_patterns:", args.mask_patterns)
     print("local_time:", args.local_time)
+    print("plot_units:", args.plot_units)
 
     dataset = VPICWindowDataset(
         h5_dir=h5_dir,
@@ -606,22 +756,38 @@ def main():
         model_input = torch.cat([x_visible_norm, mask], dim=1)
 
         pred_norm = model(model_input)
-        pred_phys = denormalize(pred_norm, mean, std)
 
-        visible_phys = y.detach().clone()
-        visible_phys[mask < 0.5] = float("nan")
+        if args.plot_units == "normalized":
+            y_plot_tensor = y_norm.detach()
+            pred_plot_tensor = pred_norm.detach()
+
+            visible_plot_tensor = y_norm.detach().clone()
+            visible_plot_tensor[mask < 0.5] = float("nan")
+
+        elif args.plot_units == "physical":
+            y_plot_tensor = y.detach()
+            pred_plot_tensor = denormalize(pred_norm, mean, std).detach()
+
+            visible_plot_tensor = y.detach().clone()
+            visible_plot_tensor[mask < 0.5] = float("nan")
+
+        else:
+            raise ValueError(f"Unknown plot_units: {args.plot_units}")
 
         rows_for_plot.append(
             {
                 "name": short_name,
                 "label": label,
                 "mask": mask[0].detach().cpu().numpy(),
-                "visible_phys": visible_phys[0].detach().cpu().numpy(),
-                "pred_phys": pred_phys[0].detach().cpu().numpy(),
+                "visible_plot": visible_plot_tensor[0].detach().cpu().numpy(),
+                "pred_plot": pred_plot_tensor[0].detach().cpu().numpy(),
             }
         )
 
-    y_np = y[0].detach().cpu().numpy()
+    if args.plot_units == "normalized":
+        y_plot_np = y_norm[0].detach().cpu().numpy()
+    else:
+        y_plot_np = y[0].detach().cpu().numpy()
 
     for ch in args.channels:
         if ch < 0 or ch >= 4:
@@ -633,17 +799,23 @@ def main():
             f"{metadata['run_name']}_"
             f"t0-{metadata['t0']}_"
             f"localt-{args.local_time}_"
-            f"{CHANNEL_NAMES[ch]}_masks_{pattern_tag}.png"
+            f"{CHANNEL_NAMES[ch]}_"
+            f"{args.plot_units}_"
+            f"masks_{pattern_tag}_compact.png"
         )
 
         plot_channel_by_mask_patterns(
-            y_phys=y_np,
+            y_plot=y_plot_np,
             rows=rows_for_plot,
             metadata=metadata,
             channel=ch,
             local_time=args.local_time,
             out_path=out_path,
             extent=args.extent,
+            plot_units=args.plot_units,
+            field_q=args.field_q,
+            residual_q=args.residual_q,
+            residual_vmax=args.residual_vmax,
             dpi=args.dpi,
         )
 
