@@ -2,27 +2,360 @@
 
 from __future__ import annotations
 
-from typing import Tuple
+import math
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
 
-def random_voxel_mask(
-    block: torch.Tensor,
-    keep_prob: float = 0.2,
-) -> torch.Tensor:
-    """
-    block: (B, C, T, X, Z)
+# Four basic mask topologies. Super-resolution, probe arrays, temporal
+# interpolation and forecasting are not separate tasks here, they are just
+# particular mask geometries covered by these four.
+MASK_PATTERNS: Tuple[str, ...] = (
+    "spatial_random",
+    "spatial_grid",
+    "spatial_block",
+    "temporal_random",
+)
 
-    Return:
-        mask with same shape.
-        1 = visible
-        0 = hidden / target to recover
-    """
-    if not (0.0 < keep_prob <= 1.0):
-        raise ValueError(f"keep_prob must be in (0, 1], got {keep_prob}")
+PATTERN_TO_ID: Dict[str, int] = {name: i for i, name in enumerate(MASK_PATTERNS)}
 
-    return (torch.rand_like(block) < keep_prob).to(block.dtype)
+# Spatial patterns keep the same observation layout for every frame of the
+# temporal window. Temporal patterns keep or hide whole frames.
+SPATIAL_MASK_PATTERNS: Tuple[str, ...] = (
+    "spatial_random",
+    "spatial_grid",
+    "spatial_block",
+)
+TEMPORAL_MASK_PATTERNS: Tuple[str, ...] = ("temporal_random",)
+
+DEFAULT_PATTERN_WEIGHTS: Dict[str, float] = {
+    "spatial_random": 1.0,
+    "spatial_grid": 1.0,
+    "spatial_block": 1.0,
+    "temporal_random": 1.0,
+}
+
+MAX_GRID_STRIDE = 32
+
+
+# ---------------------------------------------------------------------------
+# Scalar random helpers.
+#
+# All layout decisions are drawn on CPU so that mask sampling never
+# synchronizes the GPU and stays reproducible from a single CPU generator.
+# ---------------------------------------------------------------------------
+
+
+def _rand(generator: Optional[torch.Generator] = None) -> float:
+    return float(torch.rand((), generator=generator))
+
+
+def _randint(high: int, generator: Optional[torch.Generator] = None) -> int:
+    if high <= 1:
+        return 0
+    return int(torch.randint(high, (1,), generator=generator).item())
+
+
+def _log_uniform(low: float, high: float, generator: Optional[torch.Generator] = None) -> float:
+    return math.exp(math.log(low) + _rand(generator) * (math.log(high) - math.log(low)))
+
+
+def _round_clamp(value: float, low: int, high: int) -> int:
+    return int(min(max(int(round(value)), low), high))
+
+
+# ---------------------------------------------------------------------------
+# Pattern weights.
+# ---------------------------------------------------------------------------
+
+
+def parse_pattern_weights(tokens: Sequence[str]) -> Dict[str, float]:
+    """
+    Parse CLI tokens of the form:
+
+        spatial_random 1 spatial_grid 1 spatial_block 1 temporal_random 1
+
+    into a {pattern: weight} dict. Patterns that are not listed get weight 0.
+    """
+    if len(tokens) % 2 != 0:
+        raise ValueError(
+            "--mask-patterns expects alternating NAME WEIGHT tokens, "
+            f"got an odd number of tokens: {list(tokens)}"
+        )
+
+    weights: Dict[str, float] = {}
+
+    for name, raw_weight in zip(tokens[0::2], tokens[1::2]):
+        if name not in MASK_PATTERNS:
+            raise ValueError(
+                f"Unknown mask pattern {name!r}. Available: {list(MASK_PATTERNS)}"
+            )
+        if name in weights:
+            raise ValueError(f"Mask pattern {name!r} was given more than once.")
+
+        try:
+            weight = float(raw_weight)
+        except ValueError as exc:
+            raise ValueError(
+                f"Weight for mask pattern {name!r} must be a number, got {raw_weight!r}."
+            ) from exc
+
+        if weight < 0:
+            raise ValueError(f"Weight for mask pattern {name!r} must be >= 0, got {weight}.")
+
+        weights[name] = weight
+
+    if sum(weights.values()) <= 0:
+        raise ValueError("At least one mask pattern must have a positive weight.")
+
+    return weights
+
+
+def sample_patterns(
+    weights: Dict[str, float],
+    n: int,
+    generator: Optional[torch.Generator] = None,
+) -> List[str]:
+    """
+    Draw n pattern names with probabilities proportional to their weights.
+    """
+    names = [name for name in MASK_PATTERNS if weights.get(name, 0.0) > 0]
+
+    if not names:
+        raise ValueError("No mask pattern has a positive weight.")
+
+    probs = torch.tensor([weights[name] for name in names], dtype=torch.float32)
+    idx = torch.multinomial(probs, n, replacement=True, generator=generator)
+    return [names[i] for i in idx.tolist()]
+
+
+# ---------------------------------------------------------------------------
+# Per-pattern layout samplers.
+#
+# Each one returns a small CPU tensor that broadcasts to (B, C, T, X, Z):
+#   - spatial patterns return (B_or_1, C, 1, X, Z)
+#   - temporal patterns return (1, 1, T, 1, 1)
+# 1 = visible, 0 = hidden.
+# ---------------------------------------------------------------------------
+
+
+def _spatial_random_plane(B, C, X, Z, p, generator):
+    """
+    Scatter hidden voxels at random spatial locations.
+    """
+    plane = (torch.rand(B, C, 1, X, Z, generator=generator) >= p).float()
+    return plane, {}
+
+
+def _pick_grid_stride(X, Z, target_visible, generator):
+    """
+    Pick the isotropic stride whose kept fraction 1 / stride**2 is closest to
+    target_visible.
+    """
+    max_stride = max(1, min(MAX_GRID_STRIDE, max(X, Z)))
+
+    stride = torch.arange(1, max_stride + 1, dtype=torch.float32)
+    err = (1.0 / stride ** 2 - target_visible).abs()
+
+    return int(torch.argmin(err)) + 1
+
+
+def _spatial_grid_plane(B, C, X, Z, p, generator, stride=None):
+    """
+    Regular sparse spatial observations on a square grid with a random origin.
+    """
+    if stride is None:
+        # Training path: the stride follows the sampled mask fraction.
+        stride = _pick_grid_stride(X, Z, 1.0 - p, generator)
+    else:
+        # Evaluation path: a fixed, explicitly requested sampling grid.
+        stride = int(stride)
+        if stride < 1:
+            raise ValueError(f"grid stride must be >= 1, got {stride}")
+
+    offset_x = _randint(stride, generator)
+    offset_z = _randint(stride, generator)
+
+    plane = torch.zeros(1, C, 1, X, Z)
+    plane[..., offset_x::stride, offset_z::stride] = 1.0
+
+    info = {
+        "stride": stride,
+        "offset_x": offset_x,
+        "offset_z": offset_z,
+    }
+    return plane, info
+
+
+def _spatial_block_plane(B, C, X, Z, p, generator):
+    """
+    Hide one randomly placed rectangle whose area is close to p * X * Z.
+    """
+    area = p * X * Z
+    aspect = _log_uniform(1.0 / 3.0, 3.0, generator)
+
+    height = math.sqrt(area * aspect)
+    width = math.sqrt(area / aspect)
+
+    # Preserve the target area when the first guess does not fit in the box.
+    if height > X:
+        height = float(X)
+        width = area / height
+    if width > Z:
+        width = float(Z)
+        height = min(float(X), area / width)
+
+    hx = _round_clamp(height, 0, X)
+    hz = _round_clamp(width, 0, Z)
+
+    x0 = _randint(X - hx + 1, generator)
+    z0 = _randint(Z - hz + 1, generator)
+
+    plane = torch.ones(1, C, 1, X, Z)
+    plane[..., x0 : x0 + hx, z0 : z0 + hz] = 0.0
+
+    info = {
+        "rect_x0": x0,
+        "rect_z0": z0,
+        "rect_height": hx,
+        "rect_width": hz,
+    }
+    return plane, info
+
+
+def _temporal_random_frames(T, p, generator):
+    """
+    Keep a random subset of frames. The whole spatial field is observed on a
+    visible frame and fully hidden otherwise. The visible frames can be
+    scattered, contiguous, or anything in between.
+    """
+    n_visible = _round_clamp((1.0 - p) * T, 0, T)
+
+    visible = torch.randperm(T, generator=generator)[:n_visible]
+    visible, _ = torch.sort(visible)
+
+    tmask = torch.zeros(1, 1, T, 1, 1)
+    tmask[0, 0, visible, 0, 0] = 1.0
+
+    info = {
+        "num_visible_frames": int(n_visible),
+        "visible_frames": [int(t) for t in visible.tolist()],
+    }
+    return tmask, info
+
+
+# ---------------------------------------------------------------------------
+# Public mask API.
+# ---------------------------------------------------------------------------
+
+
+def sample_mask(
+    shape: Sequence[int],
+    pattern: str,
+    mask_fraction: float,
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.float32,
+    generator: Optional[torch.Generator] = None,
+    grid_stride: Optional[int] = None,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """
+    Sample one mask for a (B, C, T, X, Z) block.
+
+    Parameters
+    ----------
+    pattern:
+        One of MASK_PATTERNS.
+
+    mask_fraction:
+        Target fraction of hidden voxels, so the visible fraction is
+        approximately 1 - mask_fraction. Discrete patterns only approximate it.
+
+    generator:
+        Optional CPU torch.Generator. Every random decision is drawn from it,
+        which makes masks reproducible and independent of the device.
+
+    grid_stride:
+        Optional stride that pins the spatial_grid sampling lattice instead of
+        deriving it from mask_fraction. The grid offset stays random. Intended
+        for evaluation; training leaves this at None.
+
+    Returns
+    -------
+    mask:
+        (B, C, T, X, Z) tensor on `device`. 1 = visible, 0 = hidden.
+
+    info:
+        Debug/logging metadata: pattern, target and actual mask fraction, plus
+        pattern-specific layout parameters.
+    """
+    if pattern not in MASK_PATTERNS:
+        raise ValueError(f"Unknown mask pattern {pattern!r}. Available: {list(MASK_PATTERNS)}")
+
+    if len(shape) != 5:
+        raise ValueError(f"Expected a (B, C, T, X, Z) shape, got {tuple(shape)}")
+
+    B, C, T, X, Z = (int(s) for s in shape)
+    p = float(mask_fraction)
+
+    if pattern == "spatial_random":
+        small, info = _spatial_random_plane(B, C, X, Z, p, generator)
+    elif pattern == "spatial_grid":
+        small, info = _spatial_grid_plane(B, C, X, Z, p, generator, stride=grid_stride)
+    elif pattern == "spatial_block":
+        small, info = _spatial_block_plane(B, C, X, Z, p, generator)
+    elif pattern == "temporal_random":
+        small, info = _temporal_random_frames(T, p, generator)
+    else:
+        raise ValueError(f"Unhandled mask pattern {pattern!r}")
+
+    info["pattern"] = pattern
+    info["target_mask_fraction"] = p
+    # The small tensor broadcasts over the omitted dimensions, so its mean is
+    # already the exact mask fraction of the expanded tensor. Measuring it here
+    # keeps the measurement on CPU.
+    info["actual_mask_fraction"] = float(1.0 - small.mean().item())
+
+    mask = small.to(device=device, dtype=dtype).expand(B, C, T, X, Z).contiguous()
+    return mask, info
+
+
+def sample_batch_masks(
+    shape: Sequence[int],
+    patterns: Sequence[str],
+    mask_fractions: Sequence[float],
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.float32,
+    generator: Optional[torch.Generator] = None,
+) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
+    """
+    Sample one independent mask per batch element, so a single batch can mix
+    patterns, mask fractions and layouts.
+    """
+    B, C, T, X, Z = (int(s) for s in shape)
+
+    if len(patterns) != B or len(mask_fractions) != B:
+        raise ValueError(
+            f"Expected {B} patterns and {B} mask fractions, "
+            f"got {len(patterns)} and {len(mask_fractions)}."
+        )
+
+    masks = []
+    infos = []
+
+    for i in range(B):
+        mask, info = sample_mask(
+            (1, C, T, X, Z),
+            pattern=patterns[i],
+            mask_fraction=float(mask_fractions[i]),
+            device=device,
+            dtype=dtype,
+            generator=generator,
+        )
+        masks.append(mask)
+        infos.append(info)
+
+    return torch.cat(masks, dim=0), infos
 
 
 def make_visible_input(
@@ -30,6 +363,11 @@ def make_visible_input(
     mask: torch.Tensor,
 ) -> torch.Tensor:
     return block * mask
+
+
+# ---------------------------------------------------------------------------
+# Losses.
+# ---------------------------------------------------------------------------
 
 
 def masked_mse_loss(
@@ -82,35 +420,6 @@ def full_mae_loss(
     MAE over all voxels, including visible and hidden regions.
     """
     return torch.mean(torch.abs(pred - target))
-
-
-def temporal_interpolation_mask(
-    block: torch.Tensor,
-    keep_every: int = 2,
-) -> torch.Tensor:
-    if keep_every < 1:
-        raise ValueError(f"keep_every must be >= 1, got {keep_every}")
-
-    mask = torch.zeros_like(block)
-    mask[:, :, ::keep_every, :, :] = 1.0
-    return mask
-
-
-def future_extrapolation_mask(
-    block: torch.Tensor,
-    num_context_frames: int,
-) -> torch.Tensor:
-    B, C, T, X, Z = block.shape
-
-    if not (1 <= num_context_frames < T):
-        raise ValueError(
-            f"num_context_frames must be in [1, T-1], "
-            f"got {num_context_frames}, T={T}"
-        )
-
-    mask = torch.zeros_like(block)
-    mask[:, :, :num_context_frames, :, :] = 1.0
-    return mask
 
 
 def channel_completion_mask(

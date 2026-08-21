@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 from data.vpic_hdf5_dataset import VPICWindowDataset
-from data.masking import random_voxel_mask, make_visible_input
+from data.masking import MASK_PATTERNS, make_visible_input, sample_mask
 from models.unet3d import UNet3D
 
 
@@ -30,7 +30,7 @@ def parse_args():
     p.add_argument(
         "--run-dir",
         type=str,
-        default="runs/masked-unet3d_beta0p2_dt8_kp0.2_d53b9bb1",
+        required=True,
         help="Training run directory containing best.pt, stats.json, split.json.",
     )
     p.add_argument(
@@ -48,7 +48,31 @@ def parse_args():
 
     p.add_argument("--sample-index", type=int, default=0)
     p.add_argument("--seed", type=int, default=1234)
-    p.add_argument("--keep-prob", type=float, default=None)
+    p.add_argument(
+        "--mask-fraction",
+        type=float,
+        default=0.8,
+        help=(
+            "Target fraction of hidden voxels for the spatial_random and "
+            "temporal_random rows. Visible fraction is about 1 - this value. "
+            "spatial_grid and spatial_block use their own settings below."
+        ),
+    )
+    p.add_argument(
+        "--block-fraction",
+        type=float,
+        default=0.5,
+        help=(
+            "Spatial area covered by the spatial_block rectangle. Position and "
+            "aspect ratio stay random."
+        ),
+    )
+    p.add_argument(
+        "--grid-stride",
+        type=int,
+        default=4,
+        help="Fixed spatial_grid stride. The grid offset stays random.",
+    )
 
     p.add_argument(
         "--channels",
@@ -67,30 +91,10 @@ def parse_args():
         "--mask-patterns",
         type=str,
         nargs="+",
-        default=["random", "superres", "inpainting", "extrapolation", "probe"],
-        choices=["random", "superres", "inpainting", "interpolation", "extrapolation", "probe"],
+        default=list(MASK_PATTERNS),
+        choices=list(MASK_PATTERNS),
         help="Rows to show in the figure.",
     )
-
-    p.add_argument("--superres-factor", type=int, default=4)
-    p.add_argument("--interp-keep-every", type=int, default=2)
-    p.add_argument("--extrap-context", type=int, default=None)
-
-    p.add_argument(
-        "--inpaint-x-frac",
-        type=float,
-        default=0.45,
-        help="Fraction of x dimension to hide for central inpainting mask.",
-    )
-    p.add_argument(
-        "--inpaint-z-frac",
-        type=float,
-        default=0.45,
-        help="Fraction of z dimension to hide for central inpainting mask.",
-    )
-
-    p.add_argument("--probe-nx", type=int, default=8)
-    p.add_argument("--probe-nz", type=int, default=8)
 
     p.add_argument(
         "--plot-units",
@@ -256,164 +260,63 @@ def robust_limits(
     return float(-vmax), float(vmax)
 
 
-def random_visible_mask(block: torch.Tensor, keep_prob: float) -> torch.Tensor:
-    return random_voxel_mask(block, keep_prob=keep_prob)
-
-
-def superres_visible_mask(block: torch.Tensor, factor: int = 4) -> torch.Tensor:
+def format_mask_label(info: Dict) -> str:
     """
-    Keep every factor-th spatial grid point.
-
-    block shape: (B, C, T, X, Z)
+    Short human readable description of one sampled mask layout.
     """
-    if factor < 1:
-        raise ValueError(f"factor must be >= 1, got {factor}")
+    pattern = info["pattern"]
 
-    mask = torch.zeros_like(block)
-    mask[:, :, :, ::factor, ::factor] = 1.0
-    return mask
-
-
-def temporal_interpolation_visible_mask(block: torch.Tensor, keep_every: int = 2) -> torch.Tensor:
-    """
-    Keep every keep_every-th time frame.
-    """
-    if keep_every < 1:
-        raise ValueError(f"keep_every must be >= 1, got {keep_every}")
-
-    mask = torch.zeros_like(block)
-    mask[:, :, ::keep_every, :, :] = 1.0
-    return mask
-
-
-def temporal_extrapolation_visible_mask(
-    block: torch.Tensor,
-    num_context_frames: int | None = None,
-) -> torch.Tensor:
-    """
-    Keep first num_context_frames and hide future frames.
-    """
-    B, C, T, X, Z = block.shape
-
-    if num_context_frames is None:
-        num_context_frames = max(1, T // 2)
-
-    if not (1 <= num_context_frames < T):
-        raise ValueError(
-            f"num_context_frames must be in [1, T-1], got {num_context_frames}, T={T}"
+    if pattern == "spatial_random":
+        detail = "independent voxels"
+    elif pattern == "spatial_grid":
+        detail = (
+            f"stride={info['stride']}×{info['stride']}\n"
+            f"offset=({info['offset_x']}, {info['offset_z']})"
         )
+    elif pattern == "spatial_block":
+        detail = (
+            f"hole={100.0 * info['target_mask_fraction']:.0f}%\n"
+            f"{info['rect_height']}×{info['rect_width']} "
+            f"at ({info['rect_x0']}, {info['rect_z0']})"
+        )
+    elif pattern == "temporal_random":
+        detail = f"frames={info['visible_frames']}"
+    else:
+        detail = ""
 
-    mask = torch.zeros_like(block)
-    mask[:, :, :num_context_frames, :, :] = 1.0
-    return mask
-
-
-def inpainting_visible_mask(
-    block: torch.Tensor,
-    x_frac: float = 0.45,
-    z_frac: float = 0.45,
-) -> torch.Tensor:
-    """
-    Hide a central spatial rectangle, keep everything else.
-    """
-    B, C, T, X, Z = block.shape
-
-    if not (0.0 < x_frac < 1.0):
-        raise ValueError(f"x_frac must be in (0, 1), got {x_frac}")
-    if not (0.0 < z_frac < 1.0):
-        raise ValueError(f"z_frac must be in (0, 1), got {z_frac}")
-
-    mask = torch.ones_like(block)
-
-    hx = max(1, int(round(X * x_frac)))
-    hz = max(1, int(round(Z * z_frac)))
-
-    x0 = (X - hx) // 2
-    z0 = (Z - hz) // 2
-
-    mask[:, :, :, x0 : x0 + hx, z0 : z0 + hz] = 0.0
-    return mask
-
-
-def probe_like_visible_mask(
-    block: torch.Tensor,
-    probe_nx: int = 8,
-    probe_nz: int = 8,
-) -> torch.Tensor:
-    """
-    Keep a sparse fixed grid of probe points for all channels and all times.
-
-    This is not meant to be the final experimental geometry;
-    it is a simple probe-like structured sparse mask.
-    """
-    B, C, T, X, Z = block.shape
-
-    probe_nx = max(1, min(probe_nx, X))
-    probe_nz = max(1, min(probe_nz, Z))
-
-    xs = torch.linspace(0, X - 1, probe_nx, device=block.device).round().long()
-    zs = torch.linspace(0, Z - 1, probe_nz, device=block.device).round().long()
-
-    mask = torch.zeros_like(block)
-    for ix in xs:
-        for iz in zs:
-            mask[:, :, :, ix, iz] = 1.0
-
-    return mask
+    return f"{pattern}\n{detail}"
 
 
 def build_mask_patterns(
     block: torch.Tensor,
     patterns: Sequence[str],
-    keep_prob: float,
-    superres_factor: int,
-    interp_keep_every: int,
-    extrap_context: int | None,
-    inpaint_x_frac: float,
-    inpaint_z_frac: float,
-    probe_nx: int,
-    probe_nz: int,
+    mask_fraction: float,
+    block_fraction: float,
+    grid_stride: int,
+    generator: torch.Generator,
 ) -> List[Tuple[str, str, torch.Tensor]]:
     """
     Return list of:
         (short_name, display_label, visible_mask)
+
+    Masks come from data.masking so that the figure shows the same mask family
+    the model was trained on. spatial_grid and spatial_block are pinned to a
+    standard, interpretable benchmark geometry instead of following the shared
+    mask fraction; their position and grid offset stay random.
     """
     rows = []
 
     for name in patterns:
-        if name == "random":
-            mask = random_visible_mask(block, keep_prob=keep_prob)
-            label = f"Random voxel\nkeep={keep_prob:.2f}"
-
-        elif name == "superres":
-            mask = superres_visible_mask(block, factor=superres_factor)
-            label = f"Super-resolution\nstride={superres_factor}"
-
-        elif name == "inpainting":
-            mask = inpainting_visible_mask(
-                block,
-                x_frac=inpaint_x_frac,
-                z_frac=inpaint_z_frac,
-            )
-            label = "Spatial inpainting\ncentral hole"
-
-        elif name == "interpolation":
-            mask = temporal_interpolation_visible_mask(block, keep_every=interp_keep_every)
-            label = f"Temporal interpolation\nkeep every {interp_keep_every}"
-
-        elif name == "extrapolation":
-            mask = temporal_extrapolation_visible_mask(block, num_context_frames=extrap_context)
-            context = extrap_context if extrap_context is not None else block.shape[2] // 2
-            label = f"Temporal extrapolation\ncontext={context}"
-
-        elif name == "probe":
-            mask = probe_like_visible_mask(block, probe_nx=probe_nx, probe_nz=probe_nz)
-            label = f"Probe-like sparse\n{probe_nx}×{probe_nz}"
-
-        else:
-            raise ValueError(f"Unknown mask pattern: {name}")
-
-        rows.append((name, label, mask))
+        mask, info = sample_mask(
+            block.shape,
+            pattern=name,
+            mask_fraction=block_fraction if name == "spatial_block" else mask_fraction,
+            device=block.device,
+            dtype=block.dtype,
+            generator=generator,
+            grid_stride=grid_stride if name == "spatial_grid" else None,
+        )
+        rows.append((name, format_mask_label(info), mask))
 
     return rows
 
@@ -448,6 +351,7 @@ def plot_channel_by_mask_patterns(
     out_path: Path,
     extent,
     plot_units: str,
+    mask_fraction: float,
     field_q: float = 99.0,
     residual_q: float = 99.0,
     residual_vmax: float | None = None,
@@ -643,7 +547,7 @@ def plot_channel_by_mask_patterns(
 
     fig.suptitle(
         f"{channel_name} reconstruction under different mask patterns "
-        f"({plot_units} units)\n"
+        f"({plot_units} units, p={mask_fraction:g} for the spatial_random and temporal_random rows)\n"
         f"{run_name}, block t0={t0}, local t={local_time}, global frame={global_frame}, "
         f"beta={beta}, nu={nu}, Bz0={Bz0}, tau={tau}",
         fontsize=12,
@@ -683,7 +587,6 @@ def main():
     delta_t = int(ckpt_args.get("delta_t", ckpt_args.get("delta-t", 8)))
     stride_t = int(ckpt_args.get("stride_t", ckpt_args.get("stride-t", 2)))
     base_channels = int(ckpt_args.get("base_channels", ckpt_args.get("base-channels", 16)))
-    keep_prob = float(args.keep_prob if args.keep_prob is not None else ckpt_args.get("keep_prob", 0.2))
 
     if not (0 <= args.local_time < delta_t):
         raise ValueError(f"--local-time must be in [0, {delta_t - 1}], got {args.local_time}")
@@ -693,7 +596,9 @@ def main():
     print("delta_t:", delta_t)
     print("stride_t:", stride_t)
     print("base_channels:", base_channels)
-    print("keep_prob:", keep_prob)
+    print("mask_fraction:", args.mask_fraction)
+    print("block_fraction:", args.block_fraction)
+    print("grid_stride:", args.grid_stride)
     print("mask_patterns:", args.mask_patterns)
     print("local_time:", args.local_time)
     print("plot_units:", args.plot_units)
@@ -723,10 +628,6 @@ def main():
 
     y_norm = normalize(y, mean, std)
 
-    torch.manual_seed(args.seed)
-    if device.type == "cuda":
-        torch.cuda.manual_seed_all(args.seed)
-
     model = UNet3D(
         in_channels=8,
         out_channels=4,
@@ -736,17 +637,16 @@ def main():
     model.load_state_dict(ckpt["model"])
     model.eval()
 
+    generator = torch.Generator()
+    generator.manual_seed(args.seed)
+
     mask_rows = build_mask_patterns(
         block=y_norm,
         patterns=args.mask_patterns,
-        keep_prob=keep_prob,
-        superres_factor=args.superres_factor,
-        interp_keep_every=args.interp_keep_every,
-        extrap_context=args.extrap_context,
-        inpaint_x_frac=args.inpaint_x_frac,
-        inpaint_z_frac=args.inpaint_z_frac,
-        probe_nx=args.probe_nx,
-        probe_nz=args.probe_nz,
+        mask_fraction=args.mask_fraction,
+        block_fraction=args.block_fraction,
+        grid_stride=args.grid_stride,
+        generator=generator,
     )
 
     rows_for_plot = []
@@ -801,6 +701,7 @@ def main():
             f"localt-{args.local_time}_"
             f"{CHANNEL_NAMES[ch]}_"
             f"{args.plot_units}_"
+            f"mf{args.mask_fraction:g}_"
             f"masks_{pattern_tag}_compact.png"
         )
 
@@ -813,6 +714,7 @@ def main():
             out_path=out_path,
             extent=args.extent,
             plot_units=args.plot_units,
+            mask_fraction=args.mask_fraction,
             field_q=args.field_q,
             residual_q=args.residual_q,
             residual_vmax=args.residual_vmax,

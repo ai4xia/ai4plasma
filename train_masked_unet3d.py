@@ -17,10 +17,15 @@ from tqdm import tqdm
 
 from data.vpic_hdf5_dataset import VPICWindowDataset
 from data.masking import (
-    random_voxel_mask,
-    make_visible_input,
-    full_mse_loss,
+    DEFAULT_PATTERN_WEIGHTS,
+    MASK_PATTERNS,
+    PATTERN_TO_ID,
     full_mae_loss,
+    full_mse_loss,
+    make_visible_input,
+    parse_pattern_weights,
+    sample_batch_masks,
+    sample_patterns,
 )
 from models.unet3d import UNet3D
 
@@ -43,8 +48,40 @@ def parse_args():
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
 
-    p.add_argument("--keep-prob", type=float, default=0.2)
     p.add_argument("--base-channels", type=int, default=16)
+
+    p.add_argument(
+        "--mask-patterns",
+        type=str,
+        nargs="+",
+        default=None,
+        metavar="NAME WEIGHT",
+        help=(
+            "Alternating mask pattern names and sampling weights, for example "
+            "`--mask-patterns spatial_random 2 spatial_grid 1`. Patterns that are "
+            "not listed are never sampled. Available patterns: "
+            f"{', '.join(MASK_PATTERNS)}. Default: "
+            + " ".join(f"{k} {v:g}" for k, v in DEFAULT_PATTERN_WEIGHTS.items())
+        ),
+    )
+
+    p.add_argument(
+        "--val-patterns",
+        type=str,
+        nargs="+",
+        default=list(MASK_PATTERNS),
+        choices=list(MASK_PATTERNS),
+        help="Mask patterns evaluated separately during validation.",
+    )
+    p.add_argument(
+        "--val-mask-seed",
+        type=int,
+        default=4321,
+        help=(
+            "Seed for validation masks. Masks are keyed by (pattern, batch index), "
+            "so every epoch sees the same validation masks."
+        ),
+    )
 
     p.add_argument("--val-frac", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=1234)
@@ -105,7 +142,16 @@ def parse_args():
     )
     p.set_defaults(auto_resume=True)
 
-    return p.parse_args()
+    args = p.parse_args()
+
+    # Normalized weights are what training actually consumes, and what resume
+    # compatibility is checked against. The raw token list is kept for the record.
+    if args.mask_patterns is None:
+        args.mask_pattern_weights = dict(DEFAULT_PATTERN_WEIGHTS)
+    else:
+        args.mask_pattern_weights = parse_pattern_weights(args.mask_patterns)
+
+    return args
 
 
 def expand_path(path: str) -> Path:
@@ -130,7 +176,7 @@ def default_run_name(args) -> str:
     ).hexdigest()[:8]
     return (
         f"masked-unet3d_beta{beta_text}_dt{args.delta_t}_"
-        f"kp{args.keep_prob:g}_{signature}"
+        f"bc{args.base_channels}_fourmask_{signature}"
     )
 
 
@@ -173,7 +219,9 @@ RESUME_PARAMETER_KEYS = (
     "batch_size",
     "lr",
     "weight_decay",
-    "keep_prob",
+    "mask_pattern_weights",
+    "val_patterns",
+    "val_mask_seed",
     "base_channels",
     "val_frac",
     "seed",
@@ -184,6 +232,15 @@ RESUME_PARAMETER_KEYS = (
 
 
 def validate_resume_parameters(args, checkpoint_args: Dict[str, Any]) -> None:
+    if "mask_pattern_weights" not in checkpoint_args:
+        raise ValueError(
+            "Refusing to auto-resume: this checkpoint predates multi-pattern masking "
+            "and was trained with a single random mask at a fixed keep probability "
+            f"(keep_prob={checkpoint_args.get('keep_prob')!r}). Its masking behaviour "
+            "cannot be reproduced by the current code. Train into a fresh --out-dir, "
+            "or pass --no-auto-resume to start over."
+        )
+
     mismatches = []
     for key in RESUME_PARAMETER_KEYS:
         old_value = checkpoint_args.get(key)
@@ -287,25 +344,48 @@ def train_one_epoch(
     device: torch.device,
     mean: torch.Tensor,
     std: torch.Tensor,
-    keep_prob: float,
+    pattern_weights: Dict[str, float],
     amp: bool,
     grad_clip: float,
-) -> Dict[str, float]:
+    postfix_every: int = 50,
+) -> Dict[str, Any]:
     model.train()
 
-    total_mse = 0.0
-    total_mae = 0.0
+    n_patterns = len(MASK_PATTERNS)
+
+    # Accumulate on device and read back once per epoch, so per-pattern logging
+    # does not synchronize the GPU on every step.
+    sum_mse = torch.zeros((), device=device)
+    sum_mae = torch.zeros((), device=device)
+    sum_mse_by_pattern = torch.zeros(n_patterns, device=device)
+    sum_actual_by_pattern = torch.zeros(n_patterns, device=device)
+    count_by_pattern = torch.zeros(n_patterns, device=device)
+
+    sum_target_fraction = 0.0
+    count_samples = 0
     total_batches = 0
 
     scaler = torch.cuda.amp.GradScaler(enabled=(amp and device.type == "cuda"))
 
     pbar = tqdm(loader, desc="Train", leave=False)
 
-    for batch in pbar:
+    for step, batch in enumerate(pbar):
         y = batch["block"].to(device, non_blocking=True)
         y = normalize(y, mean, std)
 
-        mask = random_voxel_mask(y, keep_prob=keep_prob)
+        batch_size = y.shape[0]
+
+        patterns = sample_patterns(pattern_weights, batch_size)
+        fractions = torch.rand(batch_size).tolist()
+
+        mask, _ = sample_batch_masks(
+            y.shape,
+            patterns=patterns,
+            mask_fractions=fractions,
+            device=device,
+            dtype=y.dtype,
+        )
+
         x_visible = make_visible_input(y, mask)
 
         model_input = torch.cat([x_visible, mask], dim=1)  # (B, 8, T, X, Z)
@@ -314,9 +394,6 @@ def train_one_epoch(
 
         with torch.cuda.amp.autocast(enabled=(amp and device.type == "cuda")):
             pred = model(model_input)
-            # loss_mse = masked_mse_loss(pred, y, mask)
-            # loss_mae = masked_mae_loss(pred, y, mask)
-            # loss = loss_mse
             loss_mse = full_mse_loss(pred, y)
             loss_mae = full_mae_loss(pred, y)
             loss = loss_mse
@@ -330,19 +407,66 @@ def train_one_epoch(
         scaler.step(optimizer)
         scaler.update()
 
-        total_mse += float(loss_mse.detach().cpu())
-        total_mae += float(loss_mae.detach().cpu())
+        with torch.no_grad():
+            pattern_ids = torch.tensor(
+                [PATTERN_TO_ID[name] for name in patterns],
+                device=device,
+            )
+            per_sample_mse = (pred.detach().float() - y).pow(2).flatten(1).mean(1)
+            per_sample_actual = 1.0 - mask.flatten(1).mean(1)
+
+            sum_mse_by_pattern.index_add_(0, pattern_ids, per_sample_mse)
+            sum_actual_by_pattern.index_add_(0, pattern_ids, per_sample_actual)
+            count_by_pattern.index_add_(0, pattern_ids, torch.ones_like(per_sample_mse))
+
+            sum_mse += loss_mse.detach().float()
+            sum_mae += loss_mae.detach().float()
+
+        sum_target_fraction += sum(fractions)
+        count_samples += batch_size
         total_batches += 1
 
-        pbar.set_postfix(
-            mse=total_mse / total_batches,
-            mae=total_mae / total_batches,
-        )
+        if step % postfix_every == 0:
+            pbar.set_postfix(
+                mse=float(sum_mse) / total_batches,
+                mae=float(sum_mae) / total_batches,
+            )
+
+    counts = count_by_pattern.cpu()
+    mse_by_pattern = (sum_mse_by_pattern.cpu() / counts.clamp(min=1.0)).tolist()
+    actual_by_pattern = (sum_actual_by_pattern.cpu() / counts.clamp(min=1.0)).tolist()
+    counts = counts.tolist()
+
+    per_pattern = {
+        name: {
+            "mse": mse_by_pattern[i],
+            "actual_mask_fraction": actual_by_pattern[i],
+            "share": counts[i] / max(count_samples, 1),
+        }
+        for i, name in enumerate(MASK_PATTERNS)
+        if counts[i] > 0
+    }
+
+    total_count = max(count_samples, 1)
 
     return {
-        "mse": total_mse / max(total_batches, 1),
-        "mae": total_mae / max(total_batches, 1),
+        "mse": float(sum_mse) / max(total_batches, 1),
+        "mae": float(sum_mae) / max(total_batches, 1),
+        "target_mask_fraction": sum_target_fraction / total_count,
+        "actual_mask_fraction": float(sum_actual_by_pattern.sum().cpu()) / total_count,
+        "per_pattern": per_pattern,
     }
+
+
+def val_mask_seed(base_seed: int, pattern: str, batch_index: int) -> int:
+    """
+    Deterministic seed per (pattern, validation batch).
+
+    The validation loader is unshuffled, so the same batch gets the same mask in
+    every epoch and the validation curves are not dominated by mask noise.
+    """
+    seed = base_seed * 1_000_003 + PATTERN_TO_ID[pattern] * 9_176 + batch_index
+    return seed % (2 ** 31)
 
 
 @torch.no_grad()
@@ -352,41 +476,72 @@ def validate(
     device: torch.device,
     mean: torch.Tensor,
     std: torch.Tensor,
-    keep_prob: float,
+    patterns: List[str],
+    mask_seed: int,
     amp: bool,
-) -> Dict[str, float]:
+) -> Dict[str, Dict[str, float]]:
+    """
+    Evaluate every mask pattern on the same validation blocks.
+
+    The loader is iterated once and each block is reused for all patterns, so
+    the extra cost is forward passes rather than repeated HDF5 reads.
+    """
     model.eval()
 
-    total_mse = 0.0
-    total_mae = 0.0
-    total_batches = 0
+    sums = torch.zeros(len(patterns), 2, device=device)
+    counts = torch.zeros(len(patterns), device=device)
 
     pbar = tqdm(loader, desc="Val", leave=False)
 
-    for batch in pbar:
+    for batch_index, batch in enumerate(pbar):
         y = batch["block"].to(device, non_blocking=True)
         y = normalize(y, mean, std)
 
-        mask = random_voxel_mask(y, keep_prob=keep_prob)
-        x_visible = make_visible_input(y, mask)
+        batch_size = y.shape[0]
 
-        model_input = torch.cat([x_visible, mask], dim=1)
+        for i, pattern in enumerate(patterns):
+            generator = torch.Generator()
+            generator.manual_seed(val_mask_seed(mask_seed, pattern, batch_index))
 
-        with torch.cuda.amp.autocast(enabled=(amp and device.type == "cuda")):
-            pred = model(model_input)
-            # loss_mse = masked_mse_loss(pred, y, mask)
-            # loss_mae = masked_mae_loss(pred, y, mask)
-            loss_mse = full_mse_loss(pred, y)
-            loss_mae = full_mae_loss(pred, y)
+            fractions = torch.rand(batch_size, generator=generator).tolist()
 
-        total_mse += float(loss_mse.detach().cpu())
-        total_mae += float(loss_mae.detach().cpu())
-        total_batches += 1
+            mask, _ = sample_batch_masks(
+                y.shape,
+                patterns=[pattern] * batch_size,
+                mask_fractions=fractions,
+                device=device,
+                dtype=y.dtype,
+                generator=generator,
+            )
 
-    return {
-        "mse": total_mse / max(total_batches, 1),
-        "mae": total_mae / max(total_batches, 1),
+            model_input = torch.cat([make_visible_input(y, mask), mask], dim=1)
+
+            with torch.cuda.amp.autocast(enabled=(amp and device.type == "cuda")):
+                pred = model(model_input)
+                loss_mse = full_mse_loss(pred, y)
+                loss_mae = full_mae_loss(pred, y)
+
+            sums[i, 0] += loss_mse.detach().float() * batch_size
+            sums[i, 1] += loss_mae.detach().float() * batch_size
+            counts[i] += batch_size
+
+    sums = sums.cpu()
+    counts = counts.cpu().clamp(min=1.0)
+
+    metrics = {
+        pattern: {
+            "mse": float(sums[i, 0] / counts[i]),
+            "mae": float(sums[i, 1] / counts[i]),
+        }
+        for i, pattern in enumerate(patterns)
     }
+
+    metrics["mean"] = {
+        "mse": sum(metrics[pattern]["mse"] for pattern in patterns) / len(patterns),
+        "mae": sum(metrics[pattern]["mae"] for pattern in patterns) / len(patterns),
+    }
+
+    return metrics
 
 
 def save_checkpoint(
@@ -424,6 +579,8 @@ def main():
     print("HDF5 dir:", h5_dir)
     print("Output dir:", out_dir)
     print("Betas:", args.betas)
+    print("Mask pattern weights:", args.mask_pattern_weights)
+    print("Validation mask patterns:", args.val_patterns)
 
     dataset = VPICWindowDataset(
         h5_dir=h5_dir,
@@ -568,6 +725,8 @@ def main():
         wandb_run.define_metric("epoch")
         wandb_run.define_metric("train/*", step_metric="epoch")
         wandb_run.define_metric("val/*", step_metric="epoch")
+        wandb_run.define_metric("mask/*", step_metric="epoch")
+        wandb_run.define_metric("mask_pattern/*", step_metric="epoch")
         wandb_run.define_metric("optimization/*", step_metric="epoch")
 
     history = []
@@ -587,7 +746,7 @@ def main():
             device=device,
             mean=mean,
             std=std,
-            keep_prob=args.keep_prob,
+            pattern_weights=args.mask_pattern_weights,
             amp=args.amp,
             grad_clip=args.grad_clip,
         )
@@ -598,7 +757,8 @@ def main():
             device=device,
             mean=mean,
             std=std,
-            keep_prob=args.keep_prob,
+            patterns=args.val_patterns,
+            mask_seed=args.val_mask_seed,
             amp=args.amp,
         )
 
@@ -606,28 +766,56 @@ def main():
             "epoch": epoch,
             "train_mse": train_metrics["mse"],
             "train_mae": train_metrics["mae"],
-            "val_mse": val_metrics["mse"],
-            "val_mae": val_metrics["mae"],
+            "val_mse": val_metrics["mean"]["mse"],
+            "val_mae": val_metrics["mean"]["mae"],
+            "train_mask_target_fraction": train_metrics["target_mask_fraction"],
+            "train_mask_actual_fraction": train_metrics["actual_mask_fraction"],
+            "train_per_pattern": train_metrics["per_pattern"],
+            "val_per_pattern": {
+                pattern: val_metrics[pattern] for pattern in args.val_patterns
+            },
         }
         history.append(row)
 
         if wandb_run is not None:
-            wandb_run.log(
-                {
-                    "epoch": epoch,
-                    "train/mse": row["train_mse"],
-                    "train/mae": row["train_mae"],
-                    "val/mse": row["val_mse"],
-                    "val/mae": row["val_mae"],
-                    "optimization/learning_rate": optimizer.param_groups[0]["lr"],
-                }
-            )
+            log_data = {
+                "epoch": epoch,
+                "train/mse": row["train_mse"],
+                "train/mae": row["train_mae"],
+                "val/mse": row["val_mse"],
+                "val/mae": row["val_mae"],
+                "val/mean/mse": row["val_mse"],
+                "val/mean/mae": row["val_mae"],
+                "mask/target_fraction": row["train_mask_target_fraction"],
+                "mask/actual_fraction": row["train_mask_actual_fraction"],
+                "optimization/learning_rate": optimizer.param_groups[0]["lr"],
+            }
+
+            for pattern, pattern_metrics in train_metrics["per_pattern"].items():
+                log_data[f"train/{pattern}/mse"] = pattern_metrics["mse"]
+                log_data[f"mask/{pattern}/actual_fraction"] = pattern_metrics[
+                    "actual_mask_fraction"
+                ]
+                log_data[f"mask_pattern/{pattern}"] = pattern_metrics["share"]
+
+            for pattern in args.val_patterns:
+                log_data[f"val/{pattern}/mse"] = val_metrics[pattern]["mse"]
+                log_data[f"val/{pattern}/mae"] = val_metrics[pattern]["mae"]
+
+            wandb_run.log(log_data)
 
         print(
             f"train_mse={row['train_mse']:.6f} "
             f"train_mae={row['train_mae']:.6f} "
             f"val_mse={row['val_mse']:.6f} "
             f"val_mae={row['val_mae']:.6f}"
+        )
+        print(
+            "  val by pattern: "
+            + "  ".join(
+                f"{pattern}={val_metrics[pattern]['mse']:.6f}"
+                for pattern in args.val_patterns
+            )
         )
 
         with open(out_dir / "history.json", "w") as f:
