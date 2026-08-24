@@ -48,7 +48,7 @@ export NUMEXPR_NUM_THREADS=1
 H5_DIR=/pscratch/sd/b/binxia/VPIC_PPPL_HDF5_by_beta_official2500_none_compat
 
 # Bump this when the training configuration changes.
-RUN_NAME=masked-unet3d_beta0p2_dt8_bc16_fourmask_v1
+RUN_NAME=masked-unet3d_beta0p2_dt8_bc16_sharedB_densityIndependentRandomGrid_v2
 
 BETAS=(0.2)
 DELTA_T=8

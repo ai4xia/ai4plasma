@@ -314,7 +314,7 @@ def format_mask_label(info: Dict) -> str:
     pattern = info["pattern"]
 
     if pattern == "spatial_random":
-        detail = "independent voxels"
+        detail = "shared Bx/By/Bz mask; independent Density mask"
     elif pattern == "spatial_grid":
         if "magnetic_stride" in info:
             detail = (
@@ -330,16 +330,27 @@ def format_mask_label(info: Dict) -> str:
             )
     elif pattern == "spatial_block":
         detail = (
-            f"hole={100.0 * info['target_mask_fraction']:.0f}%\n"
-            f"{info['rect_height']}×{info['rect_width']} "
+            f"shared B/Density hole={info['rect_height']}×{info['rect_width']} "
             f"at ({info['rect_x0']}, {info['rect_z0']})"
         )
     elif pattern == "temporal_random":
-        detail = f"frames={info['visible_frames']}"
+        detail = f"shared B/Density frames={info['visible_frames']}"
     else:
         detail = ""
 
     return f"{pattern}\n{detail}"
+
+
+def share_magnetic_channel_mask(mask: torch.Tensor) -> torch.Tensor:
+    """Make Bx, By and Bz use exactly the same observation locations."""
+    if mask.ndim != 5 or mask.shape[1] < 3:
+        raise ValueError(
+            f"Expected mask shaped (B, C>=3, T, X, Z), got {tuple(mask.shape)}"
+        )
+
+    mask = mask.clone()
+    mask[:, 1:3] = mask[:, 0:1]
+    return mask
 
 
 def build_mask_patterns(
@@ -388,6 +399,7 @@ def build_mask_patterns(
 
             mask = magnetic_mask.clone()
             mask[:, 3:4] = density_mask[:, 3:4]
+            mask = share_magnetic_channel_mask(mask)
             info = {
                 "pattern": name,
                 "target_mask_fraction": mask_fraction,
@@ -395,9 +407,9 @@ def build_mask_patterns(
                 "magnetic_stride": magnetic_info["stride"],
                 "magnetic_offset_x": magnetic_info["offset_x"],
                 "magnetic_offset_z": magnetic_info["offset_z"],
-                "density_stride": density_info["stride"],
-                "density_offset_x": density_info["offset_x"],
-                "density_offset_z": density_info["offset_z"],
+                "density_stride": density_info["density_stride"],
+                "density_offset_x": density_info["density_offset_x"],
+                "density_offset_z": density_info["density_offset_z"],
             }
             rows.append((name, format_mask_label(info), mask))
             continue
@@ -410,6 +422,8 @@ def build_mask_patterns(
             dtype=block.dtype,
             generator=generator,
         )
+        mask = share_magnetic_channel_mask(mask)
+        info["actual_mask_fraction"] = float(1.0 - mask.mean().item())
         rows.append((name, format_mask_label(info), mask))
 
     return rows
@@ -527,14 +541,45 @@ def add_inplane_quiver(
     """Overlay (Bz, Bx) arrows, optionally only where both fields are visible."""
     step = max(1, int(step))
     x, z = physical_coordinates(bx.shape, extent)
-    zz, xx = np.meshgrid(z[::step], x[::step])
-    u = np.asarray(bz[::step, ::step])
-    v = np.asarray(bx[::step, ::step])
 
-    if visible_mask is not None:
-        keep = np.asarray(visible_mask[::step, ::step]) > 0.5
-        u = np.ma.masked_where(~keep, u)
-        v = np.ma.masked_where(~keep, v)
+    if visible_mask is None:
+        zz, xx = np.meshgrid(z[::step], x[::step])
+        u = np.asarray(bz[::step, ::step])
+        v = np.asarray(bx[::step, ::step])
+    else:
+        # Pick at most one actually visible probe from each step x step block.
+        # Sampling a fixed [::step, ::step] lattice can miss an offset probe
+        # grid completely, which would incorrectly show no observed arrows.
+        visible = np.asarray(visible_mask) > 0.5
+        selected_x = []
+        selected_z = []
+
+        for x0 in range(0, visible.shape[0], step):
+            for z0 in range(0, visible.shape[1], step):
+                block = visible[
+                    x0 : min(x0 + step, visible.shape[0]),
+                    z0 : min(z0 + step, visible.shape[1]),
+                ]
+                candidates = np.argwhere(block)
+                if candidates.size == 0:
+                    continue
+
+                center = np.array([(block.shape[0] - 1) / 2, (block.shape[1] - 1) / 2])
+                local_ix, local_iz = candidates[
+                    np.argmin(np.sum((candidates - center) ** 2, axis=1))
+                ]
+                selected_x.append(x0 + int(local_ix))
+                selected_z.append(z0 + int(local_iz))
+
+        if not selected_x:
+            return
+
+        selected_x = np.asarray(selected_x, dtype=np.int64)
+        selected_z = np.asarray(selected_z, dtype=np.int64)
+        xx = x[selected_x]
+        zz = z[selected_z]
+        u = np.asarray(bz[selected_x, selected_z])
+        v = np.asarray(bx[selected_x, selected_z])
 
     ax.quiver(
         zz,
@@ -708,6 +753,7 @@ def write_animation(
 def plot_jy_ay_by_mask_patterns(
     target_ay: np.ndarray,
     target_jy: np.ndarray,
+    target_field: np.ndarray,
     rows: List[Dict],
     metadata: Dict,
     local_time: int,
@@ -718,14 +764,17 @@ def plot_jy_ay_by_mask_patterns(
     field_q: float,
     residual_q: float,
     residual_vmax: float | None,
+    quiver_step: int,
+    quiver_scale: float,
     dpi: int,
     limit_times: Sequence[int] | None = None,
 ) -> None:
     """
     Plot Jy with Ay contours for complete target/prediction fields.
 
-    The Visible input column intentionally shows only the joint Bx/Bz
-    observation mask. Jy and Ay are not derived from incomplete observations.
+    The Visible input column shows observed target |B| values and in-plane
+    (Bz, Bx) arrows on a black missing-data background. Jy and Ay are not
+    derived from incomplete observations.
     """
     n_rows = len(rows)
     fig, axes, cax_field, cax_residual = _make_comparison_axes(n_rows)
@@ -741,6 +790,13 @@ def plot_jy_ay_by_mask_patterns(
         for row in rows
         for t in color_times
     ]
+    target_b_magnitude = np.sqrt(np.sum(target_field[:3] ** 2, axis=0))
+    b_vmin, b_vmax = robust_limits(
+        [target_b_magnitude[t] for t in color_times],
+        channel=3,
+        q=field_q,
+        symmetric=False,
+    )
     jy_vmin, jy_vmax = robust_limits(
         all_target_jy + all_pred_jy,
         channel=0,
@@ -759,17 +815,22 @@ def plot_jy_ay_by_mask_patterns(
 
     jy_cmap = make_nan_cmap("seismic")
     residual_cmap = make_nan_cmap("PRGn")
-    mask_cmap = make_nan_cmap("Greys")
+    magnetic_cmap = make_nan_cmap("viridis", bad_color="black")
     field_im = None
     residual_im = None
 
     for r, row in enumerate(rows):
         pred = pred_arrays[r]
         residual = residual_arrays[r]
-        joint_b_mask = np.minimum(
-            row["mask"][0, local_time],
-            row["mask"][2, local_time],
+        joint_b_mask = np.minimum.reduce(
+            [
+                row["mask"][0, local_time],
+                row["mask"][1, local_time],
+                row["mask"][2, local_time],
+            ]
         )
+        visible_b_magnitude = target_b_magnitude[local_time].copy()
+        visible_b_magnitude[joint_b_mask < 0.5] = np.nan
         visible_pct = 100.0 * float(np.mean(joint_b_mask))
         rmse, mae = compute_full_metrics(pred, target)
         row_label = (
@@ -794,14 +855,24 @@ def plot_jy_ay_by_mask_patterns(
         )
 
         axes[r, 1].imshow(
-            joint_b_mask,
+            visible_b_magnitude,
             origin="lower",
             aspect="auto",
             extent=extent,
-            cmap=mask_cmap,
-            vmin=0.0,
-            vmax=1.0,
+            cmap=magnetic_cmap,
+            vmin=b_vmin,
+            vmax=b_vmax,
             interpolation="nearest",
+        )
+        add_inplane_quiver(
+            axes[r, 1],
+            target_field[0, local_time],
+            target_field[2, local_time],
+            extent,
+            quiver_step,
+            quiver_scale,
+            visible_mask=joint_b_mask,
+            color="cyan",
         )
         if visible_pct == 0.0:
             axes[r, 1].text(
@@ -854,7 +925,12 @@ def plot_jy_ay_by_mask_patterns(
         for c in range(4):
             if r == 0:
                 axes[r, c].set_title(
-                    ["Target Jy + Ay", "Bx/Bz observation mask", "Prediction Jy + Ay", "Jy residual"][c],
+                    [
+                        "Target Jy + Ay",
+                        "Observed target |B| + in-plane B",
+                        "Prediction Jy + Ay",
+                        "Jy residual",
+                    ][c],
                     fontsize=11,
                     pad=4,
                 )
@@ -931,7 +1007,7 @@ def plot_density_magnetic_field_by_mask_patterns(
     else:
         res_vmin, res_vmax = -float(residual_vmax), float(residual_vmax)
 
-    density_cmap = make_nan_cmap("plasma")
+    density_cmap = make_nan_cmap("plasma", bad_color="black")
     residual_cmap = make_nan_cmap("PRGn")
     field_im = None
     residual_im = None
@@ -941,9 +1017,12 @@ def plot_density_magnetic_field_by_mask_patterns(
         pred_density = pred_arrays[r]
         residual = residual_arrays[r]
         density_mask = row["mask"][3, local_time]
-        joint_b_mask = np.minimum(
-            row["mask"][0, local_time],
-            row["mask"][2, local_time],
+        joint_b_mask = np.minimum.reduce(
+            [
+                row["mask"][0, local_time],
+                row["mask"][1, local_time],
+                row["mask"][2, local_time],
+            ]
         )
         visible_pct = 100.0 * float(np.mean(density_mask))
         rmse, mae = compute_full_metrics(pred_density, target_density)
@@ -1260,6 +1339,7 @@ def main():
         plot_jy_ay_by_mask_patterns(
             target_ay=target_ay,
             target_jy=target_jy,
+            target_field=y_plot_np,
             rows=rows_for_plot,
             metadata=metadata,
             local_time=local_time,
@@ -1270,6 +1350,8 @@ def main():
             field_q=args.field_q,
             residual_q=args.residual_q,
             residual_vmax=args.residual_vmax,
+            quiver_step=args.quiver_step,
+            quiver_scale=args.quiver_scale,
             dpi=args.dpi,
             limit_times=limit_times,
         )

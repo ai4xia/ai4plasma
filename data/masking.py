@@ -18,10 +18,18 @@ MASK_PATTERNS: Tuple[str, ...] = (
     "temporal_random",
 )
 
+# Increment this whenever the training-time meaning of a mask changes. It is
+# stored in checkpoints so auto-resume cannot silently mix incompatible mask
+# distributions in one run.
+MASKING_VERSION = "shared_magnetic_density_independent_random_grid_v2"
+
 PATTERN_TO_ID: Dict[str, int] = {name: i for i, name in enumerate(MASK_PATTERNS)}
 
-# Spatial patterns keep the same observation layout for every frame of the
-# temporal window. Temporal patterns keep or hide whole frames.
+# Bx, By and Bz always share one observation layout. Density is sampled
+# independently for spatial_random and spatial_grid, while spatial_block and
+# temporal_random use one mask shared by all four channels. Spatial patterns
+# keep their layouts for every frame of the temporal window; temporal patterns
+# choose whole visible frames.
 SPATIAL_MASK_PATTERNS: Tuple[str, ...] = (
     "spatial_random",
     "spatial_grid",
@@ -296,18 +304,50 @@ def sample_mask(
         raise ValueError(f"Expected a (B, C, T, X, Z) shape, got {tuple(shape)}")
 
     B, C, T, X, Z = (int(s) for s in shape)
+    if C != 4:
+        raise ValueError(
+            "VPIC masking expects exactly four channels ordered as "
+            f"(Bx, By, Bz, Density), got C={C}."
+        )
     p = float(mask_fraction)
 
     if pattern == "spatial_random":
-        small, info = _spatial_random_plane(B, C, X, Z, p, generator)
+        magnetic_small, magnetic_info = _spatial_random_plane(
+            B, 1, X, Z, p, generator
+        )
+        density_small, density_info = _spatial_random_plane(
+            B, 1, X, Z, p, generator
+        )
     elif pattern == "spatial_grid":
-        small, info = _spatial_grid_plane(B, C, X, Z, p, generator, stride=grid_stride)
+        magnetic_small, magnetic_info = _spatial_grid_plane(
+            B, 1, X, Z, p, generator, stride=grid_stride
+        )
+        density_small, density_info = _spatial_grid_plane(
+            B, 1, X, Z, p, generator, stride=grid_stride
+        )
     elif pattern == "spatial_block":
-        small, info = _spatial_block_plane(B, C, X, Z, p, generator)
+        magnetic_small, magnetic_info = _spatial_block_plane(
+            B, 1, X, Z, p, generator
+        )
+        density_small = magnetic_small
+        density_info = dict(magnetic_info)
     elif pattern == "temporal_random":
-        small, info = _temporal_random_frames(T, p, generator)
+        magnetic_small, magnetic_info = _temporal_random_frames(T, p, generator)
+        density_small = magnetic_small
+        density_info = dict(magnetic_info)
     else:
         raise ValueError(f"Unhandled mask pattern {pattern!r}")
+
+    magnetic_small = magnetic_small.expand(
+        magnetic_small.shape[0], 3, *magnetic_small.shape[2:]
+    )
+    small = torch.cat([magnetic_small, density_small], dim=1)
+
+    # Keep the magnetic layout metadata at the legacy top-level keys and add
+    # explicit prefixed metadata for both independently sampled modalities.
+    info = dict(magnetic_info)
+    info.update({f"magnetic_{key}": value for key, value in magnetic_info.items()})
+    info.update({f"density_{key}": value for key, value in density_info.items()})
 
     info["pattern"] = pattern
     info["target_mask_fraction"] = p
@@ -315,6 +355,12 @@ def sample_mask(
     # already the exact mask fraction of the expanded tensor. Measuring it here
     # keeps the measurement on CPU.
     info["actual_mask_fraction"] = float(1.0 - small.mean().item())
+    info["magnetic_actual_mask_fraction"] = float(
+        1.0 - magnetic_small.mean().item()
+    )
+    info["density_actual_mask_fraction"] = float(
+        1.0 - density_small.mean().item()
+    )
 
     mask = small.to(device=device, dtype=dtype).expand(B, C, T, X, Z).contiguous()
     return mask, info

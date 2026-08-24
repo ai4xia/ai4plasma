@@ -18,6 +18,7 @@ from tqdm import tqdm
 from data.vpic_hdf5_dataset import VPICWindowDataset
 from data.masking import (
     DEFAULT_PATTERN_WEIGHTS,
+    MASKING_VERSION,
     MASK_PATTERNS,
     PATTERN_TO_ID,
     full_mae_loss,
@@ -150,6 +151,7 @@ def parse_args():
         args.mask_pattern_weights = dict(DEFAULT_PATTERN_WEIGHTS)
     else:
         args.mask_pattern_weights = parse_pattern_weights(args.mask_patterns)
+    args.masking_version = MASKING_VERSION
 
     return args
 
@@ -212,6 +214,7 @@ def init_wandb(
 
 
 RESUME_PARAMETER_KEYS = (
+    "masking_version",
     "h5_dir",
     "betas",
     "delta_t",

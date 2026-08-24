@@ -101,6 +101,16 @@ def test_temporal_random_masks_whole_frames():
     assert torch.equal(visible_frames, expected)
     assert len(info["visible_frames"]) == info["num_visible_frames"]
 
+    density_visible_frames = mask[0, 3, :, 0, 0]
+    density_expected = torch.zeros(SHAPE[2])
+    density_expected[info["density_visible_frames"]] = 1.0
+    assert torch.equal(density_visible_frames, density_expected)
+    assert (
+        len(info["density_visible_frames"])
+        == info["density_num_visible_frames"]
+    )
+    assert torch.equal(mask[:, 0], mask[:, 3])
+
 
 def test_spatial_grid_is_a_regular_lattice():
     X, Z = SHAPE[3], SHAPE[4]
@@ -120,9 +130,16 @@ def test_spatial_grid_is_a_regular_lattice():
         assert 0 <= info["offset_x"] < stride
         assert 0 <= info["offset_z"] < stride
 
-        # Every channel observes the same lattice.
-        for c in range(1, SHAPE[1]):
+        # All magnetic channels observe the same lattice.
+        for c in (1, 2):
             assert torch.equal(mask[0, c, 0], mask[0, 0, 0])
+
+        density_expected = torch.zeros(X, Z)
+        density_expected[
+            info["density_offset_x"] :: info["density_stride"],
+            info["density_offset_z"] :: info["density_stride"],
+        ] = 1.0
+        assert torch.equal(mask[0, 3, 0], density_expected)
 
 
 def test_spatial_grid_stride_can_be_pinned():
@@ -150,6 +167,35 @@ def test_spatial_block_is_one_contiguous_rectangle():
     # Contiguous in both directions.
     assert torch.equal(hidden_rows, torch.arange(hidden_rows[0], hidden_rows[-1] + 1))
     assert torch.equal(hidden_cols, torch.arange(hidden_cols[0], hidden_cols[-1] + 1))
+
+    density_plane = mask[0, 3, 0]
+    density_hidden_rows = (density_plane == 0).any(dim=1).nonzero().flatten()
+    density_hidden_cols = (density_plane == 0).any(dim=0).nonzero().flatten()
+    assert len(density_hidden_rows) == info["density_rect_height"]
+    assert len(density_hidden_cols) == info["density_rect_width"]
+    assert torch.equal(mask[:, 0], mask[:, 3])
+
+
+def test_channel_sharing_rules_by_pattern():
+    for pattern in MASK_PATTERNS:
+        density_differs = False
+
+        for seed in range(20, 32):
+            mask, _ = sample_mask(
+                SHAPE,
+                pattern,
+                0.5,
+                generator=make_generator(seed),
+            )
+
+            assert torch.equal(mask[:, 0], mask[:, 1]), pattern
+            assert torch.equal(mask[:, 1], mask[:, 2]), pattern
+            density_differs |= not torch.equal(mask[:, 0], mask[:, 3])
+
+        if pattern in {"spatial_random", "spatial_grid"}:
+            assert density_differs, pattern
+        else:
+            assert not density_differs, pattern
 
 
 def test_layout_and_ratio_vary_with_seed():
