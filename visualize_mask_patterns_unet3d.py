@@ -105,9 +105,13 @@ def parse_args():
     )
     p.add_argument(
         "--animation-format",
-        choices=["mp4", "gif", "both"],
-        default="mp4",
-        help="Animation output written with --all-times (default: mp4).",
+        choices=["quicktime", "mp4", "gif", "both"],
+        default="quicktime",
+        help=(
+            "Animation output written with --all-times. quicktime writes a "
+            "Motion-JPEG .mov that opens in macOS QuickTime; mp4 may use VP9 "
+            "when H.264 is unavailable. both writes QuickTime and GIF."
+        ),
     )
     p.add_argument(
         "--fps",
@@ -658,11 +662,11 @@ def write_animation(
         raise ValueError(f"--fps must be positive, got {fps}")
 
     suffix = out_path.suffix.lower()
-    if suffix == ".mp4":
+    if suffix in {".mp4", ".mov"}:
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg is None:
             raise RuntimeError(
-                "MP4 output requires ffmpeg on PATH. Use "
+                "MP4/QuickTime output requires ffmpeg on PATH. Use "
                 "`--animation-format gif` when ffmpeg is unavailable."
             )
 
@@ -672,10 +676,20 @@ def write_animation(
             capture_output=True,
             text=True,
         ).stdout
-        if "libx264" in encoder_listing:
+        if suffix == ".mov":
+            if "mjpeg" not in encoder_listing:
+                raise RuntimeError(
+                    "QuickTime output requires ffmpeg's Motion-JPEG encoder, "
+                    "but it is not enabled on this system."
+                )
+            codec_args = ["-c:v", "mjpeg", "-q:v", "2"]
+            pixel_format = "yuvj420p"
+        elif "libx264" in encoder_listing:
             codec_args = ["-c:v", "libx264", "-crf", "20"]
+            pixel_format = "yuv420p"
         elif "libvpx-vp9" in encoder_listing:
             codec_args = ["-c:v", "libvpx-vp9", "-crf", "30", "-b:v", "0"]
+            pixel_format = "yuv420p"
         else:
             raise RuntimeError(
                 "ffmpeg is available, but neither libx264 nor libvpx-vp9 is enabled. "
@@ -709,9 +723,11 @@ def write_animation(
             command.extend(
                 [
                     "-pix_fmt",
-                    "yuv420p",
+                    pixel_format,
                     "-vf",
                     "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                    "-movflags",
+                    "+faststart",
                     str(out_path),
                 ]
             )
@@ -1384,9 +1400,14 @@ def main():
             f"globalt-{int(metadata['t0']):04d}-"
             f"{int(metadata['t0']) + delta_t - 1:04d}"
         )
-        formats = ["mp4", "gif"] if args.animation_format == "both" else [args.animation_format]
+        formats = (
+            ["quicktime", "gif"]
+            if args.animation_format == "both"
+            else [args.animation_format]
+        )
 
-        for extension in formats:
+        for animation_format in formats:
+            extension = "mov" if animation_format == "quicktime" else animation_format
             write_animation(
                 jy_frame_paths,
                 out_dir / f"{animation_stem}_Jy_Ay.{extension}",
