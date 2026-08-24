@@ -8,9 +8,11 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from visualize_mask_patterns_unet3d import (  # noqa: E402
+    build_density_forecast_rows,
     build_density_only_multifunction_rows,
     build_density_superres_rows,
     build_magnetic_ablation_rows,
+    default_density_forecast_visible_frames,
 )
 
 
@@ -71,3 +73,24 @@ def test_magnetic_ablation_is_nested_and_reuses_density_grid():
 
     for (_, _, higher), (_, _, lower) in zip(rows, rows[1:]):
         assert torch.all(lower[:, :3] <= higher[:, :3])
+
+
+def test_density_forecast_uses_complete_prefixes_and_full_magnetic_history():
+    block = torch.zeros(1, 4, 24, 20, 12)
+    history_lengths = [23, 18, 12, 6]
+    rows = build_density_forecast_rows(block, history_lengths)
+
+    assert len(rows) == 4
+    for (_, label, mask), history_length in zip(rows, history_lengths):
+        assert torch.all(mask[:, :3] == 1)
+        assert torch.all(mask[:, 3:4, :history_length] == 1)
+        assert torch.all(mask[:, 3:4, history_length:] == 0)
+        assert f"forecast horizon={24 - history_length} step" in label
+
+    for (_, _, longer), (_, _, shorter) in zip(rows, rows[1:]):
+        assert torch.all(shorter[:, 3:4] <= longer[:, 3:4])
+
+
+def test_density_forecast_defaults_scale_with_context_length():
+    assert default_density_forecast_visible_frames(24) == [23, 18, 12, 6]
+    assert default_density_forecast_visible_frames(8) == [7, 6, 4, 2]

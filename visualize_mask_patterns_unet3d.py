@@ -134,6 +134,7 @@ def parse_args():
             "multifunction",
             "density_superres",
             "magnetic_ablation",
+            "density_forecast",
             "custom",
         ],
         default="all",
@@ -141,7 +142,8 @@ def parse_args():
             "Visualization experiment to render. The default 'all' renders: "
             "Density-only versions of every mask pattern, a Density "
             "super-resolution probe-count sweep, and a magnetic-information "
-            "ablation. 'custom' preserves the original --mask-patterns behavior."
+            "ablation, and a Density forecast-horizon sweep. 'custom' preserves "
+            "the original --mask-patterns behavior."
         ),
     )
     p.add_argument(
@@ -170,6 +172,18 @@ def parse_args():
         default=[1.0, 0.8, 0.6, 0.4],
         help=(
             "Magnetic visible fractions for the nested spatial-random ablation."
+        ),
+    )
+    p.add_argument(
+        "--density-forecast-visible-frames",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "Numbers of complete leading Density frames made visible in the "
+            "density_forecast rows. All later Density frames are hidden while "
+            "Bx/By/Bz remain visible for the full temporal window. Default for "
+            "T=24: 23 18 12 6; other T values use equivalent relative lengths."
         ),
     )
 
@@ -660,6 +674,57 @@ def build_magnetic_ablation_rows(
     return rows
 
 
+def build_density_forecast_rows(
+    block: torch.Tensor,
+    visible_frame_counts: Sequence[int],
+) -> List[Tuple[str, str, torch.Tensor]]:
+    """
+    Build causal Density-prefix masks with the magnetic field always visible.
+
+    Every visible Density frame is spatially complete. Density is fully hidden
+    after the prefix, so the final slice measures conditional forecast accuracy
+    at progressively longer horizons given the complete Bx/By/Bz sequence.
+    """
+    time = int(block.shape[2])
+    counts = [int(count) for count in visible_frame_counts]
+    if not counts:
+        raise ValueError("--density-forecast-visible-frames requires at least one value.")
+    if len(set(counts)) != len(counts):
+        raise ValueError(
+            "--density-forecast-visible-frames values must be unique, "
+            f"got {counts}."
+        )
+
+    rows = []
+    for count in counts:
+        if not (1 <= count < time):
+            raise ValueError(
+                "--density-forecast-visible-frames values must be in "
+                f"[1, T-1]=[1, {time - 1}], got {count}."
+            )
+
+        mask = torch.ones_like(block)
+        mask[:, 3:4, count:] = 0.0
+        horizon = time - count
+        label = (
+            "Conditional Density forecast\n"
+            f"B visible=100% for frames 1-{time}\n"
+            f"Density visible=frames 1-{count} (spatially complete)\n"
+            f"target=frame {time}; forecast horizon={horizon} step"
+            f"{'s' if horizon != 1 else ''}"
+        )
+        rows.append((f"density_forecast_history_{count}", label, mask))
+    return rows
+
+
+def default_density_forecast_visible_frames(time: int) -> List[int]:
+    """Return T=24 -> [23, 18, 12, 6], scaled sensibly for legacy windows."""
+    if time < 2:
+        raise ValueError(f"density_forecast requires at least two frames, got T={time}.")
+    candidates = [time - 1, round(0.75 * time), round(0.50 * time), round(0.25 * time)]
+    return list(dict.fromkeys(min(max(int(value), 1), time - 1) for value in candidates))
+
+
 def build_experiment_mask_rows(
     args: argparse.Namespace,
     block: torch.Tensor,
@@ -681,7 +746,12 @@ def build_experiment_mask_rows(
     )
 
     selected = (
-        ["multifunction", "density_superres", "magnetic_ablation"]
+        [
+            "multifunction",
+            "density_superres",
+            "magnetic_ablation",
+            "density_forecast",
+        ]
         if args.experiment == "all"
         else [args.experiment]
     )
@@ -709,6 +779,11 @@ def build_experiment_mask_rows(
                 magnetic_visible_fractions=magnetic_fractions,
                 density_visible_fraction=fixed_density_fraction,
                 generator=generator,
+            )
+        elif experiment == "density_forecast":
+            rows = build_density_forecast_rows(
+                block=block,
+                visible_frame_counts=args.density_forecast_visible_frames,
             )
         elif experiment == "custom":
             rows = build_mask_patterns(
@@ -1530,6 +1605,10 @@ def main():
     # Checkpoints created before the depth option used the original three-level
     # architecture. Keep that fallback so their figures remain reproducible.
     channel_mults = ckpt_args.get("channel_mults", [1, 2, 4])
+    if args.density_forecast_visible_frames is None:
+        args.density_forecast_visible_frames = default_density_forecast_visible_frames(
+            delta_t
+        )
 
     if not (0 <= args.local_time < delta_t):
         raise ValueError(f"--local-time must be in [0, {delta_t - 1}], got {args.local_time}")
@@ -1551,6 +1630,10 @@ def main():
     print("density_visible_fractions:", args.density_visible_fractions)
     print("fixed_density_visible_fraction:", args.fixed_density_visible_fraction)
     print("magnetic_visible_fractions:", args.magnetic_visible_fractions)
+    print(
+        "density_forecast_visible_frames:",
+        args.density_forecast_visible_frames,
+    )
     print("local_time:", args.local_time)
     print("all_times:", args.all_times)
     if args.all_times:
@@ -1648,10 +1731,23 @@ def main():
         f"t0-{metadata['t0']}_"
         f"{args.plot_units}"
     )
-    local_times = list(range(delta_t)) if args.all_times else [args.local_time]
-    limit_times = local_times if args.all_times else None
-
     for experiment_name, rows_for_plot in experiment_rows:
+        if args.all_times:
+            local_times = list(range(delta_t))
+            limit_times = local_times
+        elif experiment_name == "density_forecast":
+            # A static forecast table is meaningful at the requested endpoint,
+            # not at the generic --local-time used by reconstruction tables.
+            local_times = [delta_t - 1]
+            limit_times = None
+            print(
+                "density_forecast static table uses final local time:",
+                delta_t - 1,
+            )
+        else:
+            local_times = [args.local_time]
+            limit_times = None
+
         experiment_stem = f"{sample_stem}_experiment-{experiment_name}"
         combined_frame_paths = []
         for local_time in local_times:
