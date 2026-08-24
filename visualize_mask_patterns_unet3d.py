@@ -127,6 +127,51 @@ def parse_args():
         choices=list(MASK_PATTERNS),
         help="Rows to show in the figure.",
     )
+    p.add_argument(
+        "--experiment",
+        choices=[
+            "all",
+            "multifunction",
+            "density_superres",
+            "magnetic_ablation",
+            "custom",
+        ],
+        default="all",
+        help=(
+            "Visualization experiment to render. The default 'all' renders: "
+            "Density-only versions of every mask pattern, a Density "
+            "super-resolution probe-count sweep, and a magnetic-information "
+            "ablation. 'custom' preserves the original --mask-patterns behavior."
+        ),
+    )
+    p.add_argument(
+        "--density-visible-fractions",
+        type=float,
+        nargs="+",
+        default=[0.08, 0.04, 0.02, 0.01],
+        help=(
+            "Target visible fractions for rows in the Density super-resolution "
+            "sweep. A square grid realizes the nearest available fraction."
+        ),
+    )
+    p.add_argument(
+        "--fixed-density-visible-fraction",
+        type=float,
+        default=0.08,
+        help=(
+            "Target Density grid visibility held fixed during the magnetic "
+            "information ablation."
+        ),
+    )
+    p.add_argument(
+        "--magnetic-visible-fractions",
+        type=float,
+        nargs="+",
+        default=[1.0, 0.8, 0.6, 0.4],
+        help=(
+            "Magnetic visible fractions for the nested spatial-random ablation."
+        ),
+    )
 
     p.add_argument(
         "--plot-units",
@@ -431,6 +476,254 @@ def build_mask_patterns(
         rows.append((name, format_mask_label(info), mask))
 
     return rows
+
+
+def _validate_visible_fractions(
+    values: Sequence[float],
+    option_name: str,
+    allow_zero: bool = False,
+) -> List[float]:
+    lower = 0.0 if allow_zero else np.nextafter(0.0, 1.0)
+    parsed = [float(value) for value in values]
+    if not parsed:
+        raise ValueError(f"{option_name} requires at least one value.")
+    for value in parsed:
+        if not (lower <= value <= 1.0):
+            interval = "[0, 1]" if allow_zero else "(0, 1]"
+            raise ValueError(
+                f"{option_name} values must lie in {interval}, got {value}."
+            )
+    return parsed
+
+
+def build_density_only_multifunction_rows(
+    block: torch.Tensor,
+    patterns: Sequence[str],
+    mask_fraction: float,
+    block_fraction: float,
+    grid_stride: int,
+    magnetic_grid_stride: int,
+    generator: torch.Generator,
+) -> List[Tuple[str, str, torch.Tensor]]:
+    """Apply every requested topology to Density while keeping all B visible."""
+    sampled_rows = build_mask_patterns(
+        block=block,
+        patterns=patterns,
+        mask_fraction=mask_fraction,
+        block_fraction=block_fraction,
+        grid_stride=grid_stride,
+        magnetic_grid_stride=magnetic_grid_stride,
+        generator=generator,
+    )
+    labels = {
+        "spatial_random": "Density spatial_random\nB visible=100%; Density random probes",
+        "spatial_grid": (
+            f"Density spatial_grid\nB visible=100%; Density stride="
+            f"{grid_stride}x{grid_stride}"
+        ),
+        "spatial_block": "Density spatial_block\nB visible=100%; Density-only hole",
+        "temporal_random": (
+            "Density temporal_random\nB visible=100%; Density-only hidden frames"
+        ),
+    }
+
+    rows = []
+    for name, _old_label, mask in sampled_rows:
+        mask = mask.clone()
+        mask[:, :3] = 1.0
+        rows.append((name, labels[name], mask))
+    return rows
+
+
+def _density_probe_grid(
+    block: torch.Tensor,
+    target_visible_fraction: float,
+    generator: torch.Generator,
+) -> Tuple[torch.Tensor, Dict[str, float | int]]:
+    """Create a near-isotropic regular grid close to a requested probe ratio."""
+    # Allow mildly rectangular cells when that materially improves the target
+    # ratio (notably 8%, for which no square integer stride exists).
+    candidates = []
+    for stride_x in range(1, 33):
+        for stride_z in range(1, 33):
+            nominal = 1.0 / float(stride_x * stride_z)
+            relative_error = abs(nominal - target_visible_fraction) / target_visible_fraction
+            anisotropy = abs(stride_x - stride_z) / max(stride_x, stride_z)
+            candidates.append(
+                (relative_error + 0.05 * anisotropy, anisotropy, stride_x, stride_z)
+            )
+    batch, _channels, time, size_x, size_z = block.shape
+    _score, _anisotropy, stride_x, stride_z = min(candidates)
+    offset_candidates = []
+    for candidate_x in range(stride_x):
+        count_x = (size_x - 1 - candidate_x) // stride_x + 1
+        for candidate_z in range(stride_z):
+            count_z = (size_z - 1 - candidate_z) // stride_z + 1
+            actual = float(count_x * count_z) / float(size_x * size_z)
+            offset_candidates.append(
+                (abs(actual - target_visible_fraction), candidate_x, candidate_z)
+            )
+    best_offset_error = min(item[0] for item in offset_candidates)
+    best_offsets = [
+        item for item in offset_candidates if np.isclose(item[0], best_offset_error)
+    ]
+    selected_offset = int(
+        torch.randint(len(best_offsets), (1,), generator=generator).item()
+    )
+    _offset_error, offset_x, offset_z = best_offsets[selected_offset]
+
+    plane = torch.zeros(
+        (1, 1, 1, size_x, size_z),
+        device=block.device,
+        dtype=block.dtype,
+    )
+    plane[..., offset_x::stride_x, offset_z::stride_z] = 1.0
+    mask = plane.expand(batch, 1, time, size_x, size_z).contiguous()
+    info = {
+        "stride_x": stride_x,
+        "stride_z": stride_z,
+        "offset_x": offset_x,
+        "offset_z": offset_z,
+        "actual_visible_fraction": float(mask.mean().item()),
+    }
+    return mask, info
+
+
+def build_density_superres_rows(
+    block: torch.Tensor,
+    visible_fractions: Sequence[float],
+    generator: torch.Generator,
+) -> List[Tuple[str, str, torch.Tensor]]:
+    """Sweep regular Density probe grids while keeping the full B field visible."""
+    rows = []
+    for visible_fraction in visible_fractions:
+        density_mask, info = _density_probe_grid(
+            block=block,
+            target_visible_fraction=visible_fraction,
+            generator=generator,
+        )
+        mask = torch.ones_like(block)
+        mask[:, 3:4] = density_mask
+        actual = float(info["actual_visible_fraction"])
+        label = (
+            "Density super-resolution\n"
+            f"B visible=100%; target={100.0 * visible_fraction:g}%\n"
+            f"grid stride={info['stride_x']}x{info['stride_z']}; "
+            f"actual={100.0 * actual:.2f}%"
+        )
+        rows.append((f"density_superres_{visible_fraction:g}", label, mask))
+    return rows
+
+
+def build_magnetic_ablation_rows(
+    block: torch.Tensor,
+    magnetic_visible_fractions: Sequence[float],
+    density_visible_fraction: float,
+    generator: torch.Generator,
+) -> List[Tuple[str, str, torch.Tensor]]:
+    """
+    Hold one Density grid fixed and progressively remove nested magnetic probes.
+
+    The same spatial ranking is used for all rows, so every lower-visibility B
+    layout is a strict subset of the preceding higher-visibility layout.
+    """
+    density_plane, density_info = _density_probe_grid(
+        block=block,
+        target_visible_fraction=density_visible_fraction,
+        generator=generator,
+    )
+    density_actual = float(density_info["actual_visible_fraction"])
+
+    batch, _channels, time, size_x, size_z = block.shape
+    num_sites = int(size_x * size_z)
+    permutation = torch.randperm(num_sites, generator=generator)
+    rank = torch.empty(num_sites, dtype=torch.long)
+    rank[permutation] = torch.arange(num_sites)
+
+    rows = []
+    for visible_fraction in magnetic_visible_fractions:
+        num_visible = int(round(visible_fraction * num_sites))
+        magnetic_plane = (rank < num_visible).reshape(1, 1, 1, size_x, size_z)
+        magnetic_plane = magnetic_plane.to(device=block.device, dtype=block.dtype)
+        magnetic_mask = magnetic_plane.expand(batch, 3, time, size_x, size_z)
+
+        mask = torch.cat([magnetic_mask, density_plane], dim=1).contiguous()
+        magnetic_actual = float(magnetic_mask.mean().item())
+        label = (
+            "Magnetic information ablation\n"
+            f"B visible={100.0 * magnetic_actual:.2f}% (nested random)\n"
+            f"Density grid target={100.0 * density_visible_fraction:g}%, "
+            f"actual={100.0 * density_actual:.2f}%\n"
+            f"Density stride={density_info['stride_x']}x{density_info['stride_z']}"
+        )
+        rows.append((f"magnetic_ablation_{visible_fraction:g}", label, mask))
+    return rows
+
+
+def build_experiment_mask_rows(
+    args: argparse.Namespace,
+    block: torch.Tensor,
+    generator: torch.Generator,
+) -> List[Tuple[str, List[Tuple[str, str, torch.Tensor]]]]:
+    """Build the selected table groups in their requested display order."""
+    density_fractions = _validate_visible_fractions(
+        args.density_visible_fractions,
+        "--density-visible-fractions",
+    )
+    fixed_density_fraction = _validate_visible_fractions(
+        [args.fixed_density_visible_fraction],
+        "--fixed-density-visible-fraction",
+    )[0]
+    magnetic_fractions = _validate_visible_fractions(
+        args.magnetic_visible_fractions,
+        "--magnetic-visible-fractions",
+        allow_zero=True,
+    )
+
+    selected = (
+        ["multifunction", "density_superres", "magnetic_ablation"]
+        if args.experiment == "all"
+        else [args.experiment]
+    )
+    experiments = []
+    for experiment in selected:
+        if experiment == "multifunction":
+            rows = build_density_only_multifunction_rows(
+                block=block,
+                patterns=args.mask_patterns,
+                mask_fraction=args.mask_fraction,
+                block_fraction=args.block_fraction,
+                grid_stride=args.grid_stride,
+                magnetic_grid_stride=args.magnetic_grid_stride,
+                generator=generator,
+            )
+        elif experiment == "density_superres":
+            rows = build_density_superres_rows(
+                block=block,
+                visible_fractions=density_fractions,
+                generator=generator,
+            )
+        elif experiment == "magnetic_ablation":
+            rows = build_magnetic_ablation_rows(
+                block=block,
+                magnetic_visible_fractions=magnetic_fractions,
+                density_visible_fraction=fixed_density_fraction,
+                generator=generator,
+            )
+        elif experiment == "custom":
+            rows = build_mask_patterns(
+                block=block,
+                patterns=args.mask_patterns,
+                mask_fraction=args.mask_fraction,
+                block_fraction=args.block_fraction,
+                grid_stride=args.grid_stride,
+                magnetic_grid_stride=args.magnetic_grid_stride,
+                generator=generator,
+            )
+        else:
+            raise ValueError(f"Unhandled experiment: {experiment}")
+        experiments.append((experiment, rows))
+    return experiments
 
 
 def compute_full_metrics(
@@ -764,6 +1057,30 @@ def write_animation(
         raise ValueError(f"Unsupported animation extension: {out_path.suffix}")
 
     print(f"Saved animation: {out_path}")
+
+
+def combine_table_images(
+    magnetic_path: Path,
+    density_path: Path,
+    out_path: Path,
+    gap_pixels: int = 16,
+) -> None:
+    """Place the magnetic/Jy table left and the Density table right."""
+    from PIL import Image
+
+    with Image.open(magnetic_path) as magnetic_image, Image.open(density_path) as density_image:
+        magnetic_rgb = magnetic_image.convert("RGB")
+        density_rgb = density_image.convert("RGB")
+        height = max(magnetic_rgb.height, density_rgb.height)
+        canvas = Image.new(
+            "RGB",
+            (magnetic_rgb.width + gap_pixels + density_rgb.width, height),
+            color="white",
+        )
+        canvas.paste(magnetic_rgb, (0, 0))
+        canvas.paste(density_rgb, (magnetic_rgb.width + gap_pixels, 0))
+        canvas.save(out_path)
+    print(f"Saved combined 1x2 frame: {out_path}")
 
 
 def plot_jy_ay_by_mask_patterns(
@@ -1210,6 +1527,9 @@ def main():
     delta_t = int(ckpt_args.get("delta_t", ckpt_args.get("delta-t", 8)))
     stride_t = int(ckpt_args.get("stride_t", ckpt_args.get("stride-t", 2)))
     base_channels = int(ckpt_args.get("base_channels", ckpt_args.get("base-channels", 16)))
+    # Checkpoints created before the depth option used the original three-level
+    # architecture. Keep that fallback so their figures remain reproducible.
+    channel_mults = ckpt_args.get("channel_mults", [1, 2, 4])
 
     if not (0 <= args.local_time < delta_t):
         raise ValueError(f"--local-time must be in [0, {delta_t - 1}], got {args.local_time}")
@@ -1221,11 +1541,16 @@ def main():
     print("delta_t:", delta_t)
     print("stride_t:", stride_t)
     print("base_channels:", base_channels)
+    print("channel_mults:", channel_mults)
     print("mask_fraction:", args.mask_fraction)
     print("block_fraction:", args.block_fraction)
     print("density_grid_stride:", args.grid_stride)
     print("magnetic_grid_stride:", args.magnetic_grid_stride)
     print("mask_patterns:", args.mask_patterns)
+    print("experiment:", args.experiment)
+    print("density_visible_fractions:", args.density_visible_fractions)
+    print("fixed_density_visible_fraction:", args.fixed_density_visible_fraction)
+    print("magnetic_visible_fractions:", args.magnetic_visible_fractions)
     print("local_time:", args.local_time)
     print("all_times:", args.all_times)
     if args.all_times:
@@ -1262,6 +1587,7 @@ def main():
         in_channels=8,
         out_channels=4,
         base_channels=base_channels,
+        channel_mults=channel_mults,
     ).to(device)
 
     model.load_state_dict(ckpt["model"])
@@ -1270,154 +1596,139 @@ def main():
     generator = torch.Generator()
     generator.manual_seed(args.seed)
 
-    mask_rows = build_mask_patterns(
+    if args.plot_units == "normalized":
+        y_plot_np = y_norm[0].detach().cpu().numpy()
+    elif args.plot_units == "physical":
+        y_plot_np = y[0].detach().cpu().numpy()
+    else:
+        raise ValueError(f"Unknown plot_units: {args.plot_units}")
+
+    # Derived magnetic quantities are computed only from complete fields.
+    # In particular, no gradients or path integrations are applied to the
+    # masked Visible input arrays.
+    target_ay, target_jy = compute_ay_jy(y_plot_np, args.extent)
+    experiment_mask_groups = build_experiment_mask_rows(
+        args=args,
         block=y_norm,
-        patterns=args.mask_patterns,
-        mask_fraction=args.mask_fraction,
-        block_fraction=args.block_fraction,
-        grid_stride=args.grid_stride,
-        magnetic_grid_stride=args.magnetic_grid_stride,
         generator=generator,
     )
+    experiment_rows = []
+    for experiment_name, mask_rows in experiment_mask_groups:
+        rows_for_plot = []
+        print(f"Running experiment: {experiment_name} ({len(mask_rows)} rows)")
+        for short_name, label, mask in mask_rows:
+            x_visible_norm = make_visible_input(y_norm, mask)
+            model_input = torch.cat([x_visible_norm, mask], dim=1)
+            pred_norm = model(model_input)
 
-    rows_for_plot = []
-
-    for short_name, label, mask in mask_rows:
-        x_visible_norm = make_visible_input(y_norm, mask)
-        model_input = torch.cat([x_visible_norm, mask], dim=1)
-
-        pred_norm = model(model_input)
-
-        if args.plot_units == "normalized":
-            y_plot_tensor = y_norm.detach()
-            pred_plot_tensor = pred_norm.detach()
-
-            visible_plot_tensor = y_norm.detach().clone()
+            if args.plot_units == "normalized":
+                pred_plot_tensor = pred_norm.detach()
+                visible_plot_tensor = y_norm.detach().clone()
+            else:
+                pred_plot_tensor = denormalize(pred_norm, mean, std).detach()
+                visible_plot_tensor = y.detach().clone()
             visible_plot_tensor[mask < 0.5] = float("nan")
 
-        elif args.plot_units == "physical":
-            y_plot_tensor = y.detach()
-            pred_plot_tensor = denormalize(pred_norm, mean, std).detach()
-
-            visible_plot_tensor = y.detach().clone()
-            visible_plot_tensor[mask < 0.5] = float("nan")
-
-        else:
-            raise ValueError(f"Unknown plot_units: {args.plot_units}")
-
-        rows_for_plot.append(
-            {
+            row = {
                 "name": short_name,
                 "label": label,
                 "mask": mask[0].detach().cpu().numpy(),
                 "visible_plot": visible_plot_tensor[0].detach().cpu().numpy(),
                 "pred_plot": pred_plot_tensor[0].detach().cpu().numpy(),
             }
-        )
+            row["pred_ay"], row["pred_jy"] = compute_ay_jy(
+                row["pred_plot"], args.extent
+            )
+            rows_for_plot.append(row)
+        experiment_rows.append((experiment_name, rows_for_plot))
 
-    if args.plot_units == "normalized":
-        y_plot_np = y_norm[0].detach().cpu().numpy()
-    else:
-        y_plot_np = y[0].detach().cpu().numpy()
-
-    # Derived magnetic quantities are computed only from complete fields.
-    # In particular, no gradients or path integrations are applied to the
-    # masked Visible input arrays.
-    target_ay, target_jy = compute_ay_jy(y_plot_np, args.extent)
-    for row in rows_for_plot:
-        row["pred_ay"], row["pred_jy"] = compute_ay_jy(
-            row["pred_plot"], args.extent
-        )
-
-    pattern_tag = "-".join(args.mask_patterns)
-    common_stem = (
+    sample_stem = (
         f"sample{args.sample_index:04d}_"
         f"{metadata['run_name']}_"
         f"t0-{metadata['t0']}_"
-        f"{args.plot_units}_"
-        f"mf{args.mask_fraction:g}_"
-        f"masks_{pattern_tag}"
+        f"{args.plot_units}"
     )
     local_times = list(range(delta_t)) if args.all_times else [args.local_time]
     limit_times = local_times if args.all_times else None
-    jy_frame_paths = []
-    density_frame_paths = []
 
-    for local_time in local_times:
-        frame_stem = (
-            f"{common_stem}_"
-            f"localt-{local_time:03d}_"
-            f"globalt-{int(metadata['t0']) + local_time:04d}"
-        )
-        jy_path = out_dir / f"{frame_stem}_Jy_Ay_compact.png"
-        density_path = out_dir / f"{frame_stem}_Density_Ay_B_compact.png"
-
-        plot_jy_ay_by_mask_patterns(
-            target_ay=target_ay,
-            target_jy=target_jy,
-            target_field=y_plot_np,
-            rows=rows_for_plot,
-            metadata=metadata,
-            local_time=local_time,
-            out_path=jy_path,
-            extent=args.extent,
-            plot_units=args.plot_units,
-            ay_levels=args.ay_levels,
-            field_q=args.field_q,
-            residual_q=args.residual_q,
-            residual_vmax=args.residual_vmax,
-            quiver_step=args.quiver_step,
-            quiver_scale=args.quiver_scale,
-            dpi=args.dpi,
-            limit_times=limit_times,
-        )
-
-        plot_density_magnetic_field_by_mask_patterns(
-            target_field=y_plot_np,
-            target_ay=target_ay,
-            rows=rows_for_plot,
-            metadata=metadata,
-            local_time=local_time,
-            out_path=density_path,
-            extent=args.extent,
-            plot_units=args.plot_units,
-            ay_levels=args.ay_levels,
-            quiver_step=args.quiver_step,
-            quiver_scale=args.quiver_scale,
-            field_q=args.field_q,
-            residual_q=args.residual_q,
-            residual_vmax=args.residual_vmax,
-            dpi=args.dpi,
-            limit_times=limit_times,
-        )
-
-        jy_frame_paths.append(jy_path)
-        density_frame_paths.append(density_path)
-
-    if args.all_times:
-        animation_stem = (
-            f"{common_stem}_"
-            f"globalt-{int(metadata['t0']):04d}-"
-            f"{int(metadata['t0']) + delta_t - 1:04d}"
-        )
-        formats = (
-            ["quicktime", "gif"]
-            if args.animation_format == "both"
-            else [args.animation_format]
-        )
-
-        for animation_format in formats:
-            extension = "mov" if animation_format == "quicktime" else animation_format
-            write_animation(
-                jy_frame_paths,
-                out_dir / f"{animation_stem}_Jy_Ay.{extension}",
-                fps=args.fps,
+    for experiment_name, rows_for_plot in experiment_rows:
+        experiment_stem = f"{sample_stem}_experiment-{experiment_name}"
+        combined_frame_paths = []
+        for local_time in local_times:
+            frame_stem = (
+                f"{experiment_stem}_"
+                f"localt-{local_time:03d}_"
+                f"globalt-{int(metadata['t0']) + local_time:04d}"
             )
-            write_animation(
-                density_frame_paths,
-                out_dir / f"{animation_stem}_Density_Ay_B.{extension}",
-                fps=args.fps,
+            magnetic_path = out_dir / f"{frame_stem}_magnetic_table.png"
+            density_path = out_dir / f"{frame_stem}_density_table.png"
+            combined_path = out_dir / f"{frame_stem}_combined_1x2.png"
+
+            plot_jy_ay_by_mask_patterns(
+                target_ay=target_ay,
+                target_jy=target_jy,
+                target_field=y_plot_np,
+                rows=rows_for_plot,
+                metadata=metadata,
+                local_time=local_time,
+                out_path=magnetic_path,
+                extent=args.extent,
+                plot_units=args.plot_units,
+                ay_levels=args.ay_levels,
+                field_q=args.field_q,
+                residual_q=args.residual_q,
+                residual_vmax=args.residual_vmax,
+                quiver_step=args.quiver_step,
+                quiver_scale=args.quiver_scale,
+                dpi=args.dpi,
+                limit_times=limit_times,
             )
+
+            plot_density_magnetic_field_by_mask_patterns(
+                target_field=y_plot_np,
+                target_ay=target_ay,
+                rows=rows_for_plot,
+                metadata=metadata,
+                local_time=local_time,
+                out_path=density_path,
+                extent=args.extent,
+                plot_units=args.plot_units,
+                ay_levels=args.ay_levels,
+                quiver_step=args.quiver_step,
+                quiver_scale=args.quiver_scale,
+                field_q=args.field_q,
+                residual_q=args.residual_q,
+                residual_vmax=args.residual_vmax,
+                dpi=args.dpi,
+                limit_times=limit_times,
+            )
+            combine_table_images(
+                magnetic_path=magnetic_path,
+                density_path=density_path,
+                out_path=combined_path,
+            )
+            combined_frame_paths.append(combined_path)
+
+        if args.all_times:
+            animation_stem = (
+                f"{experiment_stem}_"
+                f"globalt-{int(metadata['t0']):04d}-"
+                f"{int(metadata['t0']) + delta_t - 1:04d}_combined_1x2"
+            )
+            formats = (
+                ["quicktime", "gif"]
+                if args.animation_format == "both"
+                else [args.animation_format]
+            )
+            for animation_format in formats:
+                extension = (
+                    "mov" if animation_format == "quicktime" else animation_format
+                )
+                write_animation(
+                    combined_frame_paths,
+                    out_dir / f"{animation_stem}.{extension}",
+                    fps=args.fps,
+                )
 
 
 if __name__ == "__main__":

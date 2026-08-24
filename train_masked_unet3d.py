@@ -12,7 +12,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, Sampler, Subset
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from data.vpic_hdf5_dataset import VPICWindowDataset
@@ -31,6 +34,57 @@ from data.masking import (
 from models.unet3d import UNet3D
 
 
+def distributed_is_initialized() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def is_main_process() -> bool:
+    return not distributed_is_initialized() or dist.get_rank() == 0
+
+
+def rank_print(*args, **kwargs) -> None:
+    if is_main_process():
+        print(*args, **kwargs)
+
+
+def initialize_distributed() -> Tuple[torch.device, int, int, int]:
+    """Initialize torchrun-provided DDP state, or fall back to one process."""
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    distributed = world_size > 1
+
+    if distributed:
+        if not torch.cuda.is_available():
+            raise RuntimeError("Multi-process DDP requires CUDA/NCCL GPUs.")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", init_method="env://")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        device = torch.device("cuda", local_rank)
+    else:
+        rank = 0
+        local_rank = 0
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    return device, rank, world_size, local_rank
+
+
+class DistributedEvalSampler(Sampler[int]):
+    """Shard validation indices without DistributedSampler's padding duplicates."""
+
+    def __init__(self, dataset, rank: int, world_size: int):
+        self.dataset = dataset
+        self.rank = rank
+        self.world_size = world_size
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.world_size))
+
+    def __len__(self) -> int:
+        remaining = len(self.dataset) - self.rank
+        return 0 if remaining <= 0 else (remaining + self.world_size - 1) // self.world_size
+
+
 def parse_args():
     p = argparse.ArgumentParser()
 
@@ -40,7 +94,7 @@ def parse_args():
         default="$SCRATCH/VPIC_PPPL_HDF5_by_beta_official2500_none_compat",
     )
     p.add_argument("--betas", type=float, nargs="+", default=[0.2])
-    p.add_argument("--delta-t", type=int, default=8)
+    p.add_argument("--delta-t", type=int, default=24)
     p.add_argument("--stride-t", type=int, default=2)
 
     p.add_argument("--batch-size", type=int, default=4)
@@ -49,7 +103,19 @@ def parse_args():
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
 
-    p.add_argument("--base-channels", type=int, default=16)
+    p.add_argument("--base-channels", type=int, default=24)
+    p.add_argument(
+        "--channel-mults",
+        type=int,
+        nargs="+",
+        default=[1, 2, 4, 8],
+        choices=range(1, 17),
+        help=(
+            "Channel multipliers for the U-Net resolution levels. Use "
+            "`1 2 4 8` for the four-level model or `1 2 4` for legacy "
+            "three-level checkpoints."
+        ),
+    )
 
     p.add_argument(
         "--mask-patterns",
@@ -226,6 +292,7 @@ RESUME_PARAMETER_KEYS = (
     "val_patterns",
     "val_mask_seed",
     "base_channels",
+    "channel_mults",
     "val_frac",
     "seed",
     "stats_batches",
@@ -306,7 +373,9 @@ def estimate_channel_stats(
     sumsq_c = None
     count = 0
 
-    for i, batch in enumerate(tqdm(loader, desc="Estimating stats")):
+    for i, batch in enumerate(
+        tqdm(loader, desc="Estimating stats", disable=not is_main_process())
+    ):
         if i >= max_batches:
             break
 
@@ -370,7 +439,7 @@ def train_one_epoch(
 
     scaler = torch.cuda.amp.GradScaler(enabled=(amp and device.type == "cuda"))
 
-    pbar = tqdm(loader, desc="Train", leave=False)
+    pbar = tqdm(loader, desc="Train", leave=False, disable=not is_main_process())
 
     for step, batch in enumerate(pbar):
         y = batch["block"].to(device, non_blocking=True)
@@ -435,6 +504,26 @@ def train_one_epoch(
                 mae=float(sum_mae) / total_batches,
             )
 
+    totals = torch.tensor(
+        [
+            float(sum_mse),
+            float(sum_mae),
+            float(total_batches),
+            float(sum_target_fraction),
+            float(count_samples),
+        ],
+        dtype=torch.float64,
+        device=device,
+    )
+    if distributed_is_initialized():
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+        dist.all_reduce(sum_mse_by_pattern, op=dist.ReduceOp.SUM)
+        dist.all_reduce(sum_actual_by_pattern, op=dist.ReduceOp.SUM)
+        dist.all_reduce(count_by_pattern, op=dist.ReduceOp.SUM)
+
+    global_mse, global_mae, global_batches, global_target, global_samples = (
+        totals.tolist()
+    )
     counts = count_by_pattern.cpu()
     mse_by_pattern = (sum_mse_by_pattern.cpu() / counts.clamp(min=1.0)).tolist()
     actual_by_pattern = (sum_actual_by_pattern.cpu() / counts.clamp(min=1.0)).tolist()
@@ -444,18 +533,18 @@ def train_one_epoch(
         name: {
             "mse": mse_by_pattern[i],
             "actual_mask_fraction": actual_by_pattern[i],
-            "share": counts[i] / max(count_samples, 1),
+            "share": counts[i] / max(global_samples, 1),
         }
         for i, name in enumerate(MASK_PATTERNS)
         if counts[i] > 0
     }
 
-    total_count = max(count_samples, 1)
+    total_count = max(global_samples, 1)
 
     return {
-        "mse": float(sum_mse) / max(total_batches, 1),
-        "mae": float(sum_mae) / max(total_batches, 1),
-        "target_mask_fraction": sum_target_fraction / total_count,
+        "mse": global_mse / max(global_batches, 1),
+        "mae": global_mae / max(global_batches, 1),
+        "target_mask_fraction": global_target / total_count,
         "actual_mask_fraction": float(sum_actual_by_pattern.sum().cpu()) / total_count,
         "per_pattern": per_pattern,
     }
@@ -494,7 +583,7 @@ def validate(
     sums = torch.zeros(len(patterns), 2, device=device)
     counts = torch.zeros(len(patterns), device=device)
 
-    pbar = tqdm(loader, desc="Val", leave=False)
+    pbar = tqdm(loader, desc="Val", leave=False, disable=not is_main_process())
 
     for batch_index, batch in enumerate(pbar):
         y = batch["block"].to(device, non_blocking=True)
@@ -528,6 +617,10 @@ def validate(
             sums[i, 1] += loss_mae.detach().float() * batch_size
             counts[i] += batch_size
 
+    if distributed_is_initialized():
+        dist.all_reduce(sums, op=dist.ReduceOp.SUM)
+        dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+
     sums = sums.cpu()
     counts = counts.cpu().clamp(min=1.0)
 
@@ -557,8 +650,9 @@ def save_checkpoint(
     stats: Dict[str, List[float]],
     wandb_run_id: Optional[str] = None,
 ) -> None:
+    model_to_save = model.module if isinstance(model, DistributedDataParallel) else model
     ckpt = {
-        "model": model.state_dict(),
+        "model": model_to_save.state_dict(),
         "optimizer": optimizer.state_dict(),
         "epoch": epoch,
         "best_val_mse": best_val_mse,
@@ -571,19 +665,31 @@ def save_checkpoint(
 
 def main():
     args = parse_args()
-    set_seed(args.seed)
+    device, rank, world_size, local_rank = initialize_distributed()
+    set_seed(args.seed + rank)
 
     automatic_out_dir = Path("runs") / default_run_name(args)
     out_dir = expand_path(args.out_dir or str(automatic_out_dir))
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if is_main_process():
+        out_dir.mkdir(parents=True, exist_ok=True)
+    if distributed_is_initialized():
+        dist.barrier()
 
     h5_dir = expand_path(args.h5_dir)
 
-    print("HDF5 dir:", h5_dir)
-    print("Output dir:", out_dir)
-    print("Betas:", args.betas)
-    print("Mask pattern weights:", args.mask_pattern_weights)
-    print("Validation mask patterns:", args.val_patterns)
+    rank_print("HDF5 dir:", h5_dir)
+    rank_print("Output dir:", out_dir)
+    rank_print("Betas:", args.betas)
+    rank_print("Mask pattern weights:", args.mask_pattern_weights)
+    rank_print("Validation mask patterns:", args.val_patterns)
+    rank_print(
+        f"Distributed: world_size={world_size}, rank={rank}, "
+        f"local_rank={local_rank}, device={device}"
+    )
+    rank_print(
+        f"Batch size: {args.batch_size} per GPU, "
+        f"global={args.batch_size * world_size}"
+    )
 
     dataset = VPICWindowDataset(
         h5_dir=h5_dir,
@@ -600,31 +706,50 @@ def main():
         seed=args.seed,
     )
 
-    print("Total windows:", len(dataset))
-    print("Train windows:", len(train_idx))
-    print("Val windows:", len(val_idx))
-    print("Train runs:", len(train_runs))
-    print("Val runs:", len(val_runs))
+    rank_print("Total windows:", len(dataset))
+    rank_print("Train windows:", len(train_idx))
+    rank_print("Val windows:", len(val_idx))
+    rank_print("Train runs:", len(train_runs))
+    rank_print("Val runs:", len(val_runs))
 
-    with open(out_dir / "split.json", "w") as f:
-        json.dump(
-            {
-                "train_runs": train_runs,
-                "val_runs": val_runs,
-                "num_train_windows": len(train_idx),
-                "num_val_windows": len(val_idx),
-            },
-            f,
-            indent=2,
-        )
+    if is_main_process():
+        with open(out_dir / "split.json", "w") as f:
+            json.dump(
+                {
+                    "train_runs": train_runs,
+                    "val_runs": val_runs,
+                    "num_train_windows": len(train_idx),
+                    "num_val_windows": len(val_idx),
+                },
+                f,
+                indent=2,
+            )
 
     train_set = Subset(dataset, train_idx)
     val_set = Subset(dataset, val_idx)
 
+    train_sampler = None
+    val_sampler = None
+    if distributed_is_initialized():
+        train_sampler = DistributedSampler(
+            train_set,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=args.seed,
+            drop_last=True,
+        )
+        val_sampler = DistributedEvalSampler(
+            val_set,
+            rank=rank,
+            world_size=world_size,
+        )
+
     train_loader = DataLoader(
         train_set,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
         persistent_workers=(args.num_workers > 0),
@@ -635,40 +760,57 @@ def main():
         val_set,
         batch_size=args.batch_size,
         shuffle=False,
+        sampler=val_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
         persistent_workers=(args.num_workers > 0),
         drop_last=False,
     )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Device:", device)
+    rank_print("Device:", device)
 
     resume_checkpoint = None
     latest_path = out_dir / "latest.pt"
     if args.auto_resume and latest_path.exists():
         resume_checkpoint = torch.load(latest_path, map_location=device)
         validate_resume_parameters(args, resume_checkpoint.get("args", {}))
-        print(
+        rank_print(
             f"Auto-resuming from {latest_path} "
             f"(completed epoch {resume_checkpoint['epoch']})"
         )
 
     if resume_checkpoint is not None and "stats" in resume_checkpoint:
         stats = resume_checkpoint["stats"]
-        print("Reusing channel statistics from checkpoint")
+        rank_print("Reusing channel statistics from checkpoint")
     else:
-        stats = estimate_channel_stats(
-            train_loader,
-            device=device,
-            max_batches=args.stats_batches,
-        )
+        stats = None
+        if is_main_process():
+            stats_loader = DataLoader(
+                train_set,
+                batch_size=args.batch_size,
+                shuffle=True,
+                num_workers=args.num_workers,
+                pin_memory=True,
+                persistent_workers=False,
+                drop_last=True,
+                generator=torch.Generator().manual_seed(args.seed),
+            )
+            stats = estimate_channel_stats(
+                stats_loader,
+                device=device,
+                max_batches=args.stats_batches,
+            )
+        if distributed_is_initialized():
+            stats_object = [stats]
+            dist.broadcast_object_list(stats_object, src=0)
+            stats = stats_object[0]
 
-    print("Channel mean:", stats["mean"])
-    print("Channel std:", stats["std"])
+    rank_print("Channel mean:", stats["mean"])
+    rank_print("Channel std:", stats["std"])
 
-    with open(out_dir / "stats.json", "w") as f:
-        json.dump(stats, f, indent=2)
+    if is_main_process():
+        with open(out_dir / "stats.json", "w") as f:
+            json.dump(stats, f, indent=2)
 
     mean = torch.tensor(stats["mean"], dtype=torch.float32, device=device).view(1, 4, 1, 1, 1)
     std = torch.tensor(stats["std"], dtype=torch.float32, device=device).view(1, 4, 1, 1, 1)
@@ -677,10 +819,11 @@ def main():
         in_channels=8,
         out_channels=4,
         base_channels=args.base_channels,
+        channel_mults=args.channel_mults,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {n_params / 1e6:.3f} M")
+    rank_print(f"Model parameters: {n_params / 1e6:.3f} M")
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -696,20 +839,34 @@ def main():
         start_epoch = int(resume_checkpoint["epoch"]) + 1
         best_val_mse = float(resume_checkpoint.get("best_val_mse", float("inf")))
 
-    with open(out_dir / "config.json", "w") as f:
-        json.dump(vars(args), f, indent=2)
+    if distributed_is_initialized():
+        model = DistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+        )
+
+    if is_main_process():
+        with open(out_dir / "config.json", "w") as f:
+            json.dump(vars(args), f, indent=2)
 
     if start_epoch > args.epochs:
-        print(
+        rank_print(
             f"Training is already complete at epoch {start_epoch - 1}; "
             f"requested epochs={args.epochs}. Increase --epochs to continue."
         )
+        if distributed_is_initialized():
+            dist.destroy_process_group()
         return
 
     resume_run_id = None
     if resume_checkpoint is not None:
         resume_run_id = resume_checkpoint.get("wandb_run_id")
-    wandb_run = init_wandb(args, out_dir, resume_run_id=resume_run_id)
+    wandb_run = (
+        init_wandb(args, out_dir, resume_run_id=resume_run_id)
+        if is_main_process()
+        else None
+    )
     if wandb_run is not None:
         wandb_run.config.update(
             {
@@ -734,13 +891,15 @@ def main():
 
     history = []
     history_path = out_dir / "history.json"
-    if resume_checkpoint is not None and history_path.exists():
+    if is_main_process() and resume_checkpoint is not None and history_path.exists():
         with open(history_path) as f:
             history = json.load(f)
         history = [row for row in history if row.get("epoch", 0) < start_epoch]
 
     for epoch in range(start_epoch, args.epochs + 1):
-        print(f"\nEpoch {epoch}/{args.epochs}")
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        rank_print(f"\nEpoch {epoch}/{args.epochs}")
 
         train_metrics = train_one_epoch(
             model=model,
@@ -755,7 +914,7 @@ def main():
         )
 
         val_metrics = validate(
-            model=model,
+            model=(model.module if isinstance(model, DistributedDataParallel) else model),
             loader=val_loader,
             device=device,
             mean=mean,
@@ -778,7 +937,8 @@ def main():
                 pattern: val_metrics[pattern] for pattern in args.val_patterns
             },
         }
-        history.append(row)
+        if is_main_process():
+            history.append(row)
 
         if wandb_run is not None:
             log_data = {
@@ -807,13 +967,13 @@ def main():
 
             wandb_run.log(log_data)
 
-        print(
+        rank_print(
             f"train_mse={row['train_mse']:.6f} "
             f"train_mae={row['train_mae']:.6f} "
             f"val_mse={row['val_mse']:.6f} "
             f"val_mae={row['val_mae']:.6f}"
         )
-        print(
+        rank_print(
             "  val by pattern: "
             + "  ".join(
                 f"{pattern}={val_metrics[pattern]['mse']:.6f}"
@@ -821,13 +981,28 @@ def main():
             )
         )
 
-        with open(out_dir / "history.json", "w") as f:
-            json.dump(history, f, indent=2)
+        if is_main_process():
+            with open(out_dir / "history.json", "w") as f:
+                json.dump(history, f, indent=2)
 
         if row["val_mse"] < best_val_mse:
             best_val_mse = row["val_mse"]
+            if is_main_process():
+                save_checkpoint(
+                    out_dir / "best.pt",
+                    model=model,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                    best_val_mse=best_val_mse,
+                    args=args,
+                    stats=stats,
+                    wandb_run_id=wandb_run.id if wandb_run is not None else None,
+                )
+                rank_print(f"Saved best checkpoint: val_mse={best_val_mse:.6f}")
+
+        if is_main_process():
             save_checkpoint(
-                out_dir / "best.pt",
+                latest_path,
                 model=model,
                 optimizer=optimizer,
                 epoch=epoch,
@@ -836,18 +1011,8 @@ def main():
                 stats=stats,
                 wandb_run_id=wandb_run.id if wandb_run is not None else None,
             )
-            print(f"Saved best checkpoint: val_mse={best_val_mse:.6f}")
-
-        save_checkpoint(
-            latest_path,
-            model=model,
-            optimizer=optimizer,
-            epoch=epoch,
-            best_val_mse=best_val_mse,
-            args=args,
-            stats=stats,
-            wandb_run_id=wandb_run.id if wandb_run is not None else None,
-        )
+        if distributed_is_initialized():
+            dist.barrier()
 
     if wandb_run is not None:
         wandb_run.summary["best_val_mse"] = best_val_mse
@@ -862,6 +1027,9 @@ def main():
             artifact.add_file(str(out_dir / "best.pt"))
             wandb_run.log_artifact(artifact)
         wandb_run.finish()
+
+    if distributed_is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

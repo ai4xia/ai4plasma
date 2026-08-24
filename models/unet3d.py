@@ -78,20 +78,33 @@ class UNet3D(nn.Module):
         self,
         in_channels: int = 8,
         out_channels: int = 4,
-        base_channels: int = 16,
-        channel_mults: Sequence[int] = (1, 2, 4),
+        base_channels: int = 24,
+        channel_mults: Sequence[int] = (1, 2, 4, 8),
     ):
         super().__init__()
 
-        c0 = base_channels * channel_mults[0]
-        c1 = base_channels * channel_mults[1]
-        c2 = base_channels * channel_mults[2]
+        channel_mults = tuple(int(mult) for mult in channel_mults)
+        if len(channel_mults) not in {3, 4}:
+            raise ValueError(
+                "UNet3D supports three or four resolution levels, got "
+                f"channel_mults={channel_mults}."
+            )
+
+        channels = [base_channels * mult for mult in channel_mults]
+        c0, c1, c2 = channels[:3]
+        self.num_levels = len(channels)
 
         self.enc0 = ConvBlock3D(in_channels, c0)
         self.enc1 = DownBlock3D(c0, c1)
         self.enc2 = DownBlock3D(c1, c2)
 
-        self.mid = ConvBlock3D(c2, c2)
+        if self.num_levels == 4:
+            c3 = channels[3]
+            self.enc3 = DownBlock3D(c2, c3)
+            self.mid = ConvBlock3D(c3, c3)
+            self.up2 = UpBlock3D(c3, c2, c2)
+        else:
+            self.mid = ConvBlock3D(c2, c2)
 
         self.up1 = UpBlock3D(c2, c1, c1)
         self.up0 = UpBlock3D(c1, c0, c0)
@@ -103,8 +116,14 @@ class UNet3D(nn.Module):
         s1 = self.enc1(s0)
         x = self.enc2(s1)
 
+        if self.num_levels == 4:
+            s2 = x
+            x = self.enc3(s2)
+
         x = self.mid(x)
 
+        if self.num_levels == 4:
+            x = self.up2(x, s2)
         x = self.up1(x, s1)
         x = self.up0(x, s0)
 
@@ -112,8 +131,8 @@ class UNet3D(nn.Module):
 
 
 if __name__ == "__main__":
-    model = UNet3D(in_channels=8, out_channels=4, base_channels=16)
-    x = torch.randn(2, 8, 8, 154, 62)
+    model = UNet3D(in_channels=8, out_channels=4, base_channels=24)
+    x = torch.randn(1, 8, 24, 154, 62)
     y = model(x)
     print("input:", x.shape)
     print("output:", y.shape)
