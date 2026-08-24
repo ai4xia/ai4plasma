@@ -5,6 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
@@ -19,9 +22,6 @@ import torch
 from data.vpic_hdf5_dataset import VPICWindowDataset
 from data.masking import MASK_PATTERNS, make_visible_input, sample_mask
 from models.unet3d import UNet3D
-
-
-CHANNEL_NAMES = ["Bx", "By", "Bz", "Density"]
 
 
 def parse_args():
@@ -71,21 +71,49 @@ def parse_args():
         "--grid-stride",
         type=int,
         default=4,
-        help="Fixed spatial_grid stride. The grid offset stays random.",
+        help=(
+            "Density stride for the spatial_grid row. The grid offset stays "
+            "random. Default: 4 (one Density observation per 4x4 cell)."
+        ),
+    )
+    p.add_argument(
+        "--magnetic-grid-stride",
+        type=int,
+        default=2,
+        help=(
+            "Bx/By/Bz stride for the spatial_grid row. Default: 2, making "
+            "magnetic observations denser than Density observations."
+        ),
     )
 
-    p.add_argument(
-        "--channels",
-        type=int,
-        nargs="+",
-        default=[0, 2, 3],
-        help="Channels to plot. 0=Bx, 1=By, 2=Bz, 3=Density.",
-    )
     p.add_argument(
         "--local-time",
         type=int,
         default=4,
-        help="One local time index inside the temporal block. Rows are mask patterns.",
+        help=(
+            "One local time index inside the temporal block. Ignored by plotting "
+            "when --all-times is set."
+        ),
+    )
+    p.add_argument(
+        "--all-times",
+        action="store_true",
+        help=(
+            "Plot all local time slices from the model's temporal window and "
+            "combine each figure family into an animation."
+        ),
+    )
+    p.add_argument(
+        "--animation-format",
+        choices=["mp4", "gif", "both"],
+        default="mp4",
+        help="Animation output written with --all-times (default: mp4).",
+    )
+    p.add_argument(
+        "--fps",
+        type=float,
+        default=2.0,
+        help="Animation frame rate used with --all-times (default: 2).",
     )
     p.add_argument(
         "--mask-patterns",
@@ -124,6 +152,25 @@ def parse_args():
         type=float,
         default=None,
         help="Optional fixed symmetric residual color limit. If set, use [-vmax, vmax].",
+    )
+
+    p.add_argument(
+        "--ay-levels",
+        type=int,
+        default=15,
+        help="Number of Ay contour levels.",
+    )
+    p.add_argument(
+        "--quiver-step",
+        type=int,
+        default=20,
+        help="Spatial subsampling step for in-plane magnetic-field arrows.",
+    )
+    p.add_argument(
+        "--quiver-scale",
+        type=float,
+        default=15.0,
+        help="Matplotlib quiver scale for the in-plane magnetic field.",
     )
 
     p.add_argument(
@@ -269,10 +316,18 @@ def format_mask_label(info: Dict) -> str:
     if pattern == "spatial_random":
         detail = "independent voxels"
     elif pattern == "spatial_grid":
-        detail = (
-            f"stride={info['stride']}×{info['stride']}\n"
-            f"offset=({info['offset_x']}, {info['offset_z']})"
-        )
+        if "magnetic_stride" in info:
+            detail = (
+                f"B stride={info['magnetic_stride']}×{info['magnetic_stride']}, "
+                f"offset=({info['magnetic_offset_x']}, {info['magnetic_offset_z']})\n"
+                f"Density stride={info['density_stride']}×{info['density_stride']}, "
+                f"offset=({info['density_offset_x']}, {info['density_offset_z']})"
+            )
+        else:
+            detail = (
+                f"stride={info['stride']}×{info['stride']}\n"
+                f"offset=({info['offset_x']}, {info['offset_z']})"
+            )
     elif pattern == "spatial_block":
         detail = (
             f"hole={100.0 * info['target_mask_fraction']:.0f}%\n"
@@ -293,6 +348,7 @@ def build_mask_patterns(
     mask_fraction: float,
     block_fraction: float,
     grid_stride: int,
+    magnetic_grid_stride: int,
     generator: torch.Generator,
 ) -> List[Tuple[str, str, torch.Tensor]]:
     """
@@ -307,6 +363,45 @@ def build_mask_patterns(
     rows = []
 
     for name in patterns:
+        if name == "spatial_grid":
+            # Visualization-only benchmark geometry: magnetic diagnostics are
+            # sampled more densely than Density, matching the intended probe
+            # arrangement. Training mask sampling is deliberately unchanged.
+            magnetic_mask, magnetic_info = sample_mask(
+                block.shape,
+                pattern=name,
+                mask_fraction=mask_fraction,
+                device=block.device,
+                dtype=block.dtype,
+                generator=generator,
+                grid_stride=magnetic_grid_stride,
+            )
+            density_mask, density_info = sample_mask(
+                block.shape,
+                pattern=name,
+                mask_fraction=mask_fraction,
+                device=block.device,
+                dtype=block.dtype,
+                generator=generator,
+                grid_stride=grid_stride,
+            )
+
+            mask = magnetic_mask.clone()
+            mask[:, 3:4] = density_mask[:, 3:4]
+            info = {
+                "pattern": name,
+                "target_mask_fraction": mask_fraction,
+                "actual_mask_fraction": float(1.0 - mask.mean().item()),
+                "magnetic_stride": magnetic_info["stride"],
+                "magnetic_offset_x": magnetic_info["offset_x"],
+                "magnetic_offset_z": magnetic_info["offset_z"],
+                "density_stride": density_info["stride"],
+                "density_offset_x": density_info["offset_x"],
+                "density_offset_z": density_info["offset_z"],
+            }
+            rows.append((name, format_mask_label(info), mask))
+            continue
+
         mask, info = sample_mask(
             block.shape,
             pattern=name,
@@ -314,7 +409,6 @@ def build_mask_patterns(
             device=block.device,
             dtype=block.dtype,
             generator=generator,
-            grid_stride=grid_stride if name == "spatial_grid" else None,
         )
         rows.append((name, format_mask_label(info), mask))
 
@@ -342,41 +436,123 @@ def compute_full_metrics(
     return rmse, mae
 
 
-def plot_channel_by_mask_patterns(
-    y_plot: np.ndarray,
-    rows: List[Dict],
-    metadata: Dict,
-    channel: int,
-    local_time: int,
-    out_path: Path,
-    extent,
-    plot_units: str,
-    mask_fraction: float,
-    field_q: float = 99.0,
-    residual_q: float = 99.0,
-    residual_vmax: float | None = None,
-    dpi: int = 180,
-):
+def physical_coordinates(shape: Sequence[int], extent: Sequence[float]):
+    """Return x-z coordinates for an (X, Z) field and imshow extent."""
+    X, Z = int(shape[-2]), int(shape[-1])
+    zmin, zmax, xmin, xmax = (float(v) for v in extent)
+    x = np.linspace(xmin, xmax, X)
+    z = np.linspace(zmin, zmax, Z)
+    return x, z
+
+
+def compute_ay_jy(
+    field: np.ndarray,
+    extent: Sequence[float],
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    y_plot: (C, T, X, Z)
+    Derive Ay and Jy from a complete (C, T, X, Z) field.
 
-    rows is list of dicts with:
-        name, label, pred_plot, visible_plot, mask
-    each array has shape (C, T, X, Z)
+    The sign convention matches visualization.ipynb:
+        Bx = -dAy/dz, Bz = dAy/dx
+        Jy = dBx/dz - dBz/dx
+
+    Ay is path-integrated exactly as in the notebook and its arbitrary additive
+    constant is removed independently for every frame.  This function is only
+    called for complete target and prediction fields, never masked input.
     """
-    channel_name = CHANNEL_NAMES[channel]
+    if field.ndim != 4 or field.shape[0] < 3:
+        raise ValueError(f"Expected (C, T, X, Z) with Bx/Bz channels, got {field.shape}")
 
-    n_rows = len(rows)
-    n_data_cols = 4
+    bx = np.asarray(field[0], dtype=np.float64)
+    bz = np.asarray(field[2], dtype=np.float64)
+    T, X, Z = bx.shape
+    x, z = physical_coordinates((X, Z), extent)
 
-    # Layout:
-    #   Target | Visible | Prediction | field cbar | Residual | residual cbar
-    # This gives one colorbar for the first three field columns and one for residuals.
-    fig = plt.figure(
-        figsize=(13.0, 2.15 * n_rows + 1.2),
-        constrained_layout=False,
+    ay = np.zeros((T, X, Z), dtype=np.float64)
+    jy = np.empty((T, X, Z), dtype=np.float64)
+
+    for t in range(T):
+        # First integrate Bz along x at the left z boundary, then integrate
+        # -Bx along z for every x. This is the same path used in the notebook.
+        for ix in range(1, X):
+            dx = x[ix] - x[ix - 1]
+            ay[t, ix, 0] = ay[t, ix - 1, 0] + 0.5 * (
+                bz[t, ix - 1, 0] + bz[t, ix, 0]
+            ) * dx
+
+        for iz in range(1, Z):
+            dz = z[iz] - z[iz - 1]
+            ay[t, :, iz] = ay[t, :, iz - 1] - 0.5 * (
+                bx[t, :, iz - 1] + bx[t, :, iz]
+            ) * dz
+
+        ay[t] -= np.mean(ay[t])
+        d_bx_dz = np.gradient(bx[t], z, axis=1)
+        d_bz_dx = np.gradient(bz[t], x, axis=0)
+        jy[t] = d_bx_dz - d_bz_dx
+
+    return ay, jy
+
+
+def add_ay_contours(
+    ax,
+    ay: np.ndarray,
+    extent: Sequence[float],
+    levels: int,
+    color: str,
+) -> None:
+    """Overlay Ay contours, skipping degenerate fields cleanly."""
+    if levels <= 0 or not np.isfinite(ay).any():
+        return
+    amin = float(np.nanmin(ay))
+    amax = float(np.nanmax(ay))
+    if np.isclose(amin, amax):
+        return
+
+    x, z = physical_coordinates(ay.shape, extent)
+    zz, xx = np.meshgrid(z, x)
+    ax.contour(zz, xx, ay, levels=levels, colors=color, linewidths=0.6)
+
+
+def add_inplane_quiver(
+    ax,
+    bx: np.ndarray,
+    bz: np.ndarray,
+    extent: Sequence[float],
+    step: int,
+    scale: float,
+    visible_mask: np.ndarray | None = None,
+    color: str = "black",
+) -> None:
+    """Overlay (Bz, Bx) arrows, optionally only where both fields are visible."""
+    step = max(1, int(step))
+    x, z = physical_coordinates(bx.shape, extent)
+    zz, xx = np.meshgrid(z[::step], x[::step])
+    u = np.asarray(bz[::step, ::step])
+    v = np.asarray(bx[::step, ::step])
+
+    if visible_mask is not None:
+        keep = np.asarray(visible_mask[::step, ::step]) > 0.5
+        u = np.ma.masked_where(~keep, u)
+        v = np.ma.masked_where(~keep, v)
+
+    ax.quiver(
+        zz,
+        xx,
+        u,
+        v,
+        color=color,
+        scale=scale,
+        width=0.002,
     )
 
+
+def _make_comparison_axes(n_rows: int):
+    """Create Target | Visible/mask | Prediction | Residual comparison axes."""
+    fig = plt.figure(
+        figsize=(13.0, 5 * n_rows + 2),
+        constrained_layout=False,
+    )
     gs = gridspec.GridSpec(
         nrows=n_rows,
         ncols=6,
@@ -390,12 +566,10 @@ def plot_channel_by_mask_patterns(
         top=0.90,
     )
 
-    axes = np.empty((n_rows, n_data_cols), dtype=object)
+    axes = np.empty((n_rows, 4), dtype=object)
     base_ax = None
-
-    data_cols_to_grid_cols = [0, 1, 2, 4]
     for r in range(n_rows):
-        for c, gcol in enumerate(data_cols_to_grid_cols):
+        for c, gcol in enumerate([0, 1, 2, 4]):
             if base_ax is None:
                 ax = fig.add_subplot(gs[r, gcol])
                 base_ax = ax
@@ -403,157 +577,511 @@ def plot_channel_by_mask_patterns(
                 ax = fig.add_subplot(gs[r, gcol], sharex=base_ax, sharey=base_ax)
             axes[r, c] = ax
 
-    cax_field = fig.add_subplot(gs[:, 3])
-    cax_residual = fig.add_subplot(gs[:, 5])
+    return fig, axes, fig.add_subplot(gs[:, 3]), fig.add_subplot(gs[:, 5])
 
-    field_cmap = make_nan_cmap("viridis" if channel == 3 else "PuOr")
-    residual_cmap = make_nan_cmap("PRGn")
 
-    target = y_plot[channel, local_time]
+def _style_comparison_axis(ax, row: int, col: int, n_rows: int) -> None:
+    if row < n_rows - 1:
+        ax.tick_params(labelbottom=False)
+    if col > 0:
+        ax.tick_params(labelleft=False)
+    ax.tick_params(axis="both", which="both", labelsize=8, length=2.5)
 
-    all_field_arrays = [target]
-    all_residual_arrays = []
 
-    for row in rows:
-        pred = row["pred_plot"][channel, local_time]
-        residual = pred - target
-
-        all_field_arrays.append(pred)
-        all_residual_arrays.append(residual)
-
-    field_vmin, field_vmax = robust_limits(
-        all_field_arrays,
-        channel=channel,
-        q=field_q,
-        symmetric=None,
+def _figure_context(metadata: Dict, local_time: int) -> str:
+    t0 = metadata.get("t0", "unknown")
+    global_frame = int(t0) + int(local_time)
+    return (
+        f"{metadata.get('run_name', 'unknown')}, block t0={t0}, "
+        f"local t={local_time}, global frame={global_frame}, "
+        f"beta={metadata.get('beta', 'unknown')}, "
+        f"nu={metadata.get('nu', 'unknown')}, "
+        f"Bz0={metadata.get('Bz0', 'unknown')}, "
+        f"tau={metadata.get('tau', 'unknown')}"
     )
 
-    if residual_vmax is not None:
-        res_vmin, res_vmax = -float(residual_vmax), float(residual_vmax)
+
+def write_animation(
+    frame_paths: Sequence[Path],
+    out_path: Path,
+    fps: float,
+) -> None:
+    """Encode already-rendered PNG frames without repeating model inference."""
+    if not frame_paths:
+        raise ValueError("Cannot create an animation without frames.")
+    if fps <= 0:
+        raise ValueError(f"--fps must be positive, got {fps}")
+
+    suffix = out_path.suffix.lower()
+    if suffix == ".mp4":
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            raise RuntimeError(
+                "MP4 output requires ffmpeg on PATH. Use "
+                "`--animation-format gif` when ffmpeg is unavailable."
+            )
+
+        encoder_listing = subprocess.run(
+            [ffmpeg, "-hide_banner", "-encoders"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        if "libx264" in encoder_listing:
+            codec_args = ["-c:v", "libx264", "-crf", "20"]
+        elif "libvpx-vp9" in encoder_listing:
+            codec_args = ["-c:v", "libvpx-vp9", "-crf", "30", "-b:v", "0"]
+        else:
+            raise RuntimeError(
+                "ffmpeg is available, but neither libx264 nor libvpx-vp9 is enabled. "
+                "Use `--animation-format gif` on this system."
+            )
+
+        # Use sequential links so ffmpeg receives an unambiguous frame order,
+        # independent of the long descriptive PNG filenames.
+        with tempfile.TemporaryDirectory(
+            prefix=".animation-frames-",
+            dir=out_path.parent,
+        ) as temp_dir:
+            temp_dir_path = Path(temp_dir)
+            for i, frame_path in enumerate(frame_paths):
+                os.symlink(
+                    frame_path.resolve(),
+                    temp_dir_path / f"frame_{i:03d}.png",
+                )
+
+            command = [
+                ffmpeg,
+                "-y",
+                "-loglevel",
+                "error",
+                "-framerate",
+                str(fps),
+                "-i",
+                str(temp_dir_path / "frame_%03d.png"),
+            ]
+            command.extend(codec_args)
+            command.extend(
+                [
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-vf",
+                    "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                    str(out_path),
+                ]
+            )
+            subprocess.run(
+                command,
+                check=True,
+            )
+    elif suffix == ".gif":
+        try:
+            from PIL import Image
+        except ImportError as exc:
+            raise RuntimeError(
+                "GIF output requires Pillow. Install it with `pip install pillow`, "
+                "or use `--animation-format mp4`."
+            ) from exc
+
+        frames = []
+        for frame_path in frame_paths:
+            with Image.open(frame_path) as image:
+                frames.append(
+                    image.convert("RGB").convert("P", palette=Image.ADAPTIVE)
+                )
+
+        frames[0].save(
+            out_path,
+            save_all=True,
+            append_images=frames[1:],
+            duration=max(1, int(round(1000.0 / fps))),
+            loop=0,
+            optimize=False,
+            disposal=2,
+        )
     else:
+        raise ValueError(f"Unsupported animation extension: {out_path.suffix}")
+
+    print(f"Saved animation: {out_path}")
+
+
+def plot_jy_ay_by_mask_patterns(
+    target_ay: np.ndarray,
+    target_jy: np.ndarray,
+    rows: List[Dict],
+    metadata: Dict,
+    local_time: int,
+    out_path: Path,
+    extent: Sequence[float],
+    plot_units: str,
+    ay_levels: int,
+    field_q: float,
+    residual_q: float,
+    residual_vmax: float | None,
+    dpi: int,
+    limit_times: Sequence[int] | None = None,
+) -> None:
+    """
+    Plot Jy with Ay contours for complete target/prediction fields.
+
+    The Visible input column intentionally shows only the joint Bx/Bz
+    observation mask. Jy and Ay are not derived from incomplete observations.
+    """
+    n_rows = len(rows)
+    fig, axes, cax_field, cax_residual = _make_comparison_axes(n_rows)
+
+    target = target_jy[local_time]
+    pred_arrays = [row["pred_jy"][local_time] for row in rows]
+    residual_arrays = [pred - target for pred in pred_arrays]
+    color_times = [local_time] if limit_times is None else list(limit_times)
+    all_target_jy = [target_jy[t] for t in color_times]
+    all_pred_jy = [row["pred_jy"][t] for row in rows for t in color_times]
+    all_residual_jy = [
+        row["pred_jy"][t] - target_jy[t]
+        for row in rows
+        for t in color_times
+    ]
+    jy_vmin, jy_vmax = robust_limits(
+        all_target_jy + all_pred_jy,
+        channel=0,
+        q=field_q,
+        symmetric=True,
+    )
+    if residual_vmax is None:
         res_vmin, res_vmax = robust_limits(
-            all_residual_arrays,
-            channel=channel,
+            all_residual_jy,
+            channel=0,
             q=residual_q,
             symmetric=True,
         )
+    else:
+        res_vmin, res_vmax = -float(residual_vmax), float(residual_vmax)
 
-    col_titles = ["Target", "Visible input", "Prediction", "Residual"]
-
+    jy_cmap = make_nan_cmap("seismic")
+    residual_cmap = make_nan_cmap("PRGn")
+    mask_cmap = make_nan_cmap("Greys")
     field_im = None
     residual_im = None
 
     for r, row in enumerate(rows):
-        mask = row["mask"][channel, local_time]
-        visible = row["visible_plot"][channel, local_time]
-        pred = row["pred_plot"][channel, local_time]
-
-        residual = pred - target
-
+        pred = pred_arrays[r]
+        residual = residual_arrays[r]
+        joint_b_mask = np.minimum(
+            row["mask"][0, local_time],
+            row["mask"][2, local_time],
+        )
+        visible_pct = 100.0 * float(np.mean(joint_b_mask))
         rmse, mae = compute_full_metrics(pred, target)
-        visible_pct = 100.0 * float(np.nanmean(mask))
-
         row_label = (
             f"{row['label']}\n"
-            f"visible={visible_pct:.2f}%\n"
-            f"RMSE={rmse:.3g}\n"
-            f"MAE={mae:.3g}"
+            f"joint B visible={visible_pct:.2f}%\n"
+            f"Jy RMSE={rmse:.3g}\n"
+            f"Jy MAE={mae:.3g}"
         )
 
-        panels = [
-            (target, field_cmap, field_vmin, field_vmax),
-            (visible, field_cmap, field_vmin, field_vmax),
-            (pred, field_cmap, field_vmin, field_vmax),
-            (residual, residual_cmap, res_vmin, res_vmax),
-        ]
+        field_im = axes[r, 0].imshow(
+            target,
+            origin="lower",
+            aspect="auto",
+            extent=extent,
+            cmap=jy_cmap,
+            vmin=jy_vmin,
+            vmax=jy_vmax,
+            interpolation="nearest",
+        )
+        add_ay_contours(
+            axes[r, 0], target_ay[local_time], extent, ay_levels, color="black"
+        )
 
-        for c, (image, cmap, vmin, vmax) in enumerate(panels):
-            ax = axes[r, c]
-
-            im = ax.imshow(
-                image,
-                origin="lower",
-                aspect="auto",
-                extent=extent,
-                cmap=cmap,
-                vmin=vmin,
-                vmax=vmax,
-                interpolation="nearest",
+        axes[r, 1].imshow(
+            joint_b_mask,
+            origin="lower",
+            aspect="auto",
+            extent=extent,
+            cmap=mask_cmap,
+            vmin=0.0,
+            vmax=1.0,
+            interpolation="nearest",
+        )
+        if visible_pct == 0.0:
+            axes[r, 1].text(
+                0.5,
+                0.5,
+                "Frame hidden",
+                transform=axes[r, 1].transAxes,
+                ha="center",
+                va="center",
+                color="white",
+                fontsize=10,
             )
 
-            if c < 3:
-                field_im = im
-            else:
-                residual_im = im
+        axes[r, 2].imshow(
+            pred,
+            origin="lower",
+            aspect="auto",
+            extent=extent,
+            cmap=jy_cmap,
+            vmin=jy_vmin,
+            vmax=jy_vmax,
+            interpolation="nearest",
+        )
+        add_ay_contours(
+            axes[r, 2], row["pred_ay"][local_time], extent, ay_levels, color="black"
+        )
 
+        residual_im = axes[r, 3].imshow(
+            residual,
+            origin="lower",
+            aspect="auto",
+            extent=extent,
+            cmap=residual_cmap,
+            vmin=res_vmin,
+            vmax=res_vmax,
+            interpolation="nearest",
+        )
+        axes[r, 0].text(
+            -0.33,
+            0.5,
+            row_label,
+            transform=axes[r, 0].transAxes,
+            ha="right",
+            va="center",
+            rotation=90,
+            fontsize=8,
+            linespacing=1.05,
+        )
+
+        for c in range(4):
             if r == 0:
-                ax.set_title(col_titles[c], fontsize=11, pad=4)
-
-            # Only show tick labels on outer axes.
-            if r < n_rows - 1:
-                ax.tick_params(labelbottom=False)
-            if c > 0:
-                ax.tick_params(labelleft=False)
-
-            ax.tick_params(axis="both", which="both", labelsize=8, length=2.5)
-
-            # Row label on the far left, not repeated axis units.
-            if c == 0:
-                ax.text(
-                    -0.33,
-                    0.5,
-                    row_label,
-                    transform=ax.transAxes,
-                    ha="right",
-                    va="center",
-                    rotation=90,
-                    fontsize=8,
-                    linespacing=1.05,
+                axes[r, c].set_title(
+                    ["Target Jy + Ay", "Bx/Bz observation mask", "Prediction Jy + Ay", "Jy residual"][c],
+                    fontsize=11,
+                    pad=4,
                 )
+            _style_comparison_axis(axes[r, c], r, c, n_rows)
 
-    # Shared colorbars.
-    if field_im is not None:
-        cb_field = fig.colorbar(field_im, cax=cax_field)
-        cb_field.ax.tick_params(labelsize=8, length=2.5)
-        cb_field.set_label(
-            f"{channel_name} ({plot_units})",
-            fontsize=9,
-            rotation=90,
-            labelpad=8,
-        )
+    cb_field = fig.colorbar(field_im, cax=cax_field)
+    cb_field.set_label(f"Jy ({plot_units})", fontsize=9, labelpad=8)
+    cb_field.ax.tick_params(labelsize=8, length=2.5)
+    cb_res = fig.colorbar(residual_im, cax=cax_residual)
+    cb_res.set_label(f"Prediction − target Jy ({plot_units})", fontsize=9, labelpad=8)
+    cb_res.ax.tick_params(labelsize=8, length=2.5)
 
-    if residual_im is not None:
-        cb_res = fig.colorbar(residual_im, cax=cax_residual)
-        cb_res.ax.tick_params(labelsize=8, length=2.5)
-        cb_res.set_label(
-            f"Prediction − target ({plot_units})",
-            fontsize=9,
-            rotation=90,
-            labelpad=8,
-        )
-
-    # Shared axis labels.
     fig.text(0.545, 0.032, "z [cm]", ha="center", va="center", fontsize=10)
     fig.text(0.055, 0.50, "x [cm]", ha="center", va="center", rotation=90, fontsize=10)
-
-    run_name = metadata.get("run_name", "unknown")
-    t0 = metadata.get("t0", "unknown")
-    beta = metadata.get("beta", "unknown")
-    nu = metadata.get("nu", "unknown")
-    Bz0 = metadata.get("Bz0", "unknown")
-    tau = metadata.get("tau", "unknown")
-
-    global_frame = int(t0) + int(local_time)
-
     fig.suptitle(
-        f"{channel_name} reconstruction under different mask patterns "
-        f"({plot_units} units, p={mask_fraction:g} for the spatial_random and temporal_random rows)\n"
-        f"{run_name}, block t0={t0}, local t={local_time}, global frame={global_frame}, "
-        f"beta={beta}, nu={nu}, Bz0={Bz0}, tau={tau}",
+        f"Current density Jy and magnetic-potential Ay contours ({plot_units} units)\n"
+        + _figure_context(metadata, local_time),
         fontsize=12,
         y=0.985,
     )
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+    print(f"Saved: {out_path}")
 
+
+def plot_density_magnetic_field_by_mask_patterns(
+    target_field: np.ndarray,
+    target_ay: np.ndarray,
+    rows: List[Dict],
+    metadata: Dict,
+    local_time: int,
+    out_path: Path,
+    extent: Sequence[float],
+    plot_units: str,
+    ay_levels: int,
+    quiver_step: int,
+    quiver_scale: float,
+    field_q: float,
+    residual_q: float,
+    residual_vmax: float | None,
+    dpi: int,
+    limit_times: Sequence[int] | None = None,
+) -> None:
+    """Plot Density with Ay contours and in-plane (Bz, Bx) arrows."""
+    n_rows = len(rows)
+    fig, axes, cax_field, cax_residual = _make_comparison_axes(n_rows)
+
+    target_density = target_field[3, local_time]
+    pred_arrays = [row["pred_plot"][3, local_time] for row in rows]
+    residual_arrays = [pred - target_density for pred in pred_arrays]
+    color_times = [local_time] if limit_times is None else list(limit_times)
+    all_target_density = [target_field[3, t] for t in color_times]
+    all_pred_density = [
+        row["pred_plot"][3, t] for row in rows for t in color_times
+    ]
+    all_residual_density = [
+        row["pred_plot"][3, t] - target_field[3, t]
+        for row in rows
+        for t in color_times
+    ]
+    density_vmin, density_vmax = robust_limits(
+        all_target_density + all_pred_density,
+        channel=3,
+        q=field_q,
+        symmetric=False,
+    )
+    if residual_vmax is None:
+        res_vmin, res_vmax = robust_limits(
+            all_residual_density,
+            channel=3,
+            q=residual_q,
+            symmetric=True,
+        )
+    else:
+        res_vmin, res_vmax = -float(residual_vmax), float(residual_vmax)
+
+    density_cmap = make_nan_cmap("plasma")
+    residual_cmap = make_nan_cmap("PRGn")
+    field_im = None
+    residual_im = None
+
+    for r, row in enumerate(rows):
+        pred_field = row["pred_plot"]
+        pred_density = pred_arrays[r]
+        residual = residual_arrays[r]
+        density_mask = row["mask"][3, local_time]
+        joint_b_mask = np.minimum(
+            row["mask"][0, local_time],
+            row["mask"][2, local_time],
+        )
+        visible_pct = 100.0 * float(np.mean(density_mask))
+        rmse, mae = compute_full_metrics(pred_density, target_density)
+        row_label = (
+            f"{row['label']}\n"
+            f"Density visible={visible_pct:.2f}%\n"
+            f"Density RMSE={rmse:.3g}\n"
+            f"Density MAE={mae:.3g}"
+        )
+
+        field_im = axes[r, 0].imshow(
+            target_density,
+            origin="lower",
+            aspect="auto",
+            extent=extent,
+            cmap=density_cmap,
+            vmin=density_vmin,
+            vmax=density_vmax,
+            interpolation="nearest",
+        )
+        add_ay_contours(
+            axes[r, 0], target_ay[local_time], extent, ay_levels, color="white"
+        )
+        add_inplane_quiver(
+            axes[r, 0],
+            target_field[0, local_time],
+            target_field[2, local_time],
+            extent,
+            quiver_step,
+            quiver_scale,
+        )
+
+        axes[r, 1].imshow(
+            row["visible_plot"][3, local_time],
+            origin="lower",
+            aspect="auto",
+            extent=extent,
+            cmap=density_cmap,
+            vmin=density_vmin,
+            vmax=density_vmax,
+            interpolation="nearest",
+        )
+        add_inplane_quiver(
+            axes[r, 1],
+            target_field[0, local_time],
+            target_field[2, local_time],
+            extent,
+            quiver_step,
+            quiver_scale,
+            visible_mask=joint_b_mask,
+            color="cyan",
+        )
+        if visible_pct == 0.0:
+            axes[r, 1].text(
+                0.5,
+                0.5,
+                "Frame hidden",
+                transform=axes[r, 1].transAxes,
+                ha="center",
+                va="center",
+                color="white",
+                fontsize=10,
+            )
+
+        axes[r, 2].imshow(
+            pred_density,
+            origin="lower",
+            aspect="auto",
+            extent=extent,
+            cmap=density_cmap,
+            vmin=density_vmin,
+            vmax=density_vmax,
+            interpolation="nearest",
+        )
+        add_ay_contours(
+            axes[r, 2], row["pred_ay"][local_time], extent, ay_levels, color="white"
+        )
+        add_inplane_quiver(
+            axes[r, 2],
+            pred_field[0, local_time],
+            pred_field[2, local_time],
+            extent,
+            quiver_step,
+            quiver_scale,
+        )
+
+        residual_im = axes[r, 3].imshow(
+            residual,
+            origin="lower",
+            aspect="auto",
+            extent=extent,
+            cmap=residual_cmap,
+            vmin=res_vmin,
+            vmax=res_vmax,
+            interpolation="nearest",
+        )
+
+        axes[r, 0].text(
+            -0.33,
+            0.5,
+            row_label,
+            transform=axes[r, 0].transAxes,
+            ha="right",
+            va="center",
+            rotation=90,
+            fontsize=8,
+            linespacing=1.05,
+        )
+
+        for c in range(4):
+            if r == 0:
+                axes[r, c].set_title(
+                    [
+                        "Target Density + Ay/B",
+                        "Visible Density + visible B",
+                        "Prediction Density + Ay/B",
+                        "Density residual",
+                    ][c],
+                    fontsize=11,
+                    pad=4,
+                )
+            _style_comparison_axis(axes[r, c], r, c, n_rows)
+
+    cb_field = fig.colorbar(field_im, cax=cax_field)
+    cb_field.set_label(f"Density ({plot_units})", fontsize=9, labelpad=8)
+    cb_field.ax.tick_params(labelsize=8, length=2.5)
+    cb_res = fig.colorbar(residual_im, cax=cax_residual)
+    cb_res.set_label(f"Prediction − target Density ({plot_units})", fontsize=9, labelpad=8)
+    cb_res.ax.tick_params(labelsize=8, length=2.5)
+
+    fig.text(0.545, 0.032, "z [cm]", ha="center", va="center", fontsize=10)
+    fig.text(0.055, 0.50, "x [cm]", ha="center", va="center", rotation=90, fontsize=10)
+    fig.suptitle(
+        f"Density, Ay contours and in-plane magnetic field ({plot_units} units)\n"
+        + _figure_context(metadata, local_time),
+        fontsize=12,
+        y=0.985,
+    )
     fig.savefig(out_path, dpi=dpi)
     plt.close(fig)
     print(f"Saved: {out_path}")
@@ -590,6 +1118,8 @@ def main():
 
     if not (0 <= args.local_time < delta_t):
         raise ValueError(f"--local-time must be in [0, {delta_t - 1}], got {args.local_time}")
+    if args.all_times and args.fps <= 0:
+        raise ValueError(f"--fps must be positive, got {args.fps}")
 
     print("HDF5 dir:", h5_dir)
     print("Betas:", betas)
@@ -598,9 +1128,14 @@ def main():
     print("base_channels:", base_channels)
     print("mask_fraction:", args.mask_fraction)
     print("block_fraction:", args.block_fraction)
-    print("grid_stride:", args.grid_stride)
+    print("density_grid_stride:", args.grid_stride)
+    print("magnetic_grid_stride:", args.magnetic_grid_stride)
     print("mask_patterns:", args.mask_patterns)
     print("local_time:", args.local_time)
+    print("all_times:", args.all_times)
+    if args.all_times:
+        print("animation_format:", args.animation_format)
+        print("fps:", args.fps)
     print("plot_units:", args.plot_units)
 
     dataset = VPICWindowDataset(
@@ -646,6 +1181,7 @@ def main():
         mask_fraction=args.mask_fraction,
         block_fraction=args.block_fraction,
         grid_stride=args.grid_stride,
+        magnetic_grid_stride=args.magnetic_grid_stride,
         generator=generator,
     )
 
@@ -689,37 +1225,96 @@ def main():
     else:
         y_plot_np = y[0].detach().cpu().numpy()
 
-    for ch in args.channels:
-        if ch < 0 or ch >= 4:
-            raise ValueError(f"Invalid channel {ch}. Use 0=Bx, 1=By, 2=Bz, 3=Density.")
-
-        pattern_tag = "-".join(args.mask_patterns)
-        out_path = out_dir / (
-            f"sample{args.sample_index:04d}_"
-            f"{metadata['run_name']}_"
-            f"t0-{metadata['t0']}_"
-            f"localt-{args.local_time}_"
-            f"{CHANNEL_NAMES[ch]}_"
-            f"{args.plot_units}_"
-            f"mf{args.mask_fraction:g}_"
-            f"masks_{pattern_tag}_compact.png"
+    # Derived magnetic quantities are computed only from complete fields.
+    # In particular, no gradients or path integrations are applied to the
+    # masked Visible input arrays.
+    target_ay, target_jy = compute_ay_jy(y_plot_np, args.extent)
+    for row in rows_for_plot:
+        row["pred_ay"], row["pred_jy"] = compute_ay_jy(
+            row["pred_plot"], args.extent
         )
 
-        plot_channel_by_mask_patterns(
-            y_plot=y_plot_np,
+    pattern_tag = "-".join(args.mask_patterns)
+    common_stem = (
+        f"sample{args.sample_index:04d}_"
+        f"{metadata['run_name']}_"
+        f"t0-{metadata['t0']}_"
+        f"{args.plot_units}_"
+        f"mf{args.mask_fraction:g}_"
+        f"masks_{pattern_tag}"
+    )
+    local_times = list(range(delta_t)) if args.all_times else [args.local_time]
+    limit_times = local_times if args.all_times else None
+    jy_frame_paths = []
+    density_frame_paths = []
+
+    for local_time in local_times:
+        frame_stem = (
+            f"{common_stem}_"
+            f"localt-{local_time:03d}_"
+            f"globalt-{int(metadata['t0']) + local_time:04d}"
+        )
+        jy_path = out_dir / f"{frame_stem}_Jy_Ay_compact.png"
+        density_path = out_dir / f"{frame_stem}_Density_Ay_B_compact.png"
+
+        plot_jy_ay_by_mask_patterns(
+            target_ay=target_ay,
+            target_jy=target_jy,
             rows=rows_for_plot,
             metadata=metadata,
-            channel=ch,
-            local_time=args.local_time,
-            out_path=out_path,
+            local_time=local_time,
+            out_path=jy_path,
             extent=args.extent,
             plot_units=args.plot_units,
-            mask_fraction=args.mask_fraction,
+            ay_levels=args.ay_levels,
             field_q=args.field_q,
             residual_q=args.residual_q,
             residual_vmax=args.residual_vmax,
             dpi=args.dpi,
+            limit_times=limit_times,
         )
+
+        plot_density_magnetic_field_by_mask_patterns(
+            target_field=y_plot_np,
+            target_ay=target_ay,
+            rows=rows_for_plot,
+            metadata=metadata,
+            local_time=local_time,
+            out_path=density_path,
+            extent=args.extent,
+            plot_units=args.plot_units,
+            ay_levels=args.ay_levels,
+            quiver_step=args.quiver_step,
+            quiver_scale=args.quiver_scale,
+            field_q=args.field_q,
+            residual_q=args.residual_q,
+            residual_vmax=args.residual_vmax,
+            dpi=args.dpi,
+            limit_times=limit_times,
+        )
+
+        jy_frame_paths.append(jy_path)
+        density_frame_paths.append(density_path)
+
+    if args.all_times:
+        animation_stem = (
+            f"{common_stem}_"
+            f"globalt-{int(metadata['t0']):04d}-"
+            f"{int(metadata['t0']) + delta_t - 1:04d}"
+        )
+        formats = ["mp4", "gif"] if args.animation_format == "both" else [args.animation_format]
+
+        for extension in formats:
+            write_animation(
+                jy_frame_paths,
+                out_dir / f"{animation_stem}_Jy_Ay.{extension}",
+                fps=args.fps,
+            )
+            write_animation(
+                density_frame_paths,
+                out_dir / f"{animation_stem}_Density_Ay_B.{extension}",
+                fps=args.fps,
+            )
 
 
 if __name__ == "__main__":
