@@ -5,7 +5,7 @@ import json
 import os
 import shutil
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Callable, Dict, List, Sequence, Tuple
 
 import h5py
 import matplotlib
@@ -59,6 +59,36 @@ def parse_args() -> argparse.Namespace:
         default=[24, 12, 6, 3],
     )
     parser.add_argument(
+        "--analysis",
+        choices=["both", "slide_steps", "bidirectional"],
+        default="both",
+        help=(
+            "Analyses to render. 'both' preserves the slide-step comparison "
+            "and adds the bidirectional repeated-sweep comparison."
+        ),
+    )
+    parser.add_argument(
+        "--refinement-step",
+        type=int,
+        default=12,
+        help="Slide step for the 1-to-N-pass bidirectional rows.",
+    )
+    parser.add_argument(
+        "--refinement-passes",
+        type=int,
+        default=4,
+        help="Maximum alternating L-to-R/R-to-L passes (default: 4).",
+    )
+    parser.add_argument(
+        "--refinement-offset",
+        type=int,
+        default=12,
+        help=(
+            "Alternating offset for the step=T shifted-window control row "
+            "(default: 12)."
+        ),
+    )
+    parser.add_argument(
         "--density-visible-fraction",
         type=float,
         default=0.08,
@@ -89,6 +119,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--fps", type=float, default=2.0)
     parser.add_argument("--dpi", type=int, default=160)
+    parser.add_argument(
+        "--animation-dpi",
+        type=int,
+        default=100,
+        help="DPI for animation frames; final static PNG continues to use --dpi.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--extent",
@@ -128,6 +164,41 @@ def sliding_window_starts(
     starts = [0]
     while starts[-1] + window_size < run_length:
         starts.append(starts[-1] + slide_step)
+    return starts
+
+
+def shifted_window_starts(
+    run_length: int,
+    window_size: int,
+    slide_step: int,
+    offset: int,
+    include_boundary_padding: bool = False,
+) -> List[int]:
+    """Translate the ordinary forward schedule by a non-negative offset."""
+    if not (0 <= offset < slide_step):
+        raise ValueError(
+            f"offset must lie in [0, {slide_step - 1}], got {offset}."
+        )
+    if not include_boundary_padding or offset == 0:
+        return [
+            start + offset
+            for start in sliding_window_starts(
+                run_length, window_size, slide_step
+            )
+            if start + offset < run_length
+        ]
+
+    # Include the translated window immediately left of t=0. Its negative
+    # slots are fully masked, while its physical part reconstructs the run's
+    # leading boundary. For T=150, W=step=24, offset=12 this yields
+    # [-12, 12, 36, 60, 84, 108, 132], matching the seven offset=0 calls.
+    first_start = offset - slide_step
+    starts = []
+    start = first_start
+    while start < run_length:
+        if start + window_size > 0:
+            starts.append(start)
+        start += slide_step
     return starts
 
 
@@ -216,6 +287,7 @@ def reconstruct_with_slide_step(
     plot_units: str,
     x_index: int | None,
     amp: bool,
+    retain_state: bool = False,
 ) -> Dict:
     """Run recursive reconstruction and retain a compact projection per update."""
     channels, run_length, size_x, size_z = target_normalized.shape
@@ -337,7 +409,7 @@ def reconstruct_with_slide_step(
     )
     full_rmse, full_mae = rmse_mae(final_plot, target_density_plot)
 
-    return {
+    result = {
         "slide_step": slide_step,
         "window_starts": starts,
         "snapshots": snapshots,
@@ -356,6 +428,471 @@ def reconstruct_with_slide_step(
             "final_slice_mae": final_slice_mae,
         },
     }
+    if retain_state:
+        result["raw_state_normalized"] = raw_reconstruction.detach().clone()
+        result["conditioning_state_normalized"] = (
+            conditioning_reconstruction.detach().clone()
+        )
+    return result
+
+
+def summarize_density_state(
+    raw_state_normalized: torch.Tensor,
+    target_density_plot: np.ndarray,
+    density_mean: torch.Tensor,
+    density_std: torch.Tensor,
+    probe_mask: torch.Tensor,
+    plot_units: str,
+    x_index: int | None,
+) -> Dict:
+    """Convert one complete raw state to plot arrays and transparent metrics."""
+    raw_plot = convert_density_units(
+        raw_state_normalized,
+        density_mean=density_mean,
+        density_std=density_std,
+        plot_units=plot_units,
+    ).detach().cpu().numpy()
+    probe_bool = probe_mask.detach().cpu().numpy() > 0.5
+    full_rmse, full_mae = rmse_mae(raw_plot, target_density_plot)
+    probe_rmse, probe_mae = rmse_mae(
+        raw_plot[:, probe_bool],
+        target_density_plot[:, probe_bool],
+    )
+    hidden_rmse, hidden_mae = rmse_mae(
+        raw_plot[:, ~probe_bool],
+        target_density_plot[:, ~probe_bool],
+    )
+    return {
+        "final_reconstruction": raw_plot,
+        "prediction_projection": project_time_z(raw_plot, x_index=x_index),
+        "residual_projection": project_time_z(
+            raw_plot - target_density_plot,
+            x_index=x_index,
+        ),
+        "metrics": {
+            "full_run_rmse": full_rmse,
+            "full_run_mae": full_mae,
+            "probe_rmse": probe_rmse,
+            "probe_mae": probe_mae,
+            "hidden_rmse": hidden_rmse,
+            "hidden_mae": hidden_mae,
+        },
+    }
+
+
+@torch.no_grad()
+def refine_reconstruction_pass(
+    model: torch.nn.Module,
+    target_normalized: torch.Tensor,
+    raw_state_normalized: torch.Tensor,
+    conditioning_state_normalized: torch.Tensor,
+    probe_mask: torch.Tensor,
+    window_size: int,
+    slide_step: int,
+    direction: str,
+    offset: int,
+    amp: bool,
+    snapshot_fn: Callable[[torch.Tensor], Dict] | None = None,
+    include_boundary_padding: bool = False,
+    max_updates: int | None = None,
+) -> Dict:
+    """Apply one full-visible repeated sweep and update the state in place."""
+    if direction not in {"forward", "reverse"}:
+        raise ValueError(f"Unknown direction {direction!r}.")
+    channels, run_length, size_x, size_z = target_normalized.shape
+    if channels != 4:
+        raise ValueError(f"Expected four target channels, got {channels}.")
+    if raw_state_normalized.shape != (run_length, size_x, size_z):
+        raise ValueError("raw reconstruction state has an incompatible shape.")
+    if conditioning_state_normalized.shape != raw_state_normalized.shape:
+        raise ValueError("conditioning and raw reconstruction states must match.")
+    if not torch.isfinite(conditioning_state_normalized).all():
+        raise ValueError("Repeated sweeps require a complete initial reconstruction.")
+
+    starts = shifted_window_starts(
+        run_length=run_length,
+        window_size=window_size,
+        slide_step=slide_step,
+        offset=offset,
+        include_boundary_padding=include_boundary_padding,
+    )
+    ordered_starts = starts if direction == "forward" else list(reversed(starts))
+    if max_updates is not None:
+        if max_updates < 1:
+            raise ValueError("max_updates must be positive when provided.")
+        ordered_starts = ordered_starts[:max_updates]
+    probe_bool = probe_mask > 0.5
+    updates = []
+    snapshots = []
+
+    for update_index, start in enumerate(ordered_starts):
+        valid_start = max(start, 0)
+        valid_end = min(start + window_size, run_length)
+        valid_length = valid_end - valid_start
+        local_start = valid_start - start
+        local_end = local_start + valid_length
+        values = torch.zeros(
+            (1, 4, window_size, size_x, size_z),
+            device=target_normalized.device,
+            dtype=target_normalized.dtype,
+        )
+        mask = torch.zeros_like(values)
+
+        # Magnetic fields remain complete true observations. Every valid
+        # Density position uses the latest conditioning reconstruction and is
+        # marked visible; only padded future slots remain invisible.
+        values[0, :3, local_start:local_end] = target_normalized[
+            :3, valid_start:valid_end
+        ]
+        mask[0, :3, local_start:local_end] = 1.0
+        values[0, 3, local_start:local_end] = conditioning_state_normalized[
+            valid_start:valid_end
+        ]
+        mask[0, 3, local_start:local_end] = 1.0
+
+        density_target = target_normalized[3, valid_start:valid_end]
+        density_values = values[0, 3, local_start:local_end]
+        density_values[:, probe_bool] = density_target[:, probe_bool]
+        values[0, 3, local_start:local_end] = density_values
+
+        model_input = torch.cat([values * mask, mask], dim=1)
+        with torch.autocast(
+            device_type=target_normalized.device.type,
+            enabled=(amp and target_normalized.device.type == "cuda"),
+        ):
+            prediction = model(model_input)
+
+        # The raw output replaces the entire valid window, including regions
+        # used as fully visible input. Only the separate conditioning state is
+        # clamped at real probes before the next update.
+        raw_window = prediction[0, 3, local_start:local_end].float()
+        raw_state_normalized[valid_start:valid_end] = raw_window
+        conditioned_window = raw_window.clone()
+        conditioned_window[:, probe_bool] = density_target[:, probe_bool]
+        conditioning_state_normalized[valid_start:valid_end] = conditioned_window
+        updates.append(
+            {
+                "update_index": update_index,
+                "window_start": start,
+                "valid_start": valid_start,
+                "valid_end": valid_end,
+            }
+        )
+        if snapshot_fn is not None:
+            snapshot = snapshot_fn(raw_state_normalized)
+            snapshot.update(updates[-1])
+            snapshots.append(snapshot)
+
+    return {
+        "direction": direction,
+        "offset": offset,
+        "ordered_window_starts": ordered_starts,
+        "updates": updates,
+        "snapshots": snapshots,
+    }
+
+
+def build_bidirectional_rows(
+    model: torch.nn.Module,
+    target_normalized: torch.Tensor,
+    target_density_plot: np.ndarray,
+    density_mean: torch.Tensor,
+    density_std: torch.Tensor,
+    probe_mask: torch.Tensor,
+    window_size: int,
+    refinement_step: int,
+    refinement_passes: int,
+    refinement_offset: int,
+    plot_units: str,
+    x_index: int | None,
+    amp: bool,
+    initial_results: Dict[int, Dict] | None = None,
+) -> List[Dict]:
+    """Build the repeated-sweep rows requested for bidirectional comparison."""
+    if refinement_passes < 1:
+        raise ValueError("--refinement-passes must be at least 1.")
+    if not (1 <= refinement_step <= window_size):
+        raise ValueError(
+            f"--refinement-step must lie in [1, {window_size}]."
+        )
+    if not (0 <= refinement_offset < window_size):
+        raise ValueError(
+            f"--refinement-offset must lie in [0, {window_size - 1}]."
+        )
+
+    cached = {} if initial_results is None else initial_results
+
+    def initial_result(step: int) -> Dict:
+        result = cached.get(step)
+        if result is not None and "raw_state_normalized" in result:
+            return result
+        return reconstruct_with_slide_step(
+            model=model,
+            target_normalized=target_normalized,
+            target_density_plot=target_density_plot,
+            density_mean=density_mean,
+            density_std=density_std,
+            probe_mask=probe_mask,
+            window_size=window_size,
+            slide_step=step,
+            plot_units=plot_units,
+            x_index=x_index,
+            amp=amp,
+            retain_state=True,
+        )
+
+    def compact_snapshot(raw_state: torch.Tensor) -> Dict:
+        summary = summarize_density_state(
+            raw_state_normalized=raw_state,
+            target_density_plot=target_density_plot,
+            density_mean=density_mean,
+            density_std=density_std,
+            probe_mask=probe_mask,
+            plot_units=plot_units,
+            x_index=x_index,
+        )
+        summary.pop("final_reconstruction")
+        return summary
+
+    def initial_animation_snapshots(result: Dict) -> List[Dict]:
+        snapshots = []
+        for snapshot in result["snapshots"]:
+            snapshots.append(
+                {
+                    "prediction_projection": snapshot["prediction_projection"],
+                    "residual_projection": snapshot["residual_projection"],
+                    "metrics": {
+                        "full_run_rmse": snapshot["covered_rmse"],
+                        "full_run_mae": snapshot["covered_mae"],
+                    },
+                    "pass_index": 0,
+                    "pass_count": 1,
+                    "direction": "forward",
+                    "offset": 0,
+                    "update_index": snapshot["update_index"],
+                    "cumulative_window_calls": snapshot["update_index"] + 1,
+                    "window_start": snapshot["window_start"],
+                    "valid_end": snapshot["valid_end"],
+                    "covered_end": snapshot["covered_end"],
+                }
+            )
+        return snapshots
+
+    def annotate_pass_snapshots(pass_info: Dict, pass_index: int) -> List[Dict]:
+        for snapshot in pass_info["snapshots"]:
+            snapshot.update(
+                {
+                    "pass_index": pass_index,
+                    "pass_count": pass_index + 1,
+                    "direction": pass_info["direction"],
+                    "offset": pass_info["offset"],
+                }
+            )
+        return pass_info["snapshots"]
+
+    def compact_history(pass_info: Dict) -> Dict:
+        return {
+            key: value
+            for key, value in pass_info.items()
+            if key != "snapshots"
+        }
+
+    def state_summary(
+        raw_state: torch.Tensor,
+        pass_count: int,
+        step: int,
+        directions: List[str],
+        offsets: List[int],
+        history: List[Dict],
+        animation_snapshots: List[Dict],
+        row_kind: str,
+    ) -> Dict:
+        summary = summarize_density_state(
+            raw_state_normalized=raw_state,
+            target_density_plot=target_density_plot,
+            density_mean=density_mean,
+            density_std=density_std,
+            probe_mask=probe_mask,
+            plot_units=plot_units,
+            x_index=x_index,
+        )
+        summary.update(
+            {
+                "row_kind": row_kind,
+                "slide_step": step,
+                "pass_count": pass_count,
+                "directions": list(directions),
+                "offsets": list(offsets),
+                "history": list(history),
+                "animation_snapshots": list(animation_snapshots),
+            }
+        )
+        return summary
+
+    direction_names = [
+        "forward" if pass_index % 2 == 0 else "reverse"
+        for pass_index in range(refinement_passes)
+    ]
+    rows = []
+
+    small_initial = initial_result(refinement_step)
+    small_raw = small_initial["raw_state_normalized"].clone()
+    small_conditioning = small_initial["conditioning_state_normalized"].clone()
+    small_history = [
+        {
+            "direction": "forward",
+            "offset": 0,
+            "ordered_window_starts": small_initial["window_starts"],
+        }
+    ]
+    small_animation = initial_animation_snapshots(small_initial)
+    rows.append(
+        state_summary(
+            small_raw,
+            pass_count=1,
+            step=refinement_step,
+            directions=direction_names[:1],
+            offsets=[0],
+            history=small_history,
+            animation_snapshots=small_animation,
+            row_kind="overlap_refinement",
+        )
+    )
+    for pass_index in range(1, refinement_passes):
+        pass_info = refine_reconstruction_pass(
+            model=model,
+            target_normalized=target_normalized,
+            raw_state_normalized=small_raw,
+            conditioning_state_normalized=small_conditioning,
+            probe_mask=probe_mask,
+            window_size=window_size,
+            slide_step=refinement_step,
+            direction=direction_names[pass_index],
+            offset=0,
+            amp=amp,
+            snapshot_fn=compact_snapshot,
+        )
+        small_history.append(compact_history(pass_info))
+        small_animation.extend(annotate_pass_snapshots(pass_info, pass_index))
+        for call_index, snapshot in enumerate(small_animation, start=1):
+            snapshot["cumulative_window_calls"] = call_index
+        rows.append(
+            state_summary(
+                small_raw,
+                pass_count=pass_index + 1,
+                step=refinement_step,
+                directions=direction_names[: pass_index + 1],
+                offsets=[0] * (pass_index + 1),
+                history=small_history,
+                animation_snapshots=small_animation,
+                row_kind="overlap_refinement",
+            )
+        )
+
+    independent_initial = initial_result(window_size)
+    independent_raw = independent_initial["raw_state_normalized"].clone()
+    independent_conditioning = independent_initial[
+        "conditioning_state_normalized"
+    ].clone()
+    independent_history = [
+        {
+            "direction": "forward",
+            "offset": 0,
+            "ordered_window_starts": independent_initial["window_starts"],
+        }
+    ]
+    independent_animation = initial_animation_snapshots(independent_initial)
+    target_window_calls = len(small_animation)
+    independent_directions = ["forward"]
+    independent_offsets = [0]
+    pass_index = 1
+    while len(independent_animation) < target_window_calls:
+        direction = "forward" if pass_index % 2 == 0 else "reverse"
+        remaining_calls = target_window_calls - len(independent_animation)
+        pass_info = refine_reconstruction_pass(
+            model=model,
+            target_normalized=target_normalized,
+            raw_state_normalized=independent_raw,
+            conditioning_state_normalized=independent_conditioning,
+            probe_mask=probe_mask,
+            window_size=window_size,
+            slide_step=window_size,
+            direction=direction,
+            offset=0,
+            amp=amp,
+            snapshot_fn=compact_snapshot,
+            max_updates=remaining_calls,
+        )
+        independent_directions.append(direction)
+        independent_offsets.append(0)
+        independent_history.append(compact_history(pass_info))
+        independent_animation.extend(
+            annotate_pass_snapshots(pass_info, pass_index)
+        )
+        for call_index, snapshot in enumerate(independent_animation, start=1):
+            snapshot["cumulative_window_calls"] = call_index
+        pass_index += 1
+    rows.append(
+        state_summary(
+            independent_raw,
+            pass_count=len(independent_directions),
+            step=window_size,
+            directions=independent_directions,
+            offsets=independent_offsets,
+            history=independent_history,
+            animation_snapshots=independent_animation,
+            row_kind="independent_control",
+        )
+    )
+
+    shifted_raw = independent_initial["raw_state_normalized"].clone()
+    shifted_conditioning = independent_initial[
+        "conditioning_state_normalized"
+    ].clone()
+    shifted_history = [independent_history[0]]
+    shifted_offsets = [0]
+    shifted_directions = ["forward"]
+    shifted_animation = initial_animation_snapshots(independent_initial)
+    pass_index = 1
+    while len(shifted_animation) < target_window_calls:
+        offset = refinement_offset if pass_index % 2 == 1 else 0
+        direction = "forward" if pass_index % 2 == 0 else "reverse"
+        remaining_calls = target_window_calls - len(shifted_animation)
+        shifted_offsets.append(offset)
+        shifted_directions.append(direction)
+        pass_info = refine_reconstruction_pass(
+            model=model,
+            target_normalized=target_normalized,
+            raw_state_normalized=shifted_raw,
+            conditioning_state_normalized=shifted_conditioning,
+            probe_mask=probe_mask,
+            window_size=window_size,
+            slide_step=window_size,
+            direction=direction,
+            offset=offset,
+            amp=amp,
+            snapshot_fn=compact_snapshot,
+            include_boundary_padding=True,
+            max_updates=remaining_calls,
+        )
+        shifted_history.append(compact_history(pass_info))
+        shifted_animation.extend(annotate_pass_snapshots(pass_info, pass_index))
+        for call_index, snapshot in enumerate(shifted_animation, start=1):
+            snapshot["cumulative_window_calls"] = call_index
+        pass_index += 1
+    rows.append(
+        state_summary(
+            shifted_raw,
+            pass_count=len(shifted_directions),
+            step=window_size,
+            directions=shifted_directions,
+            offsets=shifted_offsets,
+            history=shifted_history,
+            animation_snapshots=shifted_animation,
+            row_kind="shifted_control",
+        )
+    )
+    return rows
 
 
 def snapshot_at_or_before(result: Dict, covered_end: int) -> Dict:
@@ -496,6 +1033,517 @@ def plot_progress_frame(
     print(f"Saved: {out_path}")
 
 
+def plot_bidirectional_refinement_figure(
+    target_projection: np.ndarray,
+    rows: Sequence[Dict],
+    frame_ids: np.ndarray,
+    extent: Sequence[float],
+    run_name: str,
+    window_size: int,
+    probe_actual_fraction: float,
+    projection_label: str,
+    plot_units: str,
+    density_limits: Tuple[float, float],
+    residual_limits: Tuple[float, float],
+    out_path: Path,
+    dpi: int,
+    snapshots: Sequence[Dict | None] | None = None,
+    progress_label: str | None = None,
+) -> None:
+    """Plot final states after alternating bidirectional reconstruction sweeps."""
+    n_rows = len(rows)
+    fig, axes = plt.subplots(
+        n_rows,
+        3,
+        figsize=(14.0, 3.15 * n_rows + 1.8),
+        sharex=True,
+        sharey=True,
+        constrained_layout=False,
+    )
+    if n_rows == 1:
+        axes = np.asarray([axes])
+
+    zmin, zmax = float(extent[0]), float(extent[1])
+    image_extent = [
+        float(frame_ids[0]) - 0.5,
+        float(frame_ids[-1]) + 0.5,
+        zmin,
+        zmax,
+    ]
+    density_cmap = make_nan_cmap("plasma", bad_color="black")
+    residual_cmap = make_nan_cmap("PRGn", bad_color="black")
+    density_image = None
+    residual_image = None
+
+    for row_index, row in enumerate(rows):
+        display = row if snapshots is None else snapshots[row_index]
+        if display is None:
+            prediction_projection = np.full_like(target_projection, np.nan)
+            residual_projection = np.full_like(target_projection, np.nan)
+            display_metrics = {"full_run_rmse": float("nan")}
+        else:
+            prediction_projection = display["prediction_projection"]
+            residual_projection = display["residual_projection"]
+            display_metrics = display["metrics"]
+        density_image = axes[row_index, 0].imshow(
+            target_projection.T,
+            origin="lower",
+            aspect="auto",
+            extent=image_extent,
+            cmap=density_cmap,
+            vmin=density_limits[0],
+            vmax=density_limits[1],
+            interpolation="nearest",
+        )
+        axes[row_index, 1].imshow(
+            prediction_projection.T,
+            origin="lower",
+            aspect="auto",
+            extent=image_extent,
+            cmap=density_cmap,
+            vmin=density_limits[0],
+            vmax=density_limits[1],
+            interpolation="nearest",
+        )
+        residual_image = axes[row_index, 2].imshow(
+            residual_projection.T,
+            origin="lower",
+            aspect="auto",
+            extent=image_extent,
+            cmap=residual_cmap,
+            vmin=residual_limits[0],
+            vmax=residual_limits[1],
+            interpolation="nearest",
+        )
+        direction_labels = [
+            "L→R" if direction == "forward" else "R→L"
+            for direction in row["directions"]
+        ]
+        if len(direction_labels) <= 4:
+            directions = "/".join(direction_labels)
+        else:
+            directions = f"L→R/R→L alternating ({len(direction_labels)} sweeps)"
+        if len(row["offsets"]) <= 4:
+            offsets = "/".join(str(offset) for offset in row["offsets"])
+        elif len(set(row["offsets"])) == 1:
+            offsets = str(row["offsets"][0])
+        else:
+            offsets = "0/shift alternating"
+        if snapshots is None:
+            current_label = ""
+        elif display is None:
+            current_label = "\ncurrent=pending"
+        elif "window_start" in display:
+            direction = "L→R" if display["direction"] == "forward" else "R→L"
+            current_label = (
+                f"\ncurrent=p{display['pass_count']} {direction}, "
+                f"window={display['window_start']}:{display['valid_end']}, "
+                f"calls={display['cumulative_window_calls']}"
+            )
+        else:
+            completed_calls = len(row["animation_snapshots"])
+            current_label = f"\ncurrent=complete, calls={completed_calls}"
+        axes[row_index, 0].set_ylabel(
+            f"step={row['slide_step']}, passes={row['pass_count']}\n"
+            f"dirs={directions}\n"
+            f"offsets={offsets}, calls={len(row['animation_snapshots'])}\n"
+            f"RMSE={display_metrics['full_run_rmse']:.3g}"
+            f"{current_label}\n"
+            "z [cm]",
+            fontsize=7.5,
+        )
+        for column in range(3):
+            axes[row_index, column].tick_params(labelsize=8)
+
+    for column, title in enumerate(
+        ["Target Density", "Repeated reconstruction", "Residual (prediction - target)"]
+    ):
+        axes[0, column].set_title(title, fontsize=11)
+        axes[-1, column].set_xlabel("time slice", fontsize=10)
+
+    fig.subplots_adjust(
+        left=0.115,
+        right=0.90,
+        bottom=0.055,
+        top=0.92,
+        wspace=0.08,
+        hspace=0.12,
+    )
+    density_cax = fig.add_axes([0.915, 0.53, 0.012, 0.34])
+    residual_cax = fig.add_axes([0.915, 0.12, 0.012, 0.34])
+    density_colorbar = fig.colorbar(density_image, cax=density_cax)
+    density_colorbar.set_label(f"Density ({plot_units})", fontsize=9)
+    residual_colorbar = fig.colorbar(residual_image, cax=residual_cax)
+    residual_colorbar.set_label(f"Density residual ({plot_units})", fontsize=9)
+
+    progress_text = "" if progress_label is None else f"\n{progress_label}"
+    fig.suptitle(
+        f"Bidirectional repeated Density reconstruction: {run_name}\n"
+        f"T={window_size}, fixed probes={100.0 * probe_actual_fraction:.2f}%, "
+        f"B fully observed, {projection_label}; raw predictions include probes"
+        f"{progress_text}",
+        fontsize=12,
+        y=0.985,
+    )
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+    print(f"Saved bidirectional figure: {out_path}")
+
+
+def bidirectional_animation_events(rows: Sequence[Dict]) -> List[Dict]:
+    """Synchronize all rows by sweep pass and normalized within-pass progress."""
+    overlap_rows = [row for row in rows if row["row_kind"] == "overlap_refinement"]
+    if not overlap_rows:
+        raise ValueError("Bidirectional animation requires overlap-refinement rows.")
+
+    def final_snapshot(row: Dict) -> Dict:
+        return {
+            "prediction_projection": row["prediction_projection"],
+            "residual_projection": row["residual_projection"],
+            "metrics": row["metrics"],
+        }
+
+    target_window_calls = max(len(row["animation_snapshots"]) for row in rows)
+    events = []
+    for call_index in range(target_window_calls):
+        displays = []
+        for row in rows:
+            snapshots = row["animation_snapshots"]
+            if call_index < len(snapshots):
+                displays.append(snapshots[call_index])
+            else:
+                displays.append(final_snapshot(row))
+        events.append(
+            {
+                "phase": "window-call synchronized reconstruction",
+                "label": (
+                    f"synchronized window call={call_index + 1}/"
+                    f"{target_window_calls}"
+                ),
+                "snapshots": displays,
+            }
+        )
+    return events
+
+
+def save_bidirectional_analysis(
+    rows: Sequence[Dict],
+    target_density_plot: np.ndarray,
+    target_projection: np.ndarray,
+    probe_mask: torch.Tensor,
+    frame_ids: np.ndarray,
+    extent: Sequence[float],
+    run_name: str,
+    window_size: int,
+    refinement_step: int,
+    refinement_passes: int,
+    refinement_offset: int,
+    probe_actual_fraction: float,
+    probe_info: Dict,
+    projection_label: str,
+    plot_units: str,
+    field_q: float,
+    residual_q: float,
+    residual_vmax: float | None,
+    checkpoint_path: Path,
+    checkpoint_epoch: int | None,
+    h5_path: Path,
+    out_dir: Path,
+    dpi: int,
+    animation_dpi: int,
+    animation_format: str,
+    fps: float,
+) -> None:
+    density_limits = robust_limits(
+        [target_projection] + [row["prediction_projection"] for row in rows],
+        channel=3,
+        q=field_q,
+        symmetric=False,
+    )
+    if residual_vmax is None:
+        residual_limits = robust_limits(
+            [row["residual_projection"] for row in rows],
+            channel=3,
+            q=residual_q,
+            symmetric=True,
+        )
+    else:
+        residual_limits = (-float(residual_vmax), float(residual_vmax))
+
+    common_stem = (
+        f"{run_name}_T{window_size}_bidirectional-step{refinement_step}-"
+        f"passes{refinement_passes}_step{window_size}-offset{refinement_offset}_"
+        f"density-visible-{probe_actual_fraction:.4f}_{plot_units}"
+    )
+    figure_path = out_dir / f"{common_stem}.png"
+    plot_bidirectional_refinement_figure(
+        target_projection=target_projection,
+        rows=rows,
+        frame_ids=frame_ids,
+        extent=extent,
+        run_name=run_name,
+        window_size=window_size,
+        probe_actual_fraction=probe_actual_fraction,
+        projection_label=projection_label,
+        plot_units=plot_units,
+        density_limits=density_limits,
+        residual_limits=residual_limits,
+        out_path=figure_path,
+        dpi=dpi,
+    )
+
+    animation_events = bidirectional_animation_events(rows)
+    frame_dir = out_dir / f"{common_stem}_frames"
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    frame_paths = []
+    for frame_index, event in enumerate(animation_events):
+        frame_path = frame_dir / f"frame-{frame_index:04d}.png"
+        plot_bidirectional_refinement_figure(
+            target_projection=target_projection,
+            rows=rows,
+            frame_ids=frame_ids,
+            extent=extent,
+            run_name=run_name,
+            window_size=window_size,
+            probe_actual_fraction=probe_actual_fraction,
+            projection_label=projection_label,
+            plot_units=plot_units,
+            density_limits=density_limits,
+            residual_limits=residual_limits,
+            out_path=frame_path,
+            dpi=animation_dpi,
+            snapshots=event["snapshots"],
+            progress_label=event["label"],
+        )
+        frame_paths.append(frame_path)
+
+    formats = (
+        ["quicktime", "gif"] if animation_format == "both" else [animation_format]
+    )
+    for selected_format in formats:
+        extension = "mov" if selected_format == "quicktime" else selected_format
+        write_animation(
+            frame_paths,
+            out_dir / f"{common_stem}.{extension}",
+            fps=fps,
+        )
+
+    row_metrics = []
+    for row_index, row in enumerate(rows, start=1):
+        row_metrics.append(
+            {
+                "row": row_index,
+                "row_kind": row["row_kind"],
+                "slide_step": row["slide_step"],
+                "pass_count": row["pass_count"],
+                "directions": row["directions"],
+                "offsets": row["offsets"],
+                "window_calls": len(row["animation_snapshots"]),
+                "history": row["history"],
+                **row["metrics"],
+            }
+        )
+    metrics_payload = {
+        "checkpoint": str(checkpoint_path),
+        "checkpoint_epoch": checkpoint_epoch,
+        "h5_path": str(h5_path),
+        "run_name": run_name,
+        "run_length": int(target_density_plot.shape[0]),
+        "window_size": window_size,
+        "refinement_step": refinement_step,
+        "refinement_passes": refinement_passes,
+        "refinement_offset": refinement_offset,
+        "density_visible_fraction_actual": probe_actual_fraction,
+        "probe_grid": probe_info,
+        "plot_units": plot_units,
+        "projection": projection_label,
+        "conditioning_policy": (
+            "latest reconstruction fully visible; true probes overwrite input"
+        ),
+        "metric_policy": "raw model predictions, including probe locations",
+        "animation_frames": len(animation_events),
+        "animation_policy": (
+            "all rows synchronized by cumulative model window calls"
+        ),
+        "rows": row_metrics,
+    }
+    metrics_path = out_dir / f"{common_stem}_metrics.json"
+    metrics_path.write_text(json.dumps(metrics_payload, indent=2))
+    print(f"Saved bidirectional metrics: {metrics_path}")
+
+    arrays_path = out_dir / f"{common_stem}_reconstructions.npz"
+    np.savez_compressed(
+        arrays_path,
+        target_density=target_density_plot,
+        probe_mask=probe_mask.detach().cpu().numpy(),
+        frame_ids=frame_ids,
+        **{
+            f"prediction_row_{row_index}": row["final_reconstruction"]
+            for row_index, row in enumerate(rows, start=1)
+        },
+    )
+    print(f"Saved bidirectional arrays: {arrays_path}")
+
+
+def save_slide_step_analysis(
+    results: Sequence[Dict],
+    slide_steps: Sequence[int],
+    target_density_plot: np.ndarray,
+    target_projection: np.ndarray,
+    probe_mask: torch.Tensor,
+    frame_ids: np.ndarray,
+    extent: Sequence[float],
+    run_name: str,
+    window_size: int,
+    density_visible_fraction: float,
+    probe_actual_fraction: float,
+    probe_info: Dict,
+    projection_label: str,
+    plot_units: str,
+    field_q: float,
+    residual_q: float,
+    residual_vmax: float | None,
+    animation_format: str,
+    fps: float,
+    checkpoint_path: Path,
+    checkpoint_epoch: int | None,
+    h5_path: Path,
+    out_dir: Path,
+    dpi: int,
+) -> None:
+    density_vmin, density_vmax = robust_limits(
+        [target_projection]
+        + [result["snapshots"][-1]["prediction_projection"] for result in results],
+        channel=3,
+        q=field_q,
+        symmetric=False,
+    )
+    if residual_vmax is None:
+        residual_vmin, residual_vmax_value = robust_limits(
+            [
+                snapshot["residual_projection"]
+                for result in results
+                for snapshot in result["snapshots"]
+            ],
+            channel=3,
+            q=residual_q,
+            symmetric=True,
+        )
+    else:
+        residual_vmin = -float(residual_vmax)
+        residual_vmax_value = float(residual_vmax)
+
+    progress_points = sorted(
+        {
+            int(snapshot["covered_end"])
+            for result in results
+            for snapshot in result["snapshots"]
+        }
+    )
+    frame_paths = []
+    common_stem = (
+        f"{run_name}_T{window_size}_steps-"
+        + "-".join(str(step) for step in slide_steps)
+        + f"_density-visible-{density_visible_fraction:g}_{plot_units}"
+    )
+    for frame_index, covered_end in enumerate(progress_points):
+        frame_path = out_dir / (
+            f"{common_stem}_progress-{frame_index:03d}_"
+            f"covered-through-{covered_end - 1:04d}.png"
+        )
+        plot_progress_frame(
+            target_projection=target_projection,
+            results=results,
+            covered_end=covered_end,
+            frame_ids=frame_ids,
+            extent=extent,
+            run_name=run_name,
+            window_size=window_size,
+            probe_actual_fraction=probe_actual_fraction,
+            projection_label=projection_label,
+            plot_units=plot_units,
+            density_limits=(density_vmin, density_vmax),
+            residual_limits=(residual_vmin, residual_vmax_value),
+            out_path=frame_path,
+            dpi=dpi,
+        )
+        frame_paths.append(frame_path)
+
+    final_figure_path = out_dir / f"{common_stem}_final.png"
+    shutil.copy2(frame_paths[-1], final_figure_path)
+    print(f"Saved final figure: {final_figure_path}")
+
+    formats = (
+        ["quicktime", "gif"] if animation_format == "both" else [animation_format]
+    )
+    for selected_format in formats:
+        extension = "mov" if selected_format == "quicktime" else selected_format
+        write_animation(
+            frame_paths,
+            out_dir / f"{common_stem}.{extension}",
+            fps=fps,
+        )
+
+    metrics_payload = {
+        "checkpoint": str(checkpoint_path),
+        "checkpoint_epoch": checkpoint_epoch,
+        "h5_path": str(h5_path),
+        "run_name": run_name,
+        "run_length": int(target_density_plot.shape[0]),
+        "window_size": window_size,
+        "slide_steps": list(slide_steps),
+        "density_visible_fraction_target": density_visible_fraction,
+        "density_visible_fraction_actual": probe_actual_fraction,
+        "probe_grid": probe_info,
+        "plot_units": plot_units,
+        "projection": projection_label,
+        "probe_metric_policy": "raw model predictions included",
+        "results": {
+            str(result["slide_step"]): {
+                "window_starts": result["window_starts"],
+                "updates": [
+                    {
+                        key: snapshot[key]
+                        for key in (
+                            "update_index",
+                            "window_start",
+                            "valid_end",
+                            "covered_end",
+                            "covered_rmse",
+                            "covered_mae",
+                            "last_slice_rmse",
+                            "last_slice_mae",
+                            "current_window_rmse",
+                            "current_window_mae",
+                        )
+                    }
+                    for snapshot in result["snapshots"]
+                ],
+                **result["metrics"],
+            }
+            for result in results
+        },
+    }
+    metrics_path = out_dir / f"{common_stem}_metrics.json"
+    metrics_path.write_text(json.dumps(metrics_payload, indent=2))
+    print(f"Saved metrics: {metrics_path}")
+
+    arrays_path = out_dir / f"{common_stem}_final_reconstructions.npz"
+    np.savez_compressed(
+        arrays_path,
+        target_density=target_density_plot,
+        probe_mask=probe_mask.detach().cpu().numpy(),
+        frame_ids=frame_ids,
+        **{
+            f"prediction_step_{result['slide_step']}": result[
+                "final_reconstruction"
+            ]
+            for result in results
+        },
+    )
+    print(f"Saved arrays: {arrays_path}")
+
+
 @torch.no_grad()
 def main() -> None:
     args = parse_args()
@@ -543,6 +1591,8 @@ def main() -> None:
         raise ValueError(f"--slide-steps values must be unique, got {slide_steps}.")
     if args.fps <= 0:
         raise ValueError(f"--fps must be positive, got {args.fps}.")
+    if args.dpi <= 0 or args.animation_dpi <= 0:
+        raise ValueError("--dpi and --animation-dpi must both be positive.")
 
     target = torch.from_numpy(
         np.transpose(fields_time_first, (1, 0, 2, 3))
@@ -601,8 +1651,17 @@ def main() -> None:
     print("Probe values are clamped only for recursive conditioning.")
     print("Figures and metrics retain raw model predictions at probe positions.")
 
-    results = []
-    for slide_step in slide_steps:
+    render_slide_steps = args.analysis in {"both", "slide_steps"}
+    render_bidirectional = args.analysis in {"both", "bidirectional"}
+    steps_to_compute = []
+    if render_slide_steps:
+        steps_to_compute.extend(slide_steps)
+    if render_bidirectional:
+        steps_to_compute.extend([args.refinement_step, window_size])
+    steps_to_compute = list(dict.fromkeys(steps_to_compute))
+
+    results_by_step = {}
+    for slide_step in steps_to_compute:
         print(f"Reconstructing slide step={slide_step}")
         result = reconstruct_with_slide_step(
             model=model,
@@ -616,144 +1675,95 @@ def main() -> None:
             plot_units=args.plot_units,
             x_index=args.x_index,
             amp=True,
+            retain_state=(
+                render_bidirectional
+                and slide_step in {args.refinement_step, window_size}
+            ),
         )
         print("  starts:", result["window_starts"])
         print("  metrics:", result["metrics"])
-        results.append(result)
+        results_by_step[slide_step] = result
 
-    density_vmin, density_vmax = robust_limits(
-        [target_projection]
-        + [result["snapshots"][-1]["prediction_projection"] for result in results],
-        channel=3,
-        q=args.field_q,
-        symmetric=False,
-    )
-    if args.residual_vmax is None:
-        residual_vmin, residual_vmax = robust_limits(
-            [
-                snapshot["residual_projection"]
-                for result in results
-                for snapshot in result["snapshots"]
-            ],
-            channel=3,
-            q=args.residual_q,
-            symmetric=True,
-        )
-    else:
-        residual_vmin = -float(args.residual_vmax)
-        residual_vmax = float(args.residual_vmax)
-
-    progress_points = sorted(
-        {
-            int(snapshot["covered_end"])
-            for result in results
-            for snapshot in result["snapshots"]
-        }
-    )
-    frame_paths = []
-    common_stem = (
-        f"{args.run_name}_T{window_size}_steps-"
-        + "-".join(str(step) for step in slide_steps)
-        + f"_density-visible-{args.density_visible_fraction:g}_{args.plot_units}"
-    )
-    for frame_index, covered_end in enumerate(progress_points):
-        frame_path = out_dir / (
-            f"{common_stem}_progress-{frame_index:03d}_"
-            f"covered-through-{covered_end - 1:04d}.png"
-        )
-        plot_progress_frame(
+    if render_slide_steps:
+        save_slide_step_analysis(
+            results=[results_by_step[step] for step in slide_steps],
+            slide_steps=slide_steps,
+            target_density_plot=target_density_plot,
             target_projection=target_projection,
-            results=results,
-            covered_end=covered_end,
+            probe_mask=probe_mask,
             frame_ids=frame_ids,
             extent=args.extent,
             run_name=args.run_name,
             window_size=window_size,
+            density_visible_fraction=args.density_visible_fraction,
             probe_actual_fraction=probe_actual_fraction,
+            probe_info=probe_info,
             projection_label=projection_label,
             plot_units=args.plot_units,
-            density_limits=(density_vmin, density_vmax),
-            residual_limits=(residual_vmin, residual_vmax),
-            out_path=frame_path,
+            field_q=args.field_q,
+            residual_q=args.residual_q,
+            residual_vmax=args.residual_vmax,
+            animation_format=args.animation_format,
+            fps=args.fps,
+            checkpoint_path=checkpoint_path,
+            checkpoint_epoch=checkpoint.get("epoch"),
+            h5_path=h5_path,
+            out_dir=out_dir,
             dpi=args.dpi,
         )
-        frame_paths.append(frame_path)
 
-    final_figure_path = out_dir / f"{common_stem}_final.png"
-    shutil.copy2(frame_paths[-1], final_figure_path)
-    print(f"Saved final figure: {final_figure_path}")
-
-    formats = (
-        ["quicktime", "gif"]
-        if args.animation_format == "both"
-        else [args.animation_format]
-    )
-    for animation_format in formats:
-        extension = "mov" if animation_format == "quicktime" else animation_format
-        write_animation(
-            frame_paths,
-            out_dir / f"{common_stem}.{extension}",
+    if render_bidirectional:
+        print("Building bidirectional repeated-sweep comparison")
+        bidirectional_rows = build_bidirectional_rows(
+            model=model,
+            target_normalized=target_normalized,
+            target_density_plot=target_density_plot,
+            density_mean=mean[3],
+            density_std=std[3],
+            probe_mask=probe_mask,
+            window_size=window_size,
+            refinement_step=args.refinement_step,
+            refinement_passes=args.refinement_passes,
+            refinement_offset=args.refinement_offset,
+            plot_units=args.plot_units,
+            x_index=args.x_index,
+            amp=True,
+            initial_results=results_by_step,
+        )
+        for row_index, row in enumerate(bidirectional_rows, start=1):
+            print(
+                f"  row={row_index} step={row['slide_step']} "
+                f"passes={row['pass_count']} offsets={row['offsets']} "
+                f"metrics={row['metrics']}"
+            )
+        save_bidirectional_analysis(
+            rows=bidirectional_rows,
+            target_density_plot=target_density_plot,
+            target_projection=target_projection,
+            probe_mask=probe_mask,
+            frame_ids=frame_ids,
+            extent=args.extent,
+            run_name=args.run_name,
+            window_size=window_size,
+            refinement_step=args.refinement_step,
+            refinement_passes=args.refinement_passes,
+            refinement_offset=args.refinement_offset,
+            probe_actual_fraction=probe_actual_fraction,
+            probe_info=probe_info,
+            projection_label=projection_label,
+            plot_units=args.plot_units,
+            field_q=args.field_q,
+            residual_q=args.residual_q,
+            residual_vmax=args.residual_vmax,
+            checkpoint_path=checkpoint_path,
+            checkpoint_epoch=checkpoint.get("epoch"),
+            h5_path=h5_path,
+            out_dir=out_dir,
+            dpi=args.dpi,
+            animation_dpi=args.animation_dpi,
+            animation_format=args.animation_format,
             fps=args.fps,
         )
-
-    metrics_payload = {
-        "checkpoint": str(checkpoint_path),
-        "checkpoint_epoch": checkpoint.get("epoch"),
-        "h5_path": str(h5_path),
-        "run_name": args.run_name,
-        "run_length": int(target.shape[1]),
-        "window_size": window_size,
-        "slide_steps": slide_steps,
-        "density_visible_fraction_target": args.density_visible_fraction,
-        "density_visible_fraction_actual": probe_actual_fraction,
-        "probe_grid": probe_info,
-        "plot_units": args.plot_units,
-        "projection": projection_label,
-        "probe_metric_policy": "raw model predictions included",
-        "results": {
-            str(result["slide_step"]): {
-                "window_starts": result["window_starts"],
-                "updates": [
-                    {
-                        key: snapshot[key]
-                        for key in (
-                            "update_index",
-                            "window_start",
-                            "valid_end",
-                            "covered_end",
-                            "covered_rmse",
-                            "covered_mae",
-                            "last_slice_rmse",
-                            "last_slice_mae",
-                            "current_window_rmse",
-                            "current_window_mae",
-                        )
-                    }
-                    for snapshot in result["snapshots"]
-                ],
-                **result["metrics"],
-            }
-            for result in results
-        },
-    }
-    metrics_path = out_dir / f"{common_stem}_metrics.json"
-    metrics_path.write_text(json.dumps(metrics_payload, indent=2))
-    print(f"Saved metrics: {metrics_path}")
-
-    arrays_path = out_dir / f"{common_stem}_final_reconstructions.npz"
-    np.savez_compressed(
-        arrays_path,
-        target_density=target_density_plot,
-        probe_mask=probe_mask.detach().cpu().numpy(),
-        frame_ids=frame_ids,
-        **{
-            f"prediction_step_{result['slide_step']}": result[
-                "final_reconstruction"
-            ]
-            for result in results
-        },
-    )
-    print(f"Saved arrays: {arrays_path}")
 
 
 if __name__ == "__main__":
