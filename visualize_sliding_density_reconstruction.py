@@ -26,7 +26,7 @@ from visualize_mask_patterns_unet3d import (
 )
 
 
-DEFAULT_RUN_NAME = "beta0.2_nu1_Bz0_dt2_tau200"
+DEFAULT_RUN_NAME = "beta0.2_nu1_Bz0.15_dt2_tau200"
 
 
 def parse_args() -> argparse.Namespace:
@@ -115,7 +115,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--animation-format",
         choices=["quicktime", "mp4", "gif", "both"],
-        default="quicktime",
+        default="gif",
     )
     parser.add_argument("--fps", type=float, default=2.0)
     parser.add_argument("--dpi", type=int, default=160)
@@ -1254,6 +1254,8 @@ def save_bidirectional_analysis(
     animation_format: str,
     fps: float,
 ) -> None:
+    images_dir = out_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
     density_limits = robust_limits(
         [target_projection] + [row["prediction_projection"] for row in rows],
         channel=3,
@@ -1275,7 +1277,7 @@ def save_bidirectional_analysis(
         f"passes{refinement_passes}_step{window_size}-offset{refinement_offset}_"
         f"density-visible-{probe_actual_fraction:.4f}_{plot_units}"
     )
-    figure_path = out_dir / f"{common_stem}.png"
+    figure_path = images_dir / f"{common_stem}.png"
     plot_bidirectional_refinement_figure(
         target_projection=target_projection,
         rows=rows,
@@ -1293,7 +1295,7 @@ def save_bidirectional_analysis(
     )
 
     animation_events = bidirectional_animation_events(rows)
-    frame_dir = out_dir / f"{common_stem}_frames"
+    frame_dir = images_dir / f"{common_stem}_frames"
     frame_dir.mkdir(parents=True, exist_ok=True)
     frame_paths = []
     for frame_index, event in enumerate(animation_events):
@@ -1411,6 +1413,8 @@ def save_slide_step_analysis(
     out_dir: Path,
     dpi: int,
 ) -> None:
+    images_dir = out_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
     density_vmin, density_vmax = robust_limits(
         [target_projection]
         + [result["snapshots"][-1]["prediction_projection"] for result in results],
@@ -1446,8 +1450,10 @@ def save_slide_step_analysis(
         + "-".join(str(step) for step in slide_steps)
         + f"_density-visible-{density_visible_fraction:g}_{plot_units}"
     )
+    frame_dir = images_dir / f"{common_stem}_frames"
+    frame_dir.mkdir(parents=True, exist_ok=True)
     for frame_index, covered_end in enumerate(progress_points):
-        frame_path = out_dir / (
+        frame_path = frame_dir / (
             f"{common_stem}_progress-{frame_index:03d}_"
             f"covered-through-{covered_end - 1:04d}.png"
         )
@@ -1469,7 +1475,7 @@ def save_slide_step_analysis(
         )
         frame_paths.append(frame_path)
 
-    final_figure_path = out_dir / f"{common_stem}_final.png"
+    final_figure_path = images_dir / f"{common_stem}_final.png"
     shutil.copy2(frame_paths[-1], final_figure_path)
     print(f"Saved final figure: {final_figure_path}")
 

@@ -24,6 +24,10 @@ from data.masking import MASK_PATTERNS, make_visible_input, sample_mask
 from models.unet3d import UNet3D
 
 
+DEFAULT_RUN_NAME = "beta0.2_nu1_Bz0.15_dt2_tau200"
+DEFAULT_T0 = 72
+
+
 def parse_args():
     p = argparse.ArgumentParser()
 
@@ -46,7 +50,33 @@ def parse_args():
         help="Override HDF5 data directory. If None, use checkpoint args.",
     )
 
-    p.add_argument("--sample-index", type=int, default=0)
+    p.add_argument(
+        "--run-name",
+        type=str,
+        default=DEFAULT_RUN_NAME,
+        help=(
+            "Validation run to visualize (default: the 150-frame canonical "
+            f"plasmoid run {DEFAULT_RUN_NAME})."
+        ),
+    )
+    p.add_argument(
+        "--t0",
+        type=int,
+        default=DEFAULT_T0,
+        help=(
+            "First global frame of the temporal window selected with "
+            f"--run-name (default: {DEFAULT_T0})."
+        ),
+    )
+    p.add_argument(
+        "--sample-index",
+        type=int,
+        default=None,
+        help=(
+            "Legacy zero-based index within validation windows. When given, "
+            "it overrides --run-name and --t0."
+        ),
+    )
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument(
         "--mask-fraction",
@@ -106,7 +136,7 @@ def parse_args():
     p.add_argument(
         "--animation-format",
         choices=["quicktime", "mp4", "gif", "both"],
-        default="quicktime",
+        default="gif",
         help=(
             "Animation output written with --all-times. quicktime writes a "
             "Motion-JPEG .mov that opens in macOS QuickTime; mp4 may use VP9 "
@@ -296,6 +326,8 @@ def get_val_runs(run_dir: Path) -> set[str] | None:
 
 
 def select_sample_index(dataset: VPICWindowDataset, val_runs: set[str] | None, sample_index: int) -> int:
+    if sample_index < 0:
+        raise IndexError(f"sample_index must be non-negative, got {sample_index}")
     if val_runs is None:
         if sample_index >= len(dataset):
             raise IndexError(f"sample_index={sample_index} out of range for dataset length {len(dataset)}")
@@ -315,6 +347,43 @@ def select_sample_index(dataset: VPICWindowDataset, val_runs: set[str] | None, s
         )
 
     return val_indices[sample_index]
+
+
+def select_run_t0_index(
+    dataset: VPICWindowDataset,
+    val_runs: set[str] | None,
+    run_name: str,
+    t0: int,
+) -> int:
+    """Resolve an exact physical run/window, independently of sample ordering."""
+    if t0 < 0:
+        raise ValueError(f"t0 must be non-negative, got {t0}")
+    if val_runs is not None and run_name not in val_runs:
+        raise ValueError(
+            f"run_name={run_name!r} is not in split.json validation runs."
+        )
+
+    run_windows = [
+        (i, int(sample_t0))
+        for i, (_, sample_run_name, sample_t0) in enumerate(dataset.samples)
+        if sample_run_name == run_name
+    ]
+    if not run_windows:
+        raise ValueError(f"run_name={run_name!r} was not found in the dataset.")
+
+    matches = [i for i, sample_t0 in run_windows if sample_t0 == t0]
+    if not matches:
+        available_t0 = [sample_t0 for _, sample_t0 in run_windows]
+        raise ValueError(
+            f"No window found for run_name={run_name!r}, t0={t0}. "
+            f"Available t0 range is {min(available_t0)}-{max(available_t0)} "
+            f"with values {available_t0}."
+        )
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"Found multiple dataset windows for run_name={run_name!r}, t0={t0}."
+        )
+    return matches[0]
 
 
 def make_nan_cmap(name: str, bad_color: str = "lightgray"):
@@ -1585,6 +1654,8 @@ def main():
         else run_dir / "figures_mask_patterns"
     )
     out_dir.mkdir(parents=True, exist_ok=True)
+    images_dir = out_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device(
         args.device if torch.cuda.is_available() and args.device == "cuda" else "cpu"
@@ -1627,6 +1698,10 @@ def main():
     print("magnetic_grid_stride:", args.magnetic_grid_stride)
     print("mask_patterns:", args.mask_patterns)
     print("experiment:", args.experiment)
+    if args.sample_index is None:
+        print("sample selector: run_name/t0", args.run_name, args.t0)
+    else:
+        print("sample selector: legacy validation sample_index", args.sample_index)
     print("density_visible_fractions:", args.density_visible_fractions)
     print("fixed_density_visible_fraction:", args.fixed_density_visible_fraction)
     print("magnetic_visible_fractions:", args.magnetic_visible_fractions)
@@ -1651,7 +1726,17 @@ def main():
     )
 
     val_runs = get_val_runs(run_dir)
-    dataset_idx = select_sample_index(dataset, val_runs, args.sample_index)
+    if args.sample_index is None:
+        dataset_idx = select_run_t0_index(
+            dataset=dataset,
+            val_runs=val_runs,
+            run_name=args.run_name,
+            t0=args.t0,
+        )
+        selection_stem = "named"
+    else:
+        dataset_idx = select_sample_index(dataset, val_runs, args.sample_index)
+        selection_stem = f"sample{args.sample_index:04d}"
 
     sample = dataset[dataset_idx]
     y = sample["block"].unsqueeze(0).to(device)  # (1, C, T, X, Z)
@@ -1726,12 +1811,14 @@ def main():
         experiment_rows.append((experiment_name, rows_for_plot))
 
     sample_stem = (
-        f"sample{args.sample_index:04d}_"
+        f"{selection_stem}_"
         f"{metadata['run_name']}_"
         f"t0-{metadata['t0']}_"
         f"{args.plot_units}"
     )
     for experiment_name, rows_for_plot in experiment_rows:
+        experiment_images_dir = images_dir / experiment_name
+        experiment_images_dir.mkdir(parents=True, exist_ok=True)
         if args.all_times:
             local_times = list(range(delta_t))
             limit_times = local_times
@@ -1756,9 +1843,9 @@ def main():
                 f"localt-{local_time:03d}_"
                 f"globalt-{int(metadata['t0']) + local_time:04d}"
             )
-            magnetic_path = out_dir / f"{frame_stem}_magnetic_table.png"
-            density_path = out_dir / f"{frame_stem}_density_table.png"
-            combined_path = out_dir / f"{frame_stem}_combined_1x2.png"
+            magnetic_path = experiment_images_dir / f"{frame_stem}_magnetic_table.png"
+            density_path = experiment_images_dir / f"{frame_stem}_density_table.png"
+            combined_path = experiment_images_dir / f"{frame_stem}_combined_1x2.png"
 
             plot_jy_ay_by_mask_patterns(
                 target_ay=target_ay,

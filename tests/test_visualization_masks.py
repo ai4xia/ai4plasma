@@ -13,6 +13,7 @@ from visualize_mask_patterns_unet3d import (  # noqa: E402
     build_density_superres_rows,
     build_magnetic_ablation_rows,
     default_density_forecast_visible_frames,
+    select_run_t0_index,
 )
 
 
@@ -94,3 +95,36 @@ def test_density_forecast_uses_complete_prefixes_and_full_magnetic_history():
 def test_density_forecast_defaults_scale_with_context_length():
     assert default_density_forecast_visible_frames(24) == [23, 18, 12, 6]
     assert default_density_forecast_visible_frames(8) == [7, 6, 4, 2]
+
+
+class FakeDataset:
+    samples = [
+        (0, "train_run", 0),
+        (0, "canonical_run", 70),
+        (0, "canonical_run", 72),
+        (0, "canonical_run", 74),
+    ]
+
+
+def test_named_sample_selection_uses_exact_run_and_t0():
+    index = select_run_t0_index(
+        dataset=FakeDataset(),
+        val_runs={"canonical_run"},
+        run_name="canonical_run",
+        t0=72,
+    )
+    assert index == 2
+
+
+def test_named_sample_selection_rejects_training_run():
+    try:
+        select_run_t0_index(
+            dataset=FakeDataset(),
+            val_runs={"canonical_run"},
+            run_name="train_run",
+            t0=0,
+        )
+    except ValueError as error:
+        assert "not in split.json validation runs" in str(error)
+    else:
+        raise AssertionError("Expected a non-validation run to be rejected.")

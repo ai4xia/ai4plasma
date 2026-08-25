@@ -66,7 +66,7 @@ train/validation 是按完整 `run_name` 划分，而不是随机拆分窗口。
 | Validation/Test | 25 | 591 |
 | 合计 | 250 | 7,650 |
 
-划分比例为 90%/10%，seed 为 1234。准确的 run 名单保存在训练目录的 `split.json` 中。这里的 “test” 图目前实际使用 held-out validation runs；尚未另设第三个、完全独立的最终 test split。`visualize_mask_patterns_unet3d.py` 的 `--sample-index` 只在 validation windows 中选择样本，整 run 脚本也会拒绝非 validation run，除非显式传入 `--allow-non-validation-run`。
+划分比例为 90%/10%，seed 为 1234。准确的 run 名单保存在训练目录的 `split.json` 中。这里的 “test” 图目前实际使用 held-out validation runs；尚未另设第三个、完全独立的最终 test split。`visualize_mask_patterns_unet3d.py` 默认用 `--run-name`/`--t0` 精确选择 validation window，`--sample-index` 仅作为兼容旧命令的显式 override；整 run 脚本也会拒绝非 validation run，除非显式传入 `--allow-non-validation-run`。
 
 当前只训练 beta=0.2。不同 beta 文件可能具有不同空间尺寸，不能在现有 DataLoader 中未经 padding/resampling 直接混合成一个 batch。因此当前结果不能自动解释为跨 beta 泛化。
 
@@ -198,7 +198,7 @@ masked-unet3d_beta0p2_dt24_bc24_depth4_ddp16_sharedB_densityIndependentRandomGri
 
 ## 6. 单窗口 visualization 测试案例
 
-`visualize_mask_patterns_unet3d.py` 默认读取 `best.pt` 和 validation sample。`--experiment all` 生成下面四套 table；`--all-times` 对窗口内全部 24 帧生成 PNG 并拼成视频。
+`visualize_mask_patterns_unet3d.py` 默认读取 `best.pt`，并稳定选择 150 帧 validation run `beta0.2_nu1_Bz0.15_dt2_tau200` 中从 `t0=72` 开始的窗口（global frames 72–95）。这个窗口覆盖 plasmoid 的形成过程。`--experiment all` 生成下面四套 table；`--all-times` 对窗口内全部 24 帧生成 PNG 并拼成视频。
 
 ### 6.1 Multifunction：只 mask Density
 
@@ -244,6 +244,8 @@ Jy =  dBx/dz - dBz/dx
 srun -n 1 -c 32 -G 1 --gpu-bind=none \
   python visualize_mask_patterns_unet3d.py \
   --run-dir runs/masked-unet3d_beta0p2_dt24_bc24_depth4_ddp16_sharedB_densityIndependentRandomGrid_v1 \
+  --run-name beta0.2_nu1_Bz0.15_dt2_tau200 \
+  --t0 72 \
   --experiment all \
   --all-times \
   --animation-format quicktime \
@@ -251,14 +253,14 @@ srun -n 1 -c 32 -G 1 --gpu-bind=none \
   --out-dir runs/masked-unet3d_beta0p2_dt24_bc24_depth4_ddp16_sharedB_densityIndependentRandomGrid_v1/figures_information_suite
 ```
 
-`quicktime` 生成 Motion-JPEG 编码的 `.mov`，可直接用 macOS QuickTime 查看；视频格式不是 MP3。需要同时生成 `.mov` 和 GIF 时改为 `--animation-format both`。一条命令结束后再运行下一条，不要把两个完整的 `srun ... python ...` 无分隔地粘到同一行，否则第二个 `srun` 会被 argparse 当成第一个 Python 命令的参数。
+`quicktime` 生成 Motion-JPEG 编码的 `.mov`，可直接用 macOS QuickTime 查看；视频格式不是 MP3。需要同时生成 `.mov` 和 GIF 时改为 `--animation-format both`。动画保存在 `--out-dir` 顶层，所有 PNG 统一放在 `--out-dir/images/<experiment>/`，便于直接找到视频。一条命令结束后再运行下一条，不要把两个完整的 `srun ... python ...` 无分隔地粘到同一行，否则第二个 `srun` 会被 argparse 当成第一个 Python 命令的参数。
 
 ## 7. 整 run sliding Density reconstruction
 
 `visualize_sliding_density_reconstruction.py` 用完整磁场和固定 Density probe grid 重建一个长 run。默认选择 validation run：
 
 ```text
-beta0.2_nu1_Bz0_dt2_tau200, T=150
+beta0.2_nu1_Bz0.15_dt2_tau200, T=150
 ```
 
 默认将 Density `(time,x,z)` 沿 x 平均后显示为 `(time,z)`，因为可能的 plasmoid 往往位于相近 x，而在 z 方向分离；也可以用 `--x-index INDEX` 查看固定 x slice。所有 RMSE/MAE 始终在完整三维 `(time,x,z)` Density 上计算，不受投影方式影响。
@@ -292,7 +294,7 @@ beta0.2_nu1_Bz0_dt2_tau200, T=150
 srun -n 1 -c 32 -G 1 --gpu-bind=none \
   python visualize_sliding_density_reconstruction.py \
   --run-dir runs/masked-unet3d_beta0p2_dt24_bc24_depth4_ddp16_sharedB_densityIndependentRandomGrid_v1 \
-  --run-name beta0.2_nu1_Bz0_dt2_tau200 \
+  --run-name beta0.2_nu1_Bz0.15_dt2_tau200 \
   --analysis both \
   --slide-steps 24 12 6 3 \
   --refinement-step 12 \
@@ -303,7 +305,7 @@ srun -n 1 -c 32 -G 1 --gpu-bind=none \
   --fps 2
 ```
 
-脚本保存 final PNG、逐步 PNG、QuickTime/GIF/MP4、metrics JSON 和 reconstruction NPZ。默认输出目录为该 checkpoint run 下的 `figures_sliding_density_reconstruction/`。
+脚本保存 final PNG、逐步 PNG、QuickTime/GIF/MP4、metrics JSON 和 reconstruction NPZ。动画、JSON 和 NPZ 位于 `--out-dir` 顶层；final/逐步 PNG 位于 `--out-dir/images/`，动画帧再按 analysis stem 分子目录。默认输出目录为该 checkpoint run 下的 `figures_sliding_density_reconstruction/`。
 
 ## 8. 当前结果
 
