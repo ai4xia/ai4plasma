@@ -26,7 +26,7 @@ from visualize_mask_patterns_unet3d import (
 )
 
 
-DEFAULT_RUN_NAME = "beta0.2_nu1_Bz0.15_dt2_tau200"
+DEFAULT_RUN_NAME = "beta0.2_nu2_Bz0_dt2_tau70"
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,8 +43,8 @@ def parse_args() -> argparse.Namespace:
         "--run-name",
         default=DEFAULT_RUN_NAME,
         help=(
-            "Complete HDF5 run to reconstruct. The default is a 150-frame "
-            "validation run with beta=0.2."
+            "Complete HDF5 run to reconstruct. The default is the 52-frame "
+            "held-out two-plasmoid merger run with beta=0.2."
         ),
     )
     parser.add_argument(

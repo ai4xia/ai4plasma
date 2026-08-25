@@ -24,8 +24,8 @@ from data.masking import MASK_PATTERNS, make_visible_input, sample_mask
 from models.unet3d import UNet3D
 
 
-DEFAULT_RUN_NAME = "beta0.2_nu1_Bz0.15_dt2_tau200"
-DEFAULT_T0 = 72
+DEFAULT_RUN_NAME = "beta0.2_nu2_Bz0_dt2_tau70"
+DEFAULT_T0 = 28
 
 
 def parse_args():
@@ -55,8 +55,8 @@ def parse_args():
         type=str,
         default=DEFAULT_RUN_NAME,
         help=(
-            "Validation run to visualize (default: the 150-frame canonical "
-            f"plasmoid run {DEFAULT_RUN_NAME})."
+            "Validation run to visualize (default: the canonical two-plasmoid "
+            f"merger run {DEFAULT_RUN_NAME})."
         ),
     )
     p.add_argument(

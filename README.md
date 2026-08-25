@@ -198,7 +198,7 @@ masked-unet3d_beta0p2_dt24_bc24_depth4_ddp16_sharedB_densityIndependentRandomGri
 
 ## 6. 单窗口 visualization 测试案例
 
-`visualize_mask_patterns_unet3d.py` 默认读取 `best.pt`，并稳定选择 150 帧 validation run `beta0.2_nu1_Bz0.15_dt2_tau200` 中从 `t0=72` 开始的窗口（global frames 72–95）。这个窗口覆盖 plasmoid 的形成过程。`--experiment all` 生成下面四套 table；`--all-times` 对窗口内全部 24 帧生成 PNG 并拼成视频。
+`visualize_mask_patterns_unet3d.py` 默认读取 `best.pt`，并稳定选择 held-out validation run `beta0.2_nu2_Bz0_dt2_tau70` 中从 `t0=28` 开始的窗口（global frames 28–51）。该窗口覆盖两个 plasmoid 的独立演化（t=43–45）、开始共享外层 separatrix（t=46）、接触（t=47）和融合（t=48）；Density 双峰和闭合 `Ay` 等高线都清楚支持这一拓扑演化。`--experiment all` 生成下面四套 table；`--all-times` 对窗口内全部 24 帧生成 PNG 并拼成视频。
 
 ### 6.1 Multifunction：只 mask Density
 
@@ -244,8 +244,8 @@ Jy =  dBx/dz - dBz/dx
 srun -n 1 -c 32 -G 1 --gpu-bind=none \
   python visualize_mask_patterns_unet3d.py \
   --run-dir runs/masked-unet3d_beta0p2_dt24_bc24_depth4_ddp16_sharedB_densityIndependentRandomGrid_v1 \
-  --run-name beta0.2_nu1_Bz0.15_dt2_tau200 \
-  --t0 72 \
+  --run-name beta0.2_nu2_Bz0_dt2_tau70 \
+  --t0 28 \
   --experiment all \
   --all-times \
   --animation-format quicktime \
@@ -257,13 +257,13 @@ srun -n 1 -c 32 -G 1 --gpu-bind=none \
 
 ## 7. 整 run sliding Density reconstruction
 
-`visualize_sliding_density_reconstruction.py` 用完整磁场和固定 Density probe grid 重建一个长 run。默认选择 validation run：
+`visualize_sliding_density_reconstruction.py` 用完整磁场和固定 Density probe grid 重建一个完整 run。默认选择双 plasmoid 融合的 validation run：
 
 ```text
-beta0.2_nu1_Bz0.15_dt2_tau200, T=150
+beta0.2_nu2_Bz0_dt2_tau70, T=52
 ```
 
-默认将 Density `(time,x,z)` 沿 x 平均后显示为 `(time,z)`，因为可能的 plasmoid 往往位于相近 x，而在 z 方向分离；也可以用 `--x-index INDEX` 查看固定 x slice。所有 RMSE/MAE 始终在完整三维 `(time,x,z)` Density 上计算，不受投影方式影响。
+默认将 Density `(time,x,z)` 沿 x 平均后显示为 `(time,z)`；对于当前默认 run，推荐 `--x-index 130`（约 `x=35 cm`）查看穿过双 plasmoid 核心的固定 x slice，使 t=43–48 的融合不被 x 平均削弱。所有 RMSE/MAE 始终在完整三维 `(time,x,z)` Density 上计算，不受投影方式影响。
 
 ### 7.1 单向 slide-step 比较
 
@@ -273,18 +273,18 @@ beta0.2_nu1_Bz0.15_dt2_tau200, T=150
 
 三列统一为 Target、Latest reconstruction、Residual，六行是：
 
-| 行 | 策略 | 当前 T=150 时的模型 window calls |
+| 行 | 策略 | 当前 T=52 时的模型 window calls |
 |---|---|---:|
-| 1 | step=12，L→R 一遍 | 12 |
-| 2 | step=12，再加 R→L | 24 |
-| 3 | step=12，再加 L→R | 36 |
-| 4 | step=12，再加 R→L | 48 |
-| 5 | step=24、offset=0 的 independent-window control，交替方向重复到相同预算 | 48 |
-| 6 | step=24，offset 在 0/12 间交替，使原本独立的窗口能够交换信息，同样限制预算 | 48 |
+| 1 | step=12，L→R 一遍 | 4 |
+| 2 | step=12，再加 R→L | 8 |
+| 3 | step=12，再加 L→R | 12 |
+| 4 | step=12，再加 R→L | 16 |
+| 5 | step=24、offset=0 的 independent-window control，交替方向重复到相同预算 | 16 |
+| 6 | step=24，offset 在 0/12 间交替，使原本独立的窗口能够交换信息，同样限制预算 | 16 |
 
 第一次完成全 run 后，后续 refinement sweep 把当前最新 Density reconstruction 在整个有效窗口内标记为 visible，并用真实 probe 覆盖 conditioning input。模型仍会重新输出并覆盖整个窗口，包括作为输入的 reconstruction 区域。图和 RMSE 保存的是 raw prediction，probe 位置也不替换成真值；真实 probes 只在下一次 conditioning 时施加观测约束。因此 probe RMSE 和 hidden-region RMSE 都是模型实际输出误差。
 
-六行视频按累计 window calls 同步，共 48 帧；前三行到达各自 12/24/36 calls 后冻结，第 4–6 行继续到相同 48-call 预算。这样第 4、5、6 行是在相同推理成本下比较 overlap、独立重复和 offset 信息传递。
+六行视频按累计 window calls 同步；对当前 T=52 run 共 16 帧，前三行到达各自 4/8/12 calls 后冻结，第 4–6 行继续到相同 16-call 预算。这样第 4、5、6 行是在相同推理成本下比较 overlap、独立重复和 offset 信息传递。若显式选择此前的 T=150 run，对应预算仍为 48 calls。
 
 这是 offline reconstruction/smoothing，而不是 causal online forecasting：R→L sweep 使用未来侧 reconstruction，完整磁场也在整个 run 中已知。
 
@@ -294,13 +294,14 @@ beta0.2_nu1_Bz0.15_dt2_tau200, T=150
 srun -n 1 -c 32 -G 1 --gpu-bind=none \
   python visualize_sliding_density_reconstruction.py \
   --run-dir runs/masked-unet3d_beta0p2_dt24_bc24_depth4_ddp16_sharedB_densityIndependentRandomGrid_v1 \
-  --run-name beta0.2_nu1_Bz0.15_dt2_tau200 \
+  --run-name beta0.2_nu2_Bz0_dt2_tau70 \
   --analysis both \
   --slide-steps 24 12 6 3 \
   --refinement-step 12 \
   --refinement-passes 4 \
   --refinement-offset 12 \
   --density-visible-fraction 0.08 \
+  --x-index 130 \
   --animation-format quicktime \
   --fps 2
 ```
