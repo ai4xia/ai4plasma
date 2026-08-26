@@ -48,14 +48,14 @@ srun -n 1 -c 32 -G 1 --gpu-bind=none \
     --run-dir "$RUN_DIR" \
     --run-name "$RUN_NAME" \
     --analysis both \
-    --slide-steps 24 12 6 3 \
-    --refinement-step 12 \
+    --slide-steps 8 4 2 1 \
+    --refinement-step 8 \
     --refinement-passes 4 \
     --refinement-offset 12 \
     --density-visible-fraction 0.08 \
     --x-index "$PLASMOID_X_INDEX" \
     --animation-format gif \
-    --fps 2 \
+    --fps 4 \
     --out-dir "$SLIDING_OUT"
 
 echo

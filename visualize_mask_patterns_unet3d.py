@@ -1193,7 +1193,6 @@ def write_animation(
             save_all=True,
             append_images=frames[1:],
             duration=max(1, int(round(1000.0 / fps))),
-            loop=0,
             optimize=False,
             disposal=2,
         )

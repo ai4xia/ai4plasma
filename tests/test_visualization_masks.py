@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 import torch
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -14,6 +15,7 @@ from visualize_mask_patterns_unet3d import (  # noqa: E402
     build_magnetic_ablation_rows,
     default_density_forecast_visible_frames,
     select_run_t0_index,
+    write_animation,
 )
 
 
@@ -128,3 +130,18 @@ def test_named_sample_selection_rejects_training_run():
         assert "not in split.json validation runs" in str(error)
     else:
         raise AssertionError("Expected a non-validation run to be rejected.")
+
+
+def test_gif_animation_has_no_infinite_loop_extension(tmp_path):
+    frame_paths = []
+    for index, color in enumerate(("red", "blue")):
+        frame_path = tmp_path / f"frame-{index}.png"
+        Image.new("RGB", (8, 8), color=color).save(frame_path)
+        frame_paths.append(frame_path)
+
+    gif_path = tmp_path / "single-play.gif"
+    write_animation(frame_paths, gif_path, fps=2.0)
+
+    with Image.open(gif_path) as animation:
+        assert animation.n_frames == 2
+        assert "loop" not in animation.info

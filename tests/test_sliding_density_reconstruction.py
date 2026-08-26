@@ -9,6 +9,7 @@ from visualize_sliding_density_reconstruction import (
     reconstruct_with_slide_step,
     shifted_window_starts,
     sliding_window_starts,
+    window_outline_bounds,
 )
 
 
@@ -88,6 +89,20 @@ def test_time_z_projection_averages_x_and_preserves_unreconstructed_nan():
         project_time_z(density, x_index=1)[0],
         [3.0, 5.0],
     )
+
+
+def test_window_outline_bounds_clip_padding_to_real_run():
+    frame_ids = np.arange(6)
+    assert window_outline_bounds(
+        {"window_start": 2, "valid_end": 6}, frame_ids
+    ) == (1.5, 5.5)
+    assert window_outline_bounds(
+        {"window_start": -2, "valid_start": 0, "valid_end": 2}, frame_ids
+    ) == (-0.5, 1.5)
+    assert window_outline_bounds(
+        {"window_start": 6, "valid_start": 6, "valid_end": 6}, frame_ids
+    ) is None
+    assert window_outline_bounds(None, frame_ids) is None
 
 
 def test_probes_are_clamped_only_for_recursive_input_not_output_metrics():

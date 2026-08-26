@@ -15,6 +15,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from matplotlib.patches import Rectangle
 
 from data.vpic_hdf5_dataset import find_h5_files, parse_run_name
 from models.unet3d import UNet3D
@@ -906,6 +907,82 @@ def snapshot_at_or_before(result: Dict, covered_end: int) -> Dict:
     return eligible[-1]
 
 
+def window_outline_bounds(
+    snapshot: Dict | None,
+    frame_ids: np.ndarray,
+) -> Tuple[float, float] | None:
+    """Return visible time-axis edges for one snapshot's active window."""
+    if snapshot is None or "window_start" not in snapshot or "valid_end" not in snapshot:
+        return None
+    if len(frame_ids) == 0:
+        return None
+
+    valid_start = int(
+        snapshot.get("valid_start", max(int(snapshot["window_start"]), 0))
+    )
+    valid_end = int(snapshot["valid_end"])
+    valid_start = max(0, min(valid_start, len(frame_ids)))
+    valid_end = max(0, min(valid_end, len(frame_ids)))
+    if valid_end <= valid_start:
+        return None
+
+    left = float(frame_ids[valid_start]) - 0.5
+    right = float(frame_ids[valid_end - 1]) + 0.5
+    return left, right
+
+
+def add_window_outline(
+    ax,
+    snapshot: Dict | None,
+    frame_ids: np.ndarray,
+    zmin: float,
+    zmax: float,
+) -> None:
+    """Overlay the current valid sliding-window footprint on a time-z panel."""
+    bounds = window_outline_bounds(snapshot, frame_ids)
+    if bounds is None:
+        return
+    left, right = bounds
+    width = right - left
+    height = zmax - zmin
+
+    # A faint fill makes the footprint readable without hiding the field. The
+    # black under-stroke keeps the cyan edge visible on both plotting colormaps.
+    ax.add_patch(
+        Rectangle(
+            (left, zmin),
+            width,
+            height,
+            facecolor="cyan",
+            edgecolor="none",
+            alpha=0.055,
+            zorder=4,
+        )
+    )
+    ax.add_patch(
+        Rectangle(
+            (left, zmin),
+            width,
+            height,
+            fill=False,
+            edgecolor="black",
+            linewidth=2.6,
+            zorder=5,
+        )
+    )
+    ax.add_patch(
+        Rectangle(
+            (left, zmin),
+            width,
+            height,
+            fill=False,
+            edgecolor="cyan",
+            linewidth=1.35,
+            zorder=6,
+        )
+    )
+
+
 def plot_progress_frame(
     target_projection: np.ndarray,
     results: Sequence[Dict],
@@ -921,6 +998,7 @@ def plot_progress_frame(
     residual_limits: Tuple[float, float],
     out_path: Path,
     dpi: int,
+    show_window_outline: bool = True,
 ) -> None:
     n_rows = len(results)
     fig, axes = plt.subplots(
@@ -979,20 +1057,22 @@ def plot_progress_frame(
             interpolation="nearest",
         )
 
-        frontier = int(snapshot["covered_end"])
-        frontier_x = float(frame_ids[frontier - 1]) + 0.5
         for column in range(3):
-            axes[row_index, column].axvline(
-                frontier_x,
-                color="cyan",
-                linewidth=1.0,
-                linestyle="--",
-            )
+            if show_window_outline:
+                add_window_outline(
+                    axes[row_index, column],
+                    snapshot=snapshot,
+                    frame_ids=frame_ids,
+                    zmin=zmin,
+                    zmax=zmax,
+                )
             axes[row_index, column].tick_params(labelsize=8)
         axes[row_index, 0].set_ylabel(
             f"step={result['slide_step']}\n"
             f"updates={snapshot['update_index'] + 1}\n"
-            f"window={snapshot['window_start']}:{snapshot['valid_end']}\n"
+            f"window={snapshot['window_start']}:"
+            f"{snapshot['window_start'] + window_size}; "
+            f"valid to {snapshot['valid_end']}\n"
             f"latest RMSE={snapshot['last_slice_rmse']:.3g}\n"
             "z [cm]",
             fontsize=8,
@@ -1020,11 +1100,17 @@ def plot_progress_frame(
     residual_colorbar = fig.colorbar(residual_image, cax=residual_cax)
     residual_colorbar.set_label(f"Density residual ({plot_units})", fontsize=9)
 
+    outline_text = (
+        "\ncyan outline = window used for the displayed update"
+        if show_window_outline
+        else ""
+    )
     fig.suptitle(
         f"Sliding-window Density reconstruction: {run_name}\n"
         f"T={window_size}, fixed probes={100.0 * probe_actual_fraction:.2f}%, "
         f"B fully observed, {projection_label}; progress through slice "
-        f"{int(frame_ids[min(covered_end, len(frame_ids)) - 1])}",
+        f"{int(frame_ids[min(covered_end, len(frame_ids)) - 1])}"
+        f"{outline_text}",
         fontsize=12,
         y=0.985,
     )
@@ -1049,6 +1135,7 @@ def plot_bidirectional_refinement_figure(
     dpi: int,
     snapshots: Sequence[Dict | None] | None = None,
     progress_label: str | None = None,
+    show_window_outline: bool = True,
 ) -> None:
     """Plot final states after alternating bidirectional reconstruction sweeps."""
     n_rows = len(rows)
@@ -1077,6 +1164,14 @@ def plot_bidirectional_refinement_figure(
 
     for row_index, row in enumerate(rows):
         display = row if snapshots is None else snapshots[row_index]
+        if show_window_outline:
+            outline_snapshot = (
+                row["animation_snapshots"][-1]
+                if snapshots is None and row["animation_snapshots"]
+                else display
+            )
+        else:
+            outline_snapshot = None
         if display is None:
             prediction_projection = np.full_like(target_projection, np.nan)
             residual_projection = np.full_like(target_projection, np.nan)
@@ -1129,15 +1224,26 @@ def plot_bidirectional_refinement_figure(
             offsets = str(row["offsets"][0])
         else:
             offsets = "0/shift alternating"
-        if snapshots is None:
+        if snapshots is None and not show_window_outline:
             current_label = ""
+        elif snapshots is None:
+            if outline_snapshot is None:
+                current_label = ""
+            else:
+                current_label = (
+                    f"\nlast window={outline_snapshot['window_start']}:"
+                    f"{outline_snapshot['window_start'] + window_size}; "
+                    f"valid to {outline_snapshot['valid_end']}"
+                )
         elif display is None:
             current_label = "\ncurrent=pending"
         elif "window_start" in display:
             direction = "L→R" if display["direction"] == "forward" else "R→L"
             current_label = (
                 f"\ncurrent=p{display['pass_count']} {direction}, "
-                f"window={display['window_start']}:{display['valid_end']}, "
+                f"window={display['window_start']}:"
+                f"{display['window_start'] + window_size} "
+                f"(valid to {display['valid_end']}), "
                 f"calls={display['cumulative_window_calls']}"
             )
         else:
@@ -1153,6 +1259,14 @@ def plot_bidirectional_refinement_figure(
             fontsize=7.5,
         )
         for column in range(3):
+            if show_window_outline:
+                add_window_outline(
+                    axes[row_index, column],
+                    snapshot=outline_snapshot,
+                    frame_ids=frame_ids,
+                    zmin=zmin,
+                    zmax=zmax,
+                )
             axes[row_index, column].tick_params(labelsize=8)
 
     for column, title in enumerate(
@@ -1177,11 +1291,19 @@ def plot_bidirectional_refinement_figure(
     residual_colorbar.set_label(f"Density residual ({plot_units})", fontsize=9)
 
     progress_text = "" if progress_label is None else f"\n{progress_label}"
+    if show_window_outline:
+        outline_text = (
+            "\ncyan outline = last processed window"
+            if snapshots is None
+            else "\ncyan outline = current window; completed rows have no outline"
+        )
+    else:
+        outline_text = ""
     fig.suptitle(
         f"Bidirectional repeated Density reconstruction: {run_name}\n"
         f"T={window_size}, fixed probes={100.0 * probe_actual_fraction:.2f}%, "
         f"B fully observed, {projection_label}; raw predictions include probes"
-        f"{progress_text}",
+        f"{progress_text}{outline_text}",
         fontsize=12,
         y=0.985,
     )
@@ -1292,6 +1414,7 @@ def save_bidirectional_analysis(
         residual_limits=residual_limits,
         out_path=figure_path,
         dpi=dpi,
+        show_window_outline=False,
     )
 
     animation_events = bidirectional_animation_events(rows)
@@ -1318,6 +1441,30 @@ def save_bidirectional_analysis(
             progress_label=event["label"],
         )
         frame_paths.append(frame_path)
+
+    # Repeat the completed state once without an active-window outline. GIFs
+    # stop on this clean frame, and video viewers also get an unobstructed end.
+    final_event = animation_events[-1]
+    clean_frame_path = frame_dir / f"frame-{len(frame_paths):04d}-no-window.png"
+    plot_bidirectional_refinement_figure(
+        target_projection=target_projection,
+        rows=rows,
+        frame_ids=frame_ids,
+        extent=extent,
+        run_name=run_name,
+        window_size=window_size,
+        probe_actual_fraction=probe_actual_fraction,
+        projection_label=projection_label,
+        plot_units=plot_units,
+        density_limits=density_limits,
+        residual_limits=residual_limits,
+        out_path=clean_frame_path,
+        dpi=animation_dpi,
+        snapshots=final_event["snapshots"],
+        progress_label=final_event["label"],
+        show_window_outline=False,
+    )
+    frame_paths.append(clean_frame_path)
 
     formats = (
         ["quicktime", "gif"] if animation_format == "both" else [animation_format]
@@ -1363,9 +1510,10 @@ def save_bidirectional_analysis(
             "latest reconstruction fully visible; true probes overwrite input"
         ),
         "metric_policy": "raw model predictions, including probe locations",
-        "animation_frames": len(animation_events),
+        "animation_frames": len(frame_paths),
         "animation_policy": (
-            "all rows synchronized by cumulative model window calls"
+            "all rows synchronized by cumulative model window calls; final "
+            "state repeated once without window outlines"
         ),
         "rows": row_metrics,
     }
@@ -1475,8 +1623,32 @@ def save_slide_step_analysis(
         )
         frame_paths.append(frame_path)
 
+    final_covered_end = progress_points[-1]
+    clean_frame_path = frame_dir / (
+        f"{common_stem}_progress-{len(frame_paths):03d}_"
+        f"covered-through-{final_covered_end - 1:04d}_no-window.png"
+    )
+    plot_progress_frame(
+        target_projection=target_projection,
+        results=results,
+        covered_end=final_covered_end,
+        frame_ids=frame_ids,
+        extent=extent,
+        run_name=run_name,
+        window_size=window_size,
+        probe_actual_fraction=probe_actual_fraction,
+        projection_label=projection_label,
+        plot_units=plot_units,
+        density_limits=(density_vmin, density_vmax),
+        residual_limits=(residual_vmin, residual_vmax_value),
+        out_path=clean_frame_path,
+        dpi=dpi,
+        show_window_outline=False,
+    )
+    frame_paths.append(clean_frame_path)
+
     final_figure_path = images_dir / f"{common_stem}_final.png"
-    shutil.copy2(frame_paths[-1], final_figure_path)
+    shutil.copy2(clean_frame_path, final_figure_path)
     print(f"Saved final figure: {final_figure_path}")
 
     formats = (

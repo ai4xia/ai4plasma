@@ -253,7 +253,7 @@ srun -n 1 -c 32 -G 1 --gpu-bind=none \
   --out-dir runs/masked-unet3d_beta0p2_dt24_bc24_depth4_ddp16_sharedB_densityIndependentRandomGrid_v1/figures_information_suite
 ```
 
-`quicktime` 生成 Motion-JPEG 编码的 `.mov`，可直接用 macOS QuickTime 查看；视频格式不是 MP3。需要同时生成 `.mov` 和 GIF 时改为 `--animation-format both`。动画保存在 `--out-dir` 顶层，所有 PNG 统一放在 `--out-dir/images/<experiment>/`，便于直接找到视频。一条命令结束后再运行下一条，不要把两个完整的 `srun ... python ...` 无分隔地粘到同一行，否则第二个 `srun` 会被 argparse 当成第一个 Python 命令的参数。
+`quicktime` 生成 Motion-JPEG 编码的 `.mov`，可直接用 macOS QuickTime 查看；视频格式不是 MP3。需要同时生成 `.mov` 和 GIF 时改为 `--animation-format both`。生成的 GIF 不写无限循环扩展，因此默认播放一轮后停在最后一帧。动画保存在 `--out-dir` 顶层，所有 PNG 统一放在 `--out-dir/images/<experiment>/`，便于直接找到视频。一条命令结束后再运行下一条，不要把两个完整的 `srun ... python ...` 无分隔地粘到同一行，否则第二个 `srun` 会被 argparse 当成第一个 Python 命令的参数。
 
 ## 7. 整 run sliding Density reconstruction
 
@@ -268,6 +268,8 @@ beta0.2_nu2_Bz0_dt2_tau70, T=52
 ### 7.1 单向 slide-step 比较
 
 四行分别测试 step=24、12、6、3。第一个窗口仅有真实 Density probes；之后每个窗口的 overlap 部分使用最新 reconstruction 作为完整 conditioning，新进入部分使用已有 reconstruction（若已经存在），而真实 probe 值在送入下一次模型前覆盖对应 conditioning 位置。模型的 raw prediction 会覆盖整个有效窗口，遵循 “某 slice 最后一次 reconstruction 为最终结果”。末尾不足 24 帧时允许向未来 padding，超出真实 run 的部分 mask 为 0，输出后截掉，因此无需人为改变最后一步的 nominal slide step。
+
+逐步 PNG 和动画在 Target、Prediction、Residual 三列都用青色半透明轮廓标出该行当前 update 使用的有效 window；逻辑 window 超出 run 尾部的 padding 会裁掉，并在行标签中同时写出完整 window 范围与 `valid to`。动画在最后一次有框 update 后重复相同 reconstruction 状态，但隐藏所有 window 轮廓；最终单向静态图也使用这一无框版本。
 
 ### 7.2 Bidirectional repeated refinement
 
@@ -285,6 +287,8 @@ beta0.2_nu2_Bz0_dt2_tau70, T=52
 第一次完成全 run 后，后续 refinement sweep 把当前最新 Density reconstruction 在整个有效窗口内标记为 visible，并用真实 probe 覆盖 conditioning input。模型仍会重新输出并覆盖整个窗口，包括作为输入的 reconstruction 区域。图和 RMSE 保存的是 raw prediction，probe 位置也不替换成真值；真实 probes 只在下一次 conditioning 时施加观测约束。因此 probe RMSE 和 hidden-region RMSE 都是模型实际输出误差。
 
 六行视频按累计 window calls 同步；对当前 T=52 run 共 16 帧，前三行到达各自 4/8/12 calls 后冻结，第 4–6 行继续到相同 16-call 预算。这样第 4、5、6 行是在相同推理成本下比较 overlap、独立重复和 offset 信息传递。若显式选择此前的 T=150 run，对应预算仍为 48 calls。
+
+双向动画同样用青色轮廓标出每行当前正在更新的 window；已经提前完成并冻结的行不再显示活动轮廓。动画最后追加一张相同 reconstruction 状态的无框帧，最终静态图也不显示 window 轮廓。
 
 这是 offline reconstruction/smoothing，而不是 causal online forecasting：R→L sweep 使用未来侧 reconstruction，完整磁场也在整个 run 中已知。
 
