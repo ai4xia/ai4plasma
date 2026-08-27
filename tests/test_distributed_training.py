@@ -5,7 +5,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from train_masked_unet3d import DistributedEvalSampler  # noqa: E402
+from train_masked_unet3d import (  # noqa: E402
+    DistributedEvalSampler,
+    learning_rate_for_epoch,
+    sample_mixed_magnetic_visible_counts,
+    sample_mixed_density_probe_counts,
+)
 
 
 def test_distributed_eval_sampler_covers_each_sample_once():
@@ -20,3 +25,92 @@ def test_distributed_eval_sampler_covers_each_sample_once():
     assert sorted(combined) == list(range(len(dataset)))
     assert len(combined) == len(set(combined))
     assert max(map(len, shards)) - min(map(len, shards)) <= 1
+
+
+def test_warmup_cosine_schedule_hits_endpoints_and_is_monotonic():
+    learning_rates = [
+        learning_rate_for_epoch(
+            epoch=epoch,
+            total_epochs=200,
+            base_lr=2e-4,
+            warmup_epochs=10,
+            min_lr=2e-6,
+        )
+        for epoch in range(1, 201)
+    ]
+
+    assert abs(learning_rates[0] - 2e-5) < 1e-12
+    assert abs(learning_rates[9] - 2e-4) < 1e-12
+    assert abs(learning_rates[-1] - 2e-6) < 1e-12
+    assert all(a < b for a, b in zip(learning_rates[:9], learning_rates[1:10]))
+    assert all(a > b for a, b in zip(learning_rates[9:], learning_rates[10:]))
+
+
+def test_probe_patterns_use_balanced_sparse_dense_count_mixture():
+    patterns = [
+        "spatial_random",
+        "spatial_grid",
+        "spatial_block",
+        "temporal_random",
+    ] * 2000
+    spatial_sites = 4096
+    counts = sample_mixed_density_probe_counts(
+        patterns,
+        0,
+        30,
+        spatial_sites=spatial_sites,
+    )
+
+    for pattern, count in zip(patterns, counts):
+        if pattern in {"spatial_grid", "spatial_random"}:
+            assert 0 <= count <= spatial_sites
+        else:
+            assert count is None
+
+    for pattern in ("spatial_grid", "spatial_random"):
+        pattern_counts = [
+            count
+            for sampled_pattern, count in zip(patterns, counts)
+            if sampled_pattern == pattern
+        ]
+        sparse_share = sum(count <= 30 for count in pattern_counts) / len(
+            pattern_counts
+        )
+        assert 0.46 < sparse_share < 0.54
+        assert any(count > 30 for count in pattern_counts)
+
+
+def test_probe_patterns_use_half_full_half_random_magnetic_counts():
+    patterns = [
+        "spatial_random",
+        "spatial_grid",
+        "spatial_block",
+        "temporal_random",
+    ] * 2000
+    spatial_sites = 4096
+    counts = sample_mixed_magnetic_visible_counts(
+        patterns,
+        spatial_sites=spatial_sites,
+    )
+
+    for pattern, count in zip(patterns, counts):
+        if pattern in {"spatial_grid", "spatial_random"}:
+            assert 0 <= count <= spatial_sites
+        else:
+            assert count is None
+
+    for pattern in ("spatial_grid", "spatial_random"):
+        pattern_counts = [
+            count
+            for sampled_pattern, count in zip(patterns, counts)
+            if sampled_pattern == pattern
+        ]
+        full_share = sum(count == spatial_sites for count in pattern_counts) / len(
+            pattern_counts
+        )
+        mean_visible_fraction = sum(pattern_counts) / (
+            len(pattern_counts) * spatial_sites
+        )
+        assert 0.46 < full_share < 0.54
+        assert 0.72 < mean_visible_fraction < 0.78
+        assert any(count < spatial_sites for count in pattern_counts)

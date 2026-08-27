@@ -155,6 +155,70 @@ def test_spatial_grid_stride_can_be_pinned():
     assert abs(info["actual_mask_fraction"] - (1.0 - 1.0 / 16.0)) < 0.01
 
 
+def test_probe_count_grid_keeps_b_visible_and_uses_exact_count():
+    spatial_sites = SHAPE[-2] * SHAPE[-1]
+    for probe_count in (0, 1, 10, 30, 31, spatial_sites // 2, spatial_sites):
+        target_fraction = 0.25 * (1.0 - probe_count / spatial_sites)
+        mask, info = sample_mask(
+            SHAPE,
+            "spatial_grid",
+            target_fraction,
+            generator=make_generator(400 + probe_count),
+            density_probe_count=probe_count,
+        )
+
+        assert torch.all(mask[:, :3] == 1)
+        assert int(mask[0, 3, 0].sum()) == probe_count
+        assert torch.equal(mask[:, 3, 0], mask[:, 3, -1])
+        assert info["density_probe_count"] == probe_count
+        assert abs(info["actual_mask_fraction"] - target_fraction) < 1e-6
+
+
+def test_probe_count_spatial_random_keeps_b_visible_and_uses_exact_count():
+    spatial_sites = SHAPE[-2] * SHAPE[-1]
+    for probe_count in (0, 1, 10, 30, 31, spatial_sites // 2, spatial_sites):
+        target_fraction = 0.25 * (1.0 - probe_count / spatial_sites)
+        mask, info = sample_mask(
+            SHAPE,
+            "spatial_random",
+            target_fraction,
+            generator=make_generator(700 + probe_count),
+            density_probe_count=probe_count,
+        )
+
+        assert torch.all(mask[:, :3] == 1)
+        assert int(mask[0, 3, 0].sum()) == probe_count
+        assert torch.equal(mask[:, 3, 0], mask[:, 3, -1])
+        assert info["density_probe_count"] == probe_count
+        assert abs(info["actual_mask_fraction"] - target_fraction) < 1e-6
+
+
+def test_exact_magnetic_count_is_shared_by_all_b_channels():
+    spatial_sites = SHAPE[-2] * SHAPE[-1]
+    density_count = 17
+    for pattern in ("spatial_grid", "spatial_random"):
+        for magnetic_count in (0, 1, 30, spatial_sites // 2, spatial_sites):
+            target_fraction = 1.0 - (
+                (3 * magnetic_count + density_count) / (4.0 * spatial_sites)
+            )
+            mask, info = sample_mask(
+                SHAPE,
+                pattern,
+                target_fraction,
+                generator=make_generator(900 + magnetic_count),
+                density_probe_count=density_count,
+                magnetic_visible_count=magnetic_count,
+            )
+
+            assert int(mask[0, 0, 0].sum()) == magnetic_count
+            assert torch.equal(mask[:, 0], mask[:, 1])
+            assert torch.equal(mask[:, 1], mask[:, 2])
+            assert int(mask[0, 3, 0].sum()) == density_count
+            assert torch.equal(mask[:, :, 0], mask[:, :, -1])
+            assert info["magnetic_visible_count"] == magnetic_count
+            assert abs(info["actual_mask_fraction"] - target_fraction) < 1e-6
+
+
 def test_spatial_block_is_one_contiguous_rectangle():
     mask, info = sample_mask(SHAPE, "spatial_block", 0.5, generator=make_generator(5))
 

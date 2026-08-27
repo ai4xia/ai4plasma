@@ -21,15 +21,17 @@ MASK_PATTERNS: Tuple[str, ...] = (
 # Increment this whenever the training-time meaning of a mask changes. It is
 # stored in checkpoints so auto-resume cannot silently mix incompatible mask
 # distributions in one run.
-MASKING_VERSION = "shared_magnetic_density_independent_random_grid_v2"
+MASKING_VERSION = "mixedB_sharedLayout_mixedDensityProbeLayouts_v5"
 
 PATTERN_TO_ID: Dict[str, int] = {name: i for i, name in enumerate(MASK_PATTERNS)}
 
-# Bx, By and Bz always share one observation layout. Density is sampled
-# independently for spatial_random and spatial_grid, while spatial_block and
-# temporal_random use one mask shared by all four channels. Spatial patterns
-# keep their layouts for every frame of the temporal window; temporal patterns
-# choose whole visible frames.
+# Bx, By and Bz always share one observation layout. During training/validation,
+# the exact-count path samples their common magnetic layout independently of
+# Density for spatial_grid and spatial_random. Density is near-regular for
+# spatial_grid and uniformly random without replacement for spatial_random. The
+# legacy fraction/fixed-stride APIs remain available to visualization callers.
+# spatial_block and temporal_random share one mask across all four channels.
+# Spatial layouts remain fixed throughout a window.
 SPATIAL_MASK_PATTERNS: Tuple[str, ...] = (
     "spatial_random",
     "spatial_grid",
@@ -196,6 +198,91 @@ def _spatial_grid_plane(B, C, X, Z, p, generator, stride=None):
     return plane, info
 
 
+def _sparse_probe_grid_plane(B, C, X, Z, probe_count, generator):
+    """Create a randomized near-regular spatial layout with exactly N probes."""
+    probe_count = int(probe_count)
+    if not (0 <= probe_count <= X * Z):
+        raise ValueError(
+            f"probe_count must lie in [0, {X * Z}], got {probe_count}."
+        )
+
+    plane = torch.zeros(1, C, 1, X, Z)
+    if probe_count == 0:
+        return plane, {
+            "probe_count": 0,
+            "grid_count_x": 0,
+            "grid_count_z": 0,
+            "offset_x": 0,
+            "offset_z": 0,
+        }
+
+    domain_aspect = float(X) / float(Z)
+    candidates = []
+    for count_x in range(1, min(X, probe_count) + 1):
+        count_z = int(math.ceil(probe_count / count_x))
+        if count_z > Z:
+            continue
+        grid_sites = count_x * count_z
+        aspect_error = abs(math.log((count_x / count_z) / domain_aspect))
+        excess_fraction = float(grid_sites - probe_count) / float(probe_count)
+        candidates.append((aspect_error + 0.1 * excess_fraction, count_x, count_z))
+    if not candidates:
+        raise RuntimeError(
+            f"Could not place {probe_count} probes on a {X}x{Z} domain."
+        )
+    _score, count_x, count_z = min(candidates)
+
+    step_x = max(1, X // count_x)
+    step_z = max(1, Z // count_z)
+    offset_x = _randint(step_x, generator)
+    offset_z = _randint(step_z, generator)
+    x_indices = (
+        torch.floor(torch.arange(count_x, dtype=torch.float32) * X / count_x)
+        .long()
+        .add(offset_x)
+        .remainder(X)
+    )
+    z_indices = (
+        torch.floor(torch.arange(count_z, dtype=torch.float32) * Z / count_z)
+        .long()
+        .add(offset_z)
+        .remainder(Z)
+    )
+    grid_x = x_indices[:, None].expand(count_x, count_z).reshape(-1)
+    grid_z = z_indices[None, :].expand(count_x, count_z).reshape(-1)
+    selected = torch.randperm(grid_x.numel(), generator=generator)[:probe_count]
+    plane[..., grid_x[selected], grid_z[selected]] = 1.0
+    return plane, {
+        "probe_count": probe_count,
+        "grid_count_x": count_x,
+        "grid_count_z": count_z,
+        "offset_x": offset_x,
+        "offset_z": offset_z,
+    }
+
+
+def _random_probe_plane(B, C, X, Z, probe_count, generator):
+    """Create a uniformly random layout with exactly N distinct probes."""
+    probe_count = int(probe_count)
+    spatial_sites = X * Z
+    if not (0 <= probe_count <= spatial_sites):
+        raise ValueError(
+            f"probe_count must lie in [0, {spatial_sites}], got {probe_count}."
+        )
+
+    plane = torch.zeros(1, C, 1, X, Z)
+    if probe_count > 0:
+        indices = torch.randperm(spatial_sites, generator=generator)[:probe_count]
+        x_indices = torch.div(indices, Z, rounding_mode="floor")
+        z_indices = indices.remainder(Z)
+        plane[..., x_indices, z_indices] = 1.0
+
+    return plane, {
+        "probe_count": probe_count,
+        "visible_count": probe_count,
+    }
+
+
 def _spatial_block_plane(B, C, X, Z, p, generator):
     """
     Hide one randomly placed rectangle whose area is close to p * X * Z.
@@ -266,6 +353,8 @@ def sample_mask(
     dtype: torch.dtype = torch.float32,
     generator: Optional[torch.Generator] = None,
     grid_stride: Optional[int] = None,
+    density_probe_count: Optional[int] = None,
+    magnetic_visible_count: Optional[int] = None,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
     """
     Sample one mask for a (B, C, T, X, Z) block.
@@ -287,6 +376,17 @@ def sample_mask(
         Optional stride that pins the spatial_grid sampling lattice instead of
         deriving it from mask_fraction. The grid offset stays random. Intended
         for evaluation; training leaves this at None.
+
+    density_probe_count:
+        Optional exact Density probe count for spatial_grid or spatial_random.
+        Density uses a randomized near-regular grid for spatial_grid and
+        uniformly random distinct sites for spatial_random.
+
+    magnetic_visible_count:
+        Optional exact number of visible magnetic sites for spatial_grid or
+        spatial_random. Bx, By and Bz use one shared uniformly random layout.
+        If omitted while density_probe_count is set, all magnetic sites remain
+        visible for backward-compatible visualization calls.
 
     Returns
     -------
@@ -311,20 +411,57 @@ def sample_mask(
         )
     p = float(mask_fraction)
 
+    if magnetic_visible_count is not None and (
+        pattern not in {"spatial_grid", "spatial_random"}
+        or density_probe_count is None
+    ):
+        raise ValueError(
+            "magnetic_visible_count requires spatial_grid or spatial_random "
+            "together with density_probe_count."
+        )
+
     if pattern == "spatial_random":
-        magnetic_small, magnetic_info = _spatial_random_plane(
-            B, 1, X, Z, p, generator
-        )
-        density_small, density_info = _spatial_random_plane(
-            B, 1, X, Z, p, generator
-        )
+        if density_probe_count is None:
+            magnetic_small, magnetic_info = _spatial_random_plane(
+                B, 1, X, Z, p, generator
+            )
+            density_small, density_info = _spatial_random_plane(
+                B, 1, X, Z, p, generator
+            )
+        else:
+            if magnetic_visible_count is None:
+                magnetic_small = torch.ones(1, 1, 1, X, Z)
+                magnetic_info = {"visible_count": X * Z}
+            else:
+                magnetic_small, magnetic_info = _random_probe_plane(
+                    B, 1, X, Z, magnetic_visible_count, generator
+                )
+            density_small, density_info = _random_probe_plane(
+                B, 1, X, Z, density_probe_count, generator
+            )
     elif pattern == "spatial_grid":
-        magnetic_small, magnetic_info = _spatial_grid_plane(
-            B, 1, X, Z, p, generator, stride=grid_stride
-        )
-        density_small, density_info = _spatial_grid_plane(
-            B, 1, X, Z, p, generator, stride=grid_stride
-        )
+        if density_probe_count is None:
+            magnetic_small, magnetic_info = _spatial_grid_plane(
+                B, 1, X, Z, p, generator, stride=grid_stride
+            )
+            density_small, density_info = _spatial_grid_plane(
+                B, 1, X, Z, p, generator, stride=grid_stride
+            )
+        else:
+            if grid_stride is not None:
+                raise ValueError(
+                    "grid_stride and density_probe_count cannot be set together."
+                )
+            if magnetic_visible_count is None:
+                magnetic_small = torch.ones(1, 1, 1, X, Z)
+                magnetic_info = {"visible_count": X * Z}
+            else:
+                magnetic_small, magnetic_info = _random_probe_plane(
+                    B, 1, X, Z, magnetic_visible_count, generator
+                )
+            density_small, density_info = _sparse_probe_grid_plane(
+                B, 1, X, Z, density_probe_count, generator
+            )
     elif pattern == "spatial_block":
         magnetic_small, magnetic_info = _spatial_block_plane(
             B, 1, X, Z, p, generator
@@ -373,6 +510,8 @@ def sample_batch_masks(
     device: Optional[torch.device] = None,
     dtype: torch.dtype = torch.float32,
     generator: Optional[torch.Generator] = None,
+    density_probe_counts: Optional[Sequence[Optional[int]]] = None,
+    magnetic_visible_counts: Optional[Sequence[Optional[int]]] = None,
 ) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
     """
     Sample one independent mask per batch element, so a single batch can mix
@@ -384,6 +523,19 @@ def sample_batch_masks(
         raise ValueError(
             f"Expected {B} patterns and {B} mask fractions, "
             f"got {len(patterns)} and {len(mask_fractions)}."
+        )
+    if density_probe_counts is None:
+        density_probe_counts = [None] * B
+    if len(density_probe_counts) != B:
+        raise ValueError(
+            f"Expected {B} density probe counts, got {len(density_probe_counts)}."
+        )
+    if magnetic_visible_counts is None:
+        magnetic_visible_counts = [None] * B
+    if len(magnetic_visible_counts) != B:
+        raise ValueError(
+            f"Expected {B} magnetic visible counts, "
+            f"got {len(magnetic_visible_counts)}."
         )
 
     masks = []
@@ -397,6 +549,8 @@ def sample_batch_masks(
             device=device,
             dtype=dtype,
             generator=generator,
+            density_probe_count=density_probe_counts[i],
+            magnetic_visible_count=magnetic_visible_counts[i],
         )
         masks.append(mask)
         infos.append(info)

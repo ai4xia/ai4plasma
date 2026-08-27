@@ -5,10 +5,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import random
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -31,7 +32,7 @@ from data.masking import (
     sample_batch_masks,
     sample_patterns,
 )
-from models.unet3d import UNet3D
+from models.unet3d import MODEL_VERSION, UNet3D
 
 
 def distributed_is_initialized() -> bool:
@@ -101,6 +102,18 @@ def parse_args():
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument(
+        "--warmup-epochs",
+        type=int,
+        default=10,
+        help="Linear LR warmup length before cosine decay (default: 10 epochs).",
+    )
+    p.add_argument(
+        "--min-lr",
+        type=float,
+        default=2e-6,
+        help="Final learning rate reached by cosine decay (default: 2e-6).",
+    )
     p.add_argument("--weight-decay", type=float, default=1e-4)
 
     p.add_argument("--base-channels", type=int, default=24)
@@ -147,6 +160,26 @@ def parse_args():
         help=(
             "Seed for validation masks. Masks are keyed by (pattern, batch index), "
             "so every epoch sees the same validation masks."
+        ),
+    )
+    p.add_argument(
+        "--density-probe-min",
+        type=int,
+        default=0,
+        help=(
+            "Minimum of the sparse Density-probe interval used by "
+            "spatial_grid and spatial_random (default: 0)."
+        ),
+    )
+    p.add_argument(
+        "--density-probe-max",
+        type=int,
+        default=30,
+        help=(
+            "Maximum of the sparse Density-probe interval used by "
+            "spatial_grid and spatial_random (default: 30). Each sample has "
+            "50%% probability of using this interval and 50%% probability "
+            "of using [maximum + 1, X * Z]."
         ),
     )
 
@@ -218,6 +251,27 @@ def parse_args():
     else:
         args.mask_pattern_weights = parse_pattern_weights(args.mask_patterns)
     args.masking_version = MASKING_VERSION
+    args.model_version = MODEL_VERSION
+
+    if args.epochs <= 0:
+        p.error(f"--epochs must be positive, got {args.epochs}")
+    if not (0 <= args.warmup_epochs < args.epochs):
+        p.error(
+            "--warmup-epochs must lie in [0, epochs), got "
+            f"{args.warmup_epochs} for epochs={args.epochs}"
+        )
+    if args.lr <= 0:
+        p.error(f"--lr must be positive, got {args.lr}")
+    if not (0 <= args.min_lr <= args.lr):
+        p.error(
+            f"--min-lr must lie in [0, lr], got min_lr={args.min_lr}, "
+            f"lr={args.lr}"
+        )
+    if not (0 <= args.density_probe_min <= args.density_probe_max):
+        p.error(
+            "Expected 0 <= density-probe-min <= density-probe-max, got "
+            f"{args.density_probe_min} and {args.density_probe_max}"
+        )
 
     return args
 
@@ -231,6 +285,103 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def learning_rate_for_epoch(
+    epoch: int,
+    total_epochs: int,
+    base_lr: float,
+    warmup_epochs: int,
+    min_lr: float,
+) -> float:
+    """Return the deterministic linear-warmup + cosine-decay LR for one epoch."""
+    if not (1 <= epoch <= total_epochs):
+        raise ValueError(f"epoch must lie in [1, {total_epochs}], got {epoch}")
+    if not (0 <= warmup_epochs < total_epochs):
+        raise ValueError(
+            f"warmup_epochs must lie in [0, {total_epochs}), got {warmup_epochs}"
+        )
+    if not (0 <= min_lr <= base_lr):
+        raise ValueError(
+            f"Expected 0 <= min_lr <= base_lr, got {min_lr} and {base_lr}"
+        )
+
+    if warmup_epochs > 0 and epoch <= warmup_epochs:
+        return base_lr * float(epoch) / float(warmup_epochs)
+
+    decay_progress = float(epoch - warmup_epochs) / float(
+        total_epochs - warmup_epochs
+    )
+    cosine = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
+    return min_lr + (base_lr - min_lr) * cosine
+
+
+def sample_mixed_density_probe_counts(
+    patterns: Sequence[str],
+    minimum: int,
+    maximum: int,
+    spatial_sites: int,
+    generator: Optional[torch.Generator] = None,
+) -> List[Optional[int]]:
+    """Draw exact Density counts from a 50/50 sparse/dense mixture."""
+    if not (0 <= minimum <= maximum < spatial_sites):
+        raise ValueError(
+            "Expected 0 <= minimum <= maximum < spatial_sites, got "
+            f"{minimum}, {maximum}, and {spatial_sites}."
+        )
+
+    counts: List[Optional[int]] = []
+    for pattern in patterns:
+        if pattern in {"spatial_grid", "spatial_random"}:
+            use_sparse_interval = _torch_random_bool(generator)
+            low = minimum if use_sparse_interval else maximum + 1
+            high = maximum if use_sparse_interval else spatial_sites
+            count = int(
+                torch.randint(
+                    low,
+                    high + 1,
+                    (1,),
+                    generator=generator,
+                ).item()
+            )
+            counts.append(count)
+        else:
+            counts.append(None)
+    return counts
+
+
+def _torch_random_bool(generator: Optional[torch.Generator] = None) -> bool:
+    """Return a reproducible fair coin flip using the mask RNG."""
+    return bool(torch.randint(0, 2, (1,), generator=generator).item())
+
+
+def sample_mixed_magnetic_visible_counts(
+    patterns: Sequence[str],
+    spatial_sites: int,
+    generator: Optional[torch.Generator] = None,
+) -> List[Optional[int]]:
+    """Draw 50% fully visible B layouts and 50% uniform-count layouts."""
+    if spatial_sites <= 0:
+        raise ValueError(f"spatial_sites must be positive, got {spatial_sites}.")
+
+    counts: List[Optional[int]] = []
+    for pattern in patterns:
+        if pattern in {"spatial_grid", "spatial_random"}:
+            if _torch_random_bool(generator):
+                count = spatial_sites
+            else:
+                count = int(
+                    torch.randint(
+                        0,
+                        spatial_sites + 1,
+                        (1,),
+                        generator=generator,
+                    ).item()
+                )
+            counts.append(count)
+        else:
+            counts.append(None)
+    return counts
 
 
 def default_run_name(args) -> str:
@@ -280,17 +431,23 @@ def init_wandb(
 
 
 RESUME_PARAMETER_KEYS = (
+    "model_version",
     "masking_version",
     "h5_dir",
     "betas",
     "delta_t",
     "stride_t",
     "batch_size",
+    "epochs",
     "lr",
+    "warmup_epochs",
+    "min_lr",
     "weight_decay",
     "mask_pattern_weights",
     "val_patterns",
     "val_mask_seed",
+    "density_probe_min",
+    "density_probe_max",
     "base_channels",
     "channel_mults",
     "val_frac",
@@ -417,9 +574,13 @@ def train_one_epoch(
     mean: torch.Tensor,
     std: torch.Tensor,
     pattern_weights: Dict[str, float],
+    density_probe_min: int,
+    density_probe_max: int,
     amp: bool,
     grad_clip: float,
     postfix_every: int = 50,
+    epoch_number: Optional[int] = None,
+    epoch_progress: Optional[Any] = None,
 ) -> Dict[str, Any]:
     model.train()
 
@@ -436,12 +597,19 @@ def train_one_epoch(
     sum_target_fraction = 0.0
     count_samples = 0
     total_batches = 0
+    density_probe_sum = 0
+    density_probe_sample_count = 0
+    sparse_density_sample_count = 0
+    magnetic_visible_sum = 0
+    magnetic_sample_count = 0
+    fully_visible_magnetic_sample_count = 0
+    spatial_sites = 0
 
     scaler = torch.cuda.amp.GradScaler(enabled=(amp and device.type == "cuda"))
 
-    pbar = tqdm(loader, desc="Train", leave=False, disable=not is_main_process())
+    batches_per_epoch = max(len(loader), 1)
 
-    for step, batch in enumerate(pbar):
+    for step, batch in enumerate(loader):
         y = batch["block"].to(device, non_blocking=True)
         y = normalize(y, mean, std)
 
@@ -449,6 +617,50 @@ def train_one_epoch(
 
         patterns = sample_patterns(pattern_weights, batch_size)
         fractions = torch.rand(batch_size).tolist()
+        spatial_sites = int(y.shape[-2] * y.shape[-1])
+        density_probe_counts = sample_mixed_density_probe_counts(
+            patterns,
+            minimum=density_probe_min,
+            maximum=density_probe_max,
+            spatial_sites=spatial_sites,
+        )
+        magnetic_visible_counts = sample_mixed_magnetic_visible_counts(
+            patterns,
+            spatial_sites=spatial_sites,
+        )
+        probe_counts_in_batch = [
+            count for count in density_probe_counts if count is not None
+        ]
+        density_probe_sum += sum(probe_counts_in_batch)
+        density_probe_sample_count += len(probe_counts_in_batch)
+        sparse_density_sample_count += sum(
+            count <= density_probe_max for count in probe_counts_in_batch
+        )
+        magnetic_counts_in_batch = [
+            count for count in magnetic_visible_counts if count is not None
+        ]
+        magnetic_visible_sum += sum(magnetic_counts_in_batch)
+        magnetic_sample_count += len(magnetic_counts_in_batch)
+        fully_visible_magnetic_sample_count += sum(
+            count == spatial_sites for count in magnetic_counts_in_batch
+        )
+        for i, (probe_count, magnetic_count) in enumerate(
+            zip(density_probe_counts, magnetic_visible_counts)
+        ):
+            if probe_count is not None:
+                if magnetic_count is None:
+                    raise RuntimeError(
+                        "Probe-pattern sample is missing its magnetic visible count."
+                    )
+                if probe_count > spatial_sites:
+                    raise ValueError(
+                        f"Density probe count {probe_count} exceeds the "
+                        f"{spatial_sites} spatial sites."
+                    )
+                # Three B channels share magnetic_count visible sites; Density
+                # independently contains probe_count sites.
+                visible_values = 3 * magnetic_count + probe_count
+                fractions[i] = 1.0 - visible_values / (4.0 * spatial_sites)
 
         mask, _ = sample_batch_masks(
             y.shape,
@@ -456,6 +668,8 @@ def train_one_epoch(
             mask_fractions=fractions,
             device=device,
             dtype=y.dtype,
+            density_probe_counts=density_probe_counts,
+            magnetic_visible_counts=magnetic_visible_counts,
         )
 
         x_visible = make_visible_input(y, mask)
@@ -498,11 +712,20 @@ def train_one_epoch(
         count_samples += batch_size
         total_batches += 1
 
-        if step % postfix_every == 0:
-            pbar.set_postfix(
+        if epoch_progress is not None:
+            epoch_progress.update(1.0 / batches_per_epoch)
+
+        if epoch_progress is not None and step % postfix_every == 0:
+            epoch_progress.set_postfix(
+                phase="train",
                 mse=float(sum_mse) / total_batches,
                 mae=float(sum_mae) / total_batches,
             )
+
+    if epoch_progress is not None and epoch_number is not None:
+        # Eliminate floating-point accumulation drift at every epoch boundary.
+        epoch_progress.n = float(epoch_number)
+        epoch_progress.refresh()
 
     totals = torch.tensor(
         [
@@ -511,6 +734,12 @@ def train_one_epoch(
             float(total_batches),
             float(sum_target_fraction),
             float(count_samples),
+            float(density_probe_sum),
+            float(density_probe_sample_count),
+            float(sparse_density_sample_count),
+            float(magnetic_visible_sum),
+            float(magnetic_sample_count),
+            float(fully_visible_magnetic_sample_count),
         ],
         dtype=torch.float64,
         device=device,
@@ -521,9 +750,19 @@ def train_one_epoch(
         dist.all_reduce(sum_actual_by_pattern, op=dist.ReduceOp.SUM)
         dist.all_reduce(count_by_pattern, op=dist.ReduceOp.SUM)
 
-    global_mse, global_mae, global_batches, global_target, global_samples = (
-        totals.tolist()
-    )
+    (
+        global_mse,
+        global_mae,
+        global_batches,
+        global_target,
+        global_samples,
+        global_probe_sum,
+        global_probe_sample_count,
+        global_sparse_sample_count,
+        global_magnetic_visible_sum,
+        global_magnetic_sample_count,
+        global_fully_visible_magnetic_sample_count,
+    ) = totals.tolist()
     counts = count_by_pattern.cpu()
     mse_by_pattern = (sum_mse_by_pattern.cpu() / counts.clamp(min=1.0)).tolist()
     actual_by_pattern = (sum_actual_by_pattern.cpu() / counts.clamp(min=1.0)).tolist()
@@ -540,12 +779,24 @@ def train_one_epoch(
     }
 
     total_count = max(global_samples, 1)
+    probe_count = max(global_probe_sample_count, 1)
+    mean_density_probes = global_probe_sum / probe_count
+    magnetic_count = max(global_magnetic_sample_count, 1)
+    mean_magnetic_visible = global_magnetic_visible_sum / magnetic_count
 
     return {
         "mse": global_mse / max(global_batches, 1),
         "mae": global_mae / max(global_batches, 1),
         "target_mask_fraction": global_target / total_count,
         "actual_mask_fraction": float(sum_actual_by_pattern.sum().cpu()) / total_count,
+        "density_probe_count": mean_density_probes,
+        "density_visible_fraction": mean_density_probes / max(spatial_sites, 1),
+        "sparse_density_sample_share": global_sparse_sample_count / probe_count,
+        "magnetic_visible_count": mean_magnetic_visible,
+        "magnetic_visible_fraction": mean_magnetic_visible / max(spatial_sites, 1),
+        "fully_visible_magnetic_sample_share": (
+            global_fully_visible_magnetic_sample_count / magnetic_count
+        ),
         "per_pattern": per_pattern,
     }
 
@@ -570,7 +821,10 @@ def validate(
     std: torch.Tensor,
     patterns: List[str],
     mask_seed: int,
+    density_probe_min: int,
+    density_probe_max: int,
     amp: bool,
+    epoch_progress: Optional[Any] = None,
 ) -> Dict[str, Dict[str, float]]:
     """
     Evaluate every mask pattern on the same validation blocks.
@@ -583,9 +837,10 @@ def validate(
     sums = torch.zeros(len(patterns), 2, device=device)
     counts = torch.zeros(len(patterns), device=device)
 
-    pbar = tqdm(loader, desc="Val", leave=False, disable=not is_main_process())
+    if epoch_progress is not None:
+        epoch_progress.set_postfix(phase="val")
 
-    for batch_index, batch in enumerate(pbar):
+    for batch_index, batch in enumerate(loader):
         y = batch["block"].to(device, non_blocking=True)
         y = normalize(y, mean, std)
 
@@ -596,6 +851,37 @@ def validate(
             generator.manual_seed(val_mask_seed(mask_seed, pattern, batch_index))
 
             fractions = torch.rand(batch_size, generator=generator).tolist()
+            spatial_sites = int(y.shape[-2] * y.shape[-1])
+            density_probe_counts = sample_mixed_density_probe_counts(
+                [pattern] * batch_size,
+                minimum=density_probe_min,
+                maximum=density_probe_max,
+                spatial_sites=spatial_sites,
+                generator=generator,
+            )
+            magnetic_visible_counts = sample_mixed_magnetic_visible_counts(
+                [pattern] * batch_size,
+                spatial_sites=spatial_sites,
+                generator=generator,
+            )
+            for sample_index, (probe_count, magnetic_count) in enumerate(
+                zip(density_probe_counts, magnetic_visible_counts)
+            ):
+                if probe_count is not None:
+                    if magnetic_count is None:
+                        raise RuntimeError(
+                            "Probe-pattern validation sample is missing its "
+                            "magnetic visible count."
+                        )
+                    if probe_count > spatial_sites:
+                        raise ValueError(
+                            f"Density probe count {probe_count} exceeds the "
+                            f"{spatial_sites} spatial sites."
+                        )
+                    visible_values = 3 * magnetic_count + probe_count
+                    fractions[sample_index] = 1.0 - (
+                        visible_values / (4.0 * spatial_sites)
+                    )
 
             mask, _ = sample_batch_masks(
                 y.shape,
@@ -604,6 +890,8 @@ def validate(
                 device=device,
                 dtype=y.dtype,
                 generator=generator,
+                density_probe_counts=density_probe_counts,
+                magnetic_visible_counts=magnetic_visible_counts,
             )
 
             model_input = torch.cat([make_visible_input(y, mask), mask], dim=1)
@@ -680,6 +968,20 @@ def main():
     rank_print("HDF5 dir:", h5_dir)
     rank_print("Output dir:", out_dir)
     rank_print("Betas:", args.betas)
+    rank_print("Model version:", args.model_version)
+    rank_print(
+        "spatial_grid/spatial_random: B uses a 50/50 mixture of fully visible "
+        "and an exact count uniformly drawn from [0, X*Z]; Density uses "
+        f"a 50/50 mixture of [{args.density_probe_min}, "
+        f"{args.density_probe_max}] and "
+        f"[{args.density_probe_max + 1}, X*Z]"
+    )
+    rank_print(
+        "Learning-rate schedule: "
+        f"linear warmup {args.warmup_epochs} epochs, "
+        f"base_lr={args.lr:g}, cosine min_lr={args.min_lr:g}, "
+        f"total_epochs={args.epochs}"
+    )
     rank_print("Mask pattern weights:", args.mask_pattern_weights)
     rank_print("Validation mask patterns:", args.val_patterns)
     rank_print(
@@ -820,6 +1122,7 @@ def main():
         out_channels=4,
         base_channels=args.base_channels,
         channel_mults=args.channel_mults,
+        architecture=args.model_version,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -896,10 +1199,40 @@ def main():
             history = json.load(f)
         history = [row for row in history if row.get("epoch", 0) < start_epoch]
 
+    epoch_progress = None
+    if is_main_process():
+        epoch_progress = tqdm(
+            total=float(args.epochs),
+            initial=float(start_epoch - 1),
+            desc="Training",
+            unit="epoch",
+            dynamic_ncols=True,
+            bar_format=(
+                "{desc}: {percentage:3.0f}%|{bar}| "
+                "{n:.2f}/{total:.0f} epochs [{elapsed}<{remaining}{postfix}]"
+            ),
+        )
+
+    def epoch_log(message: str) -> None:
+        if epoch_progress is not None:
+            epoch_progress.write(message)
+        else:
+            rank_print(message)
+
     for epoch in range(start_epoch, args.epochs + 1):
+        epoch_lr = learning_rate_for_epoch(
+            epoch=epoch,
+            total_epochs=args.epochs,
+            base_lr=args.lr,
+            warmup_epochs=args.warmup_epochs,
+            min_lr=args.min_lr,
+        )
+        for parameter_group in optimizer.param_groups:
+            parameter_group["lr"] = epoch_lr
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        rank_print(f"\nEpoch {epoch}/{args.epochs}")
+        if epoch_progress is not None:
+            epoch_progress.set_postfix(phase="train", lr=f"{epoch_lr:.8g}")
 
         train_metrics = train_one_epoch(
             model=model,
@@ -909,8 +1242,12 @@ def main():
             mean=mean,
             std=std,
             pattern_weights=args.mask_pattern_weights,
+            density_probe_min=args.density_probe_min,
+            density_probe_max=args.density_probe_max,
             amp=args.amp,
             grad_clip=args.grad_clip,
+            epoch_number=epoch,
+            epoch_progress=epoch_progress,
         )
 
         val_metrics = validate(
@@ -921,17 +1258,39 @@ def main():
             std=std,
             patterns=args.val_patterns,
             mask_seed=args.val_mask_seed,
+            density_probe_min=args.density_probe_min,
+            density_probe_max=args.density_probe_max,
             amp=args.amp,
+            epoch_progress=epoch_progress,
         )
 
         row = {
             "epoch": epoch,
+            "learning_rate": epoch_lr,
             "train_mse": train_metrics["mse"],
             "train_mae": train_metrics["mae"],
             "val_mse": val_metrics["mean"]["mse"],
             "val_mae": val_metrics["mean"]["mae"],
             "train_mask_target_fraction": train_metrics["target_mask_fraction"],
             "train_mask_actual_fraction": train_metrics["actual_mask_fraction"],
+            "train_density_probe_count": train_metrics[
+                "density_probe_count"
+            ],
+            "train_density_visible_fraction": train_metrics[
+                "density_visible_fraction"
+            ],
+            "train_sparse_density_sample_share": train_metrics[
+                "sparse_density_sample_share"
+            ],
+            "train_magnetic_visible_count": train_metrics[
+                "magnetic_visible_count"
+            ],
+            "train_magnetic_visible_fraction": train_metrics[
+                "magnetic_visible_fraction"
+            ],
+            "train_fully_visible_magnetic_sample_share": train_metrics[
+                "fully_visible_magnetic_sample_share"
+            ],
             "train_per_pattern": train_metrics["per_pattern"],
             "val_per_pattern": {
                 pattern: val_metrics[pattern] for pattern in args.val_patterns
@@ -951,7 +1310,25 @@ def main():
                 "val/mean/mae": row["val_mae"],
                 "mask/target_fraction": row["train_mask_target_fraction"],
                 "mask/actual_fraction": row["train_mask_actual_fraction"],
-                "optimization/learning_rate": optimizer.param_groups[0]["lr"],
+                "mask/density_probe_patterns/probe_count": row[
+                    "train_density_probe_count"
+                ],
+                "mask/density_probe_patterns/visible_fraction": row[
+                    "train_density_visible_fraction"
+                ],
+                "mask/density_probe_patterns/sparse_sample_share": row[
+                    "train_sparse_density_sample_share"
+                ],
+                "mask/magnetic_probe_patterns/visible_count": row[
+                    "train_magnetic_visible_count"
+                ],
+                "mask/magnetic_probe_patterns/visible_fraction": row[
+                    "train_magnetic_visible_fraction"
+                ],
+                "mask/magnetic_probe_patterns/fully_visible_sample_share": row[
+                    "train_fully_visible_magnetic_sample_share"
+                ],
+                "optimization/learning_rate": row["learning_rate"],
             }
 
             for pattern, pattern_metrics in train_metrics["per_pattern"].items():
@@ -967,13 +1344,21 @@ def main():
 
             wandb_run.log(log_data)
 
-        rank_print(
+        epoch_log(
+            f"Epoch {epoch}/{args.epochs}  lr={epoch_lr:.8g}  "
             f"train_mse={row['train_mse']:.6f} "
             f"train_mae={row['train_mae']:.6f} "
             f"val_mse={row['val_mse']:.6f} "
-            f"val_mae={row['val_mae']:.6f}"
+            f"val_mae={row['val_mae']:.6f} "
+            f"density_probes="
+            f"{row['train_density_probe_count']:.2f} "
+            f"sparse_probe_share="
+            f"{row['train_sparse_density_sample_share']:.3f} "
+            f"B_visible={row['train_magnetic_visible_fraction']:.3f} "
+            f"B_full_share="
+            f"{row['train_fully_visible_magnetic_sample_share']:.3f}"
         )
-        rank_print(
+        epoch_log(
             "  val by pattern: "
             + "  ".join(
                 f"{pattern}={val_metrics[pattern]['mse']:.6f}"
@@ -998,7 +1383,7 @@ def main():
                     stats=stats,
                     wandb_run_id=wandb_run.id if wandb_run is not None else None,
                 )
-                rank_print(f"Saved best checkpoint: val_mse={best_val_mse:.6f}")
+                epoch_log(f"Saved best checkpoint: val_mse={best_val_mse:.6f}")
 
         if is_main_process():
             save_checkpoint(
@@ -1013,6 +1398,9 @@ def main():
             )
         if distributed_is_initialized():
             dist.barrier()
+
+    if epoch_progress is not None:
+        epoch_progress.close()
 
     if wandb_run is not None:
         wandb_run.summary["best_val_mse"] = best_val_mse

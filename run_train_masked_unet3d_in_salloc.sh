@@ -65,7 +65,7 @@ if not torch.cuda.is_available():
 PY
 
 H5_DIR=/pscratch/sd/b/binxia/VPIC_PPPL_HDF5_by_beta_official2500_none_compat
-RUN_NAME=masked-unet3d_beta0p2_dt24_bc24_depth4_ddp16_sharedB_densityIndependentRandomGrid_v1
+RUN_NAME=masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine1000_v7
 
 BETAS=(0.2)
 DELTA_T=24
@@ -74,8 +74,12 @@ STRIDE_T=2
 # Per-GPU batch size. With 16 GPUs this gives global batch size 64.
 BATCH_SIZE=4
 NUM_WORKERS=4
-EPOCHS=80
+EPOCHS=1000
 LR=2e-4
+WARMUP_EPOCHS=10
+MIN_LR=2e-6
+DENSITY_PROBE_MIN=0
+DENSITY_PROBE_MAX=30
 BASE_CHANNELS=24
 CHANNEL_MULTS=(1 2 4 8)
 
@@ -99,6 +103,10 @@ TRAIN_ARGS=(
     --num-workers "${NUM_WORKERS}"
     --epochs "${EPOCHS}"
     --lr "${LR}"
+    --warmup-epochs "${WARMUP_EPOCHS}"
+    --min-lr "${MIN_LR}"
+    --density-probe-min "${DENSITY_PROBE_MIN}"
+    --density-probe-max "${DENSITY_PROBE_MAX}"
     --base-channels "${BASE_CHANNELS}"
     --channel-mults "${CHANNEL_MULTS[@]}"
     --amp

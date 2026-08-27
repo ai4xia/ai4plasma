@@ -13,7 +13,8 @@ VPIC CSV
   -> 从每个 run 提取长度 24、stride 2 的时间窗口
   -> 四通道归一化
   -> 随机生成可见性 mask
-  -> [masked fields, masks] 共 8 通道输入 3D U-Net
+  -> [masked fields, masks] 共 8 通道输入 residual 3D U-Net
+  -> visible normalized fields + learned residual
   -> 重建 [Bx, By, Bz, Density] 共 4 通道
 ```
 
@@ -100,17 +101,25 @@ train/validation 是按完整 `run_name` 划分，而不是随机拆分窗口。
 | base channels | 24 |
 | channel multipliers | 1, 2, 4, 8 |
 | encoder channels | 24, 48, 96, 192 |
-| 参数量 | 5,281,732（约 5.282 M） |
+| 参数量 | 5,340,052（约 5.340 M） |
 | 卷积 | 3×3×3 Conv3d |
-| 归一化 | GroupNorm，最多 8 groups |
+| activation normalization | 无；保留中间特征的绝对均值与尺度 |
 | 激活 | SiLU |
 | 下采样 | 2×2×2 MaxPool3d |
 | 上采样 | trilinear interpolation |
-| 输出层 | 1×1×1 Conv3d，24 → 4 |
+| 输出层 | 零初始化的 1×1×1 Conv3d，预测四通道 residual |
 
-每个 resolution level 使用两个 `Conv3d + GroupNorm + SiLU`。四层模型自带三条 encoder-to-decoder skip connections：decoder 上采样后与对应 encoder feature concatenate，再经过卷积块。因此增加第四层时已经增加了相应的 skip connection，不需要在模型外另外手写。
+每个 resolution level 使用无 activation normalization 的 residual convolution block：两个 `Conv3d` 构成修正分支，输入通过 identity 或 1×1×1 projection 与修正相加。只在修正分支内部使用 `SiLU`，相加之后不再激活，使 skip path 保持严格线性并传递绝对 feature level。这样不会像 GroupNorm 一样移除中间特征的组内均值和尺度。四层模型自带三条 encoder-to-decoder skip connections：decoder 上采样后与对应 encoder feature concatenate，再经过 residual block。
 
-代码仍兼容旧的三层 `(1,2,4)` checkpoint，包括此前 `base=16, T=8` 的模型，但当前新模型是 `base=24, T=24, depth=4`。
+模型最终预测的是修正量：
+
+```text
+prediction = visible_normalized_fields + UNet_residual([visible_fields, masks])
+```
+
+这里没有按 mask 把观测真值硬写回输出；residual 可以修改所有位置。输出 head 使用零初始化，因此训练起点在 visible 区域为 identity、hidden 区域为 normalized zero（对应各物理通道训练均值），随后完全通过统一重建 loss 学习修正。
+
+代码仍兼容旧 GroupNorm/direct-output checkpoint，包括三层 `(1,2,4)` 模型；没有 `model_version` 的旧 checkpoint 会自动走 legacy inference。新训练默认使用 `residual_unet3d_no_activation_norm_v2`，checkpoint 和 auto-resume 参数会记录并检查该版本，防止混用不兼容权重。
 
 ## 4. 训练逻辑
 
@@ -129,18 +138,18 @@ train/validation 是按完整 `run_name` 划分，而不是随机拆分窗口。
 
 ### 4.2 四种 mask pattern
 
-每个 training sample 独立选择一种 pattern，并从 `[0,1)` 均匀采样 hidden fraction。当前四种 pattern 权重均为 1，即期望采样比例各约 25%。空间 mask 在窗口内所有 24 帧保持不变；`temporal_random` 则选择整帧可见或不可见。
+每个 training sample 独立选择一种 pattern。当前四种 pattern 权重均为 1，即期望采样比例各约 25%。`spatial_block` 和 `temporal_random` 从 `[0,1)` 均匀采样 hidden fraction；两个 probe pattern 使用下面的 probe-count 混合分布。空间 mask 在窗口内所有 24 帧保持不变；`temporal_random` 则选择整帧可见或不可见。
 
 | Pattern | 空间/时间含义 | 三个磁场 mask | Density 与磁场的关系 |
 |---|---|---|---|
-| `spatial_random` | 随机空间观测点，所有时间共用 | `Bx/By/Bz` 完全一致 | Density 独立随机采样 |
-| `spatial_grid` | 规则稀疏网格，所有时间共用 | `Bx/By/Bz` 完全一致 | Density 使用独立网格 offset；训练时由同一目标比例得到相同 stride |
+| `spatial_random` | 完全随机的 Density probe array，所有时间共用 | 50% 完全可见；50% 从 0–`X*Z` 抽取准确可见数，三通道共用随机位置 | 准确数量的 distinct probes，无放回均匀随机位置 |
+| `spatial_grid` | 近规则 Density probe array，所有时间共用 | 50% 完全可见；50% 从 0–`X*Z` 抽取准确可见数，三通道共用随机位置 | 准确 probe 数量，并随机化 grid phase/layout |
 | `spatial_block` | 隐藏一个随机矩形区域 | `Bx/By/Bz` 完全一致 | 四个通道完全共用 mask |
 | `temporal_random` | 随机选择完整可见时间帧 | `Bx/By/Bz` 完全一致 | 四个通道完全共用 mask |
 
-因此当前规则是：任何情况下三个磁场通道都共享 mask；对 `spatial_random/spatial_grid`，Density 独立采样；对 `spatial_block/temporal_random`，磁场和 Density 共用 mask。
+因此当前规则是：任何情况下三个磁场通道都共享 mask；训练/验证中的 `spatial_random` 和 `spatial_grid` 独立采样磁场与 Density 的可见点数和位置，Density probe 的位置分布分别采用完全随机和近规则布局；`spatial_block/temporal_random` 则由四通道共用 mask。
 
-训练的 grid stride 会随随机 hidden fraction 变化。可视化的 custom/multifunction grid 则允许更符合实验设定的固定密度：默认磁场 stride=2，Density stride=4。
+两个 probe pattern 的 Density 都先以 50% 概率选择稀疏区间 0–30、以 50% 概率选择稠密区间 31–`X*Z`，再在所选闭区间内离散均匀抽取准确 probe 数量。磁场独立地以 50% 概率完全可见，以 50% 概率从 0–`X*Z` 均匀抽取准确可见点数；后一分支使用 `randperm(X*Z)` 无放回选址，三个磁场通道共用位置。这样两个 probe pattern 的平均磁场可见率约为 75%，且完整磁场与各种稀疏度都会出现。`spatial_grid` 的 Density 近规则阵列具有随机 phase，不能整齐分解成矩形 grid 时会从稍大的近各向同性 lattice 随机去掉多余位置；`spatial_random` 的 Density 同样使用无放回随机位置。可视化的 custom/multifunction grid 仍可使用显式固定 stride，不受训练专用 exact-count 路径影响。
 
 ### 4.3 损失、优化和验证
 
@@ -155,10 +164,12 @@ loss = mean((prediction - target)^2)
 当前优化配置：
 
 - AdamW，learning rate `2e-4`，weight decay `1e-4`；
-- 没有 learning-rate scheduler；
+- 前 10 epochs 线性 warmup：epoch 1 从 `2e-5` 开始，epoch 10 到达 `2e-4`；
+- epoch 11–1000 使用 cosine decay，最终降到 `2e-6`；
+- `spatial_grid` 和 `spatial_random` 的磁场以 50/50 概率选择完全可见或从 0–`X*Z` 均匀抽取准确可见数；Density 分别以 50/50 概率从 0–30 和 31–`X*Z` 抽取准确 probe 数量；
 - gradient norm clipping 为 1.0；
 - AMP mixed precision；
-- 80 epochs；
+- 1000 epochs；
 - 4 nodes × 4 GPUs/node = 16 GPUs；
 - batch size 4/GPU，global batch size 64；
 - PyTorch DDP/NCCL。
@@ -191,7 +202,7 @@ sbatch train_masked_unet3d_4n16g.sbatch
 如果已经位于满足 4 nodes、每节点 4 GPUs 的 allocation 中，运行同一脚本会直接启动 `srun + torchrun`。脚本默认使用当前正式 run 名：
 
 ```text
-masked-unet3d_beta0p2_dt24_bc24_depth4_ddp16_sharedB_densityIndependentRandomGrid_v1
+masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine1000_v7
 ```
 
 额外 CLI 参数会追加给训练脚本；由于 `--auto-resume` 默认开启，同一输出目录存在兼容的 `latest.pt` 时会续训。若确实要训练全新模型，应使用新的 `--out-dir`/`--wandb-name`，不要覆盖现有结果。
@@ -202,11 +213,11 @@ masked-unet3d_beta0p2_dt24_bc24_depth4_ddp16_sharedB_densityIndependentRandomGri
 
 ### 6.1 Multifunction：只 mask Density
 
-四行依次为 `spatial_random`、`spatial_grid`、`spatial_block`、`temporal_random`。磁场始终 100% visible，只有 Density 按各 pattern 遮挡，用于展示同一模型对多种观测几何的兼容性。
+四行依次为 `spatial_random`、`spatial_grid`、`spatial_block`、`temporal_random`。磁场始终 100% visible，只有 Density 按各 pattern 遮挡，用于展示同一模型对多种观测几何的兼容性。其中 visualization-only 的 `spatial_block` 固定遮挡高 x 半区，以完整覆盖 plasmoid 出现范围。
 
 ### 6.2 Density super-resolution：probe 数量扫描
 
-磁场始终 100% visible；Density 使用规则 probe grid。四行目标 visible fraction 默认为 8%、4%、2%、1%，用于研究 Density probe 数量与重建误差的关系。实现会选择接近目标比例的近各向同性整数 grid，并在图中写出实际比例和 stride。
+磁场始终 100% visible；Density 使用规则 probe grid。四行 probe 数量默认为 30、20、10、0，用于重点研究极稀疏 Density probe 数量与重建误差的关系。实现会生成包含准确 probe 数量的近各向同性 grid。
 
 ### 6.3 Magnetic ablation：磁场信息量扫描
 
@@ -222,8 +233,8 @@ Density 固定为约 8% visible 的 super-resolution grid；磁场 visible fract
 
 磁场不再分别画三张 `Bx/By/Bz` 图。每个 experiment 生成左右拼接的两张 table：
 
-- 左侧磁场/Jy table：Target `Jy + Ay contours`、Observed `|B| + in-plane B`、Prediction `Jy + Ay contours`、Jy residual；
-- 右侧 Density table：Target、Visible input、Prediction、Density residual，并叠加 `Ay` contours 和平面磁场箭头。
+- 左侧磁场/Jy table：Target `Jy + Ay contours`、Masked target `Jy`、Prediction `Jy + Ay contours`、normalized Jy residual；
+- 右侧 Density table：Target、Visible input、Prediction、normalized Density residual，并叠加 `Ay` contours 和平面磁场箭头。
 
 物理量定义为：
 
@@ -234,16 +245,26 @@ Jy =  dBx/dz - dBz/dx
 |B| = sqrt(Bx^2 + By^2 + Bz^2)
 ```
 
-`Ay` 使用与 `visualization.ipynb` 一致的 path integration 并去掉任意加法常数。图位于 `x-z` 平面，所以箭头只能表示面内分量 `(Bz,Bx)`；`By` 垂直图面，不能作为二维箭头，但已包含在背景磁场强度 `|B|` 中。`Ay/Jy` 只从完整 Target 和 Prediction 计算，不对带缺失值的 Visible input 求导或积分。
+`Ay` 使用与 `visualization.ipynb` 一致的 path integration 并去掉任意加法常数。图位于 `x-z` 平面，所以 Density table 中的箭头只能表示面内分量 `(Bz,Bx)`；`By` 垂直图面，不能作为二维箭头。`Ay/Jy` 只从完整 Target 和 Prediction 计算，不对带缺失值的 Visible input 求导或积分；左侧第二列是在完整 Target `Jy` 计算完成后再应用三路磁场的共同 mask。
 
-所有 observed panel 使用统一规则：黑色代表 invisible；彩色代表该位置实际输入模型的 target 数值。三个磁场通道 mask 相同，因此 observed `|B|` 的可见区域语义明确。
+所有 masked/visible panel 中黑色代表 invisible。Density table 的彩色位置是实际输入模型的 target 数值；左侧第二列则是为展示磁场观测范围而应用共同 B mask 的 Target `Jy`。
+
+第四列和 sliding/bidirectional residual panel 使用无量纲的 stabilized pointwise normalized residual：
+
+```text
+r = (prediction - target) / (abs(target) + epsilon * RMS(target))
+NRMSE = sqrt(mean(r**2))
+NMAE = mean(abs(r))
+```
+
+默认 `epsilon=0.05`，可通过 `--relative-error-eps` 调整。`RMS(target)` 在当前比较所覆盖的完整 target 范围上计算，因此真实值接近零时分母仍有与场尺度相称的下限。`--residual-vmax` 和 residual colorbar 相应变为无量纲。sliding JSON 同时保留原始物理单位 RMSE/MAE 与新增 NRMSE/NMAE。
 
 ### 6.6 运行全部四套单窗口实验
 
 ```bash
 srun -n 1 -c 32 -G 1 --gpu-bind=none \
   python visualize_mask_patterns_unet3d.py \
-  --run-dir runs/masked-unet3d_beta0p2_dt24_bc24_depth4_ddp16_sharedB_densityIndependentRandomGrid_v1 \
+  --run-dir runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine1000_v7 \
   --run-name beta0.2_nu2_Bz0_dt2_tau70 \
   --t0 28 \
   --experiment all \
@@ -312,7 +333,9 @@ srun -n 1 -c 32 -G 1 --gpu-bind=none \
 
 脚本保存 final PNG、逐步 PNG、QuickTime/GIF/MP4、metrics JSON 和 reconstruction NPZ。动画、JSON 和 NPZ 位于 `--out-dir` 顶层；final/逐步 PNG 位于 `--out-dir/images/`，动画帧再按 analysis stem 分子目录。默认输出目录为该 checkpoint run 下的 `figures_sliding_density_reconstruction/`。
 
-## 8. 当前结果
+## 8. Legacy GroupNorm/direct-output checkpoint 结果
+
+以下结果来自架构调整前的 `masked-unet3d_beta0p2_dt24_bc24_depth4_ddp16_sharedB_densityIndependentRandomGrid_v1`，用于和新 residual/no-normalization run 对照；新模型尚需重新训练后更新本节。
 
 ### 8.1 训练结果
 
