@@ -165,11 +165,11 @@ loss = mean((prediction - target)^2)
 
 - AdamW，learning rate `2e-4`，weight decay `1e-4`；
 - 前 10 epochs 线性 warmup：epoch 1 从 `2e-5` 开始，epoch 10 到达 `2e-4`；
-- epoch 11–1000 使用 cosine decay，最终降到 `2e-6`；
+- epoch 11–3000 使用 cosine decay，最终降到 `2e-6`；
 - `spatial_grid` 和 `spatial_random` 的磁场以 50/50 概率选择完全可见或从 0–`X*Z` 均匀抽取准确可见数；Density 分别以 50/50 概率从 0–30 和 31–`X*Z` 抽取准确 probe 数量；
 - gradient norm clipping 为 1.0；
 - AMP mixed precision；
-- 1000 epochs；
+- 3000 epochs；
 - 4 nodes × 4 GPUs/node = 16 GPUs；
 - batch size 4/GPU，global batch size 64；
 - PyTorch DDP/NCCL。
@@ -202,7 +202,7 @@ sbatch train_masked_unet3d_4n16g.sbatch
 如果已经位于满足 4 nodes、每节点 4 GPUs 的 allocation 中，运行同一脚本会直接启动 `srun + torchrun`。脚本默认使用当前正式 run 名：
 
 ```text
-masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine1000_v7
+masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine3000_v8
 ```
 
 额外 CLI 参数会追加给训练脚本；由于 `--auto-resume` 默认开启，同一输出目录存在兼容的 `latest.pt` 时会续训。若确实要训练全新模型，应使用新的 `--out-dir`/`--wandb-name`，不要覆盖现有结果。
@@ -264,7 +264,7 @@ NMAE = mean(abs(r))
 ```bash
 srun -n 1 -c 32 -G 1 --gpu-bind=none \
   python visualize_mask_patterns_unet3d.py \
-  --run-dir runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine1000_v7 \
+  --run-dir runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine3000_v8 \
   --run-name beta0.2_nu2_Bz0_dt2_tau70 \
   --t0 28 \
   --experiment all \
