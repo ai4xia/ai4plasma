@@ -605,11 +605,36 @@ def masked_mae_loss(
 def full_mse_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
+    visible_mask: torch.Tensor,
 ) -> torch.Tensor:
     """
-    MSE over all voxels, including visible and hidden regions.
+    MSE balanced across B/Density groups and visible/hidden regions.
     """
-    return torch.mean((pred - target) ** 2)
+    squared_error = (pred - target) ** 2
+    group_losses = []
+
+    for channel_slice in (slice(0, 3), slice(3, 4)):
+        group_error = squared_error[:, channel_slice]
+        group_visible_mask = visible_mask[:, channel_slice]
+        group_hidden_mask = 1.0 - group_visible_mask
+
+        visible_count = group_visible_mask.sum()
+        hidden_count = group_hidden_mask.sum()
+        component_counts = torch.stack([visible_count, hidden_count])
+        component_losses = torch.stack(
+            [
+                (group_error * group_visible_mask).sum()
+                / visible_count.clamp_min(1.0),
+                (group_error * group_hidden_mask).sum()
+                / hidden_count.clamp_min(1.0),
+            ]
+        )
+        valid_components = (component_counts > 0).to(component_losses.dtype)
+        group_losses.append(
+            (component_losses * valid_components).sum() / valid_components.sum()
+        )
+
+    return torch.stack(group_losses).mean()
 
 
 def full_mae_loss(

@@ -680,7 +680,7 @@ def train_one_epoch(
 
         with torch.cuda.amp.autocast(enabled=(amp and device.type == "cuda")):
             pred = model(model_input)
-            loss_mse = full_mse_loss(pred, y)
+            loss_mse = full_mse_loss(pred, y, mask)
             loss_mae = full_mae_loss(pred, y)
             loss = loss_mse
 
@@ -898,7 +898,7 @@ def validate(
 
             with torch.cuda.amp.autocast(enabled=(amp and device.type == "cuda")):
                 pred = model(model_input)
-                loss_mse = full_mse_loss(pred, y)
+                loss_mse = full_mse_loss(pred, y, mask)
                 loss_mae = full_mae_loss(pred, y)
 
             sums[i, 0] += loss_mse.detach().float() * batch_size
