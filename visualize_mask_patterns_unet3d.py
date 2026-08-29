@@ -28,6 +28,57 @@ DEFAULT_RUN_NAME = "beta0.2_nu2_Bz0_dt2_tau70"
 DEFAULT_T0 = 28
 
 
+def save_information_suite_error_plot(
+    target_field: np.ndarray,
+    target_jy: np.ndarray,
+    rows: List[Dict],
+    frame_ids: np.ndarray,
+    out_path: Path,
+    title: str,
+    relative_error_eps: float,
+) -> Dict:
+    """Plot framewise normalized errors with one line per GIF row."""
+    density_eps = relative_error_epsilon(
+        [target_field[3, t] for t in range(target_field.shape[1])],
+        relative_error_eps,
+    )
+    jy_eps = relative_error_epsilon(
+        [target_jy[t] for t in range(target_jy.shape[0])], relative_error_eps
+    )
+    fig, axes = plt.subplots(2, 1, figsize=(10.5, 7.0), sharex=True)
+    payload = []
+    for row_index, row in enumerate(rows, start=1):
+        density_residual = normalized_residual(
+            row["pred_plot"][3], target_field[3], density_eps
+        )
+        jy_residual = normalized_residual(row["pred_jy"], target_jy, jy_eps)
+        density_nrmse = np.sqrt(np.mean(np.square(density_residual), axis=(1, 2)))
+        jy_nrmse = np.sqrt(np.mean(np.square(jy_residual), axis=(1, 2)))
+        label = f"row {row_index}: {row['label']}"
+        axes[0].plot(frame_ids, density_nrmse, linewidth=1.8, label=label)
+        axes[1].plot(frame_ids, jy_nrmse, linewidth=1.8, label=label)
+        payload.append(
+            {
+                "row": row_index,
+                "label": row["label"],
+                "density_nrmse": density_nrmse.tolist(),
+                "jy_nrmse": jy_nrmse.tolist(),
+            }
+        )
+    axes[0].set_ylabel("Density frame NRMSE")
+    axes[1].set_ylabel("Jy frame NRMSE")
+    axes[1].set_xlabel("Global frame")
+    for ax in axes:
+        ax.grid(alpha=0.25)
+        ax.legend(fontsize=8, ncol=2)
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+    print(f"Saved framewise error plot: {out_path}")
+    return {"frame_ids": frame_ids.tolist(), "rows": payload}
+
+
 def parse_args():
     p = argparse.ArgumentParser()
 
@@ -1926,6 +1977,21 @@ def main():
             limit_times = None
 
         experiment_stem = f"{sample_stem}_experiment-{experiment_name}"
+        frame_ids = np.arange(
+            int(metadata["t0"]), int(metadata["t0"]) + delta_t
+        )
+        error_payload = save_information_suite_error_plot(
+            target_field=y_plot_np,
+            target_jy=target_jy,
+            rows=rows_for_plot,
+            frame_ids=frame_ids,
+            out_path=out_dir / f"{experiment_stem}_error_vs_frame.png",
+            title=f"{experiment_name}: error by frame",
+            relative_error_eps=args.relative_error_eps,
+        )
+        error_path = out_dir / f"{experiment_stem}_error_vs_frame.json"
+        error_path.write_text(json.dumps(error_payload, indent=2))
+        print(f"Saved framewise error data: {error_path}")
         combined_frame_paths = []
         for local_time in local_times:
             frame_stem = (

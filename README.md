@@ -1,6 +1,6 @@
 # AI4Plasma：VPIC 四场时空重建
 
-本文档记录仓库截至 2026-08-24 的实际实现、当前训练结果和下一步实验计划。当前模型使用稀疏或缺失的磁场与密度观测，同时重建完整的 `Bx`、`By`、`Bz` 和 `Density` 时空块；它既可用于单个 24 帧窗口，也可通过递归 sliding window 重建一个更长的 VPIC run。
+本文档记录仓库截至 2026-08-28 的实际实现、当前训练结果和下一步实验计划。当前模型使用稀疏或缺失的磁场与密度观测，同时重建完整的 `Bx`、`By`、`Bz` 和 `Density` 时空块；它既可用于单个 24 帧窗口，也可通过递归 sliding window 重建一个更长的 VPIC run。
 
 ## 1. 当前功能概览
 
@@ -332,6 +332,56 @@ srun -n 1 -c 32 -G 1 --gpu-bind=none \
 ```
 
 脚本保存 final PNG、逐步 PNG、QuickTime/GIF/MP4、metrics JSON 和 reconstruction NPZ。动画、JSON 和 NPZ 位于 `--out-dir` 顶层；final/逐步 PNG 位于 `--out-dir/images/`，动画帧再按 analysis stem 分子目录。默认输出目录为该 checkpoint run 下的 `figures_sliding_density_reconstruction/`。
+
+### 7.4 当前 v8 checkpoint 的训练结果
+
+当前正式实验为 `masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine3000_v8`。训练完整运行 3000 epochs，最佳 checkpoint 位于 epoch 2883：
+
+| 指标（normalized units） | 最佳 / epoch 2883 | 最终 / epoch 3000 |
+|---|---:|---:|
+| Train MSE | 0.013293 | 0.012717 |
+| Mean validation MSE | **0.007270** | 0.007280 |
+| Mean validation MAE | 0.034229 | **0.034223** |
+
+最佳 epoch 的分 pattern validation MSE 为：`spatial_grid=0.001277`、`spatial_random=0.001771`、`temporal_random=0.009169`、`spatial_block=0.016862`。连续空间缺口和整帧时间缺失仍是主要瓶颈。相对 cosine-1000 v7，v8 最佳 validation MSE 改善约 18.3%；相对 cosine-400 v6 改善约 39.5%。完整逐 epoch 记录、配置、归一化统计和 run-level split 已作为精简审阅材料保存在当前 v8 run 目录中。
+
+### 7.5 逐帧误差诊断
+
+每个 GIF 现在另存一张 `*_error_vs_frame.png`：GIF 中每一行对应图中的一条曲线。information-suite 同时报告 Density/Jy frame NRMSE；sliding reconstruction 报告物理单位 frame RMSE/MAE。逐帧数值写入相邻 JSON 或 metrics JSON，便于复算而不需要从图片读数。
+
+#### 单窗口 information-suite
+
+![Multifunction framewise error](runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine3000_v8/figures_information_suite_plasmoid_merger/named_beta0.2_nu2_Bz0_dt2_tau70_t0-28_physical_experiment-multifunction_error_vs_frame.png)
+
+![Density super-resolution framewise error](runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine3000_v8/figures_information_suite_plasmoid_merger/named_beta0.2_nu2_Bz0_dt2_tau70_t0-28_physical_experiment-density_superres_error_vs_frame.png)
+
+![Magnetic ablation framewise error](runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine3000_v8/figures_information_suite_plasmoid_merger/named_beta0.2_nu2_Bz0_dt2_tau70_t0-28_physical_experiment-magnetic_ablation_error_vs_frame.png)
+
+![Conditional Density forecast framewise error](runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine3000_v8/figures_information_suite_plasmoid_merger/named_beta0.2_nu2_Bz0_dt2_tau70_t0-28_physical_experiment-density_forecast_error_vs_frame.png)
+
+这些曲线目前支持以下判断：
+
+- global frames 49–51 在所有任务中同时变难，说明末端误差峰值不只是 recursive sliding 的累计误差，也与 plasmoid merger 后期动力学或窗口边界上下文不足有关；
+- B 完整可见时，30/20/10/0 个 Density probes 的 Density NRMSE 几乎重合，提示网络主要依靠 B 重建 Density，可能没有充分利用稀疏 Density probes；
+- B 可见率由 100% 降到 40% 时 Density NRMSE 只小幅变化，但 Jy NRMSE 约增至三倍，说明逐点场值重建尚不能可靠保证空间导数/current-sheet 结构；
+- conditional Density forecast 的误差随 horizon 从 1、6、12 到 18 steps 单调增大，模型仍明显受有限时间上下文约束。
+
+#### 完整 run sliding reconstruction
+
+![Slide-step framewise error](runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine3000_v8/figures_sliding_density_reconstruction_plasmoid_merger/beta0.2_nu2_Bz0_dt2_tau70_T24_steps-8-4-2-1_density-visible-0.08_physical_error_vs_frame.png)
+
+![Bidirectional framewise error](runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine3000_v8/figures_sliding_density_reconstruction_plasmoid_merger/beta0.2_nu2_Bz0_dt2_tau70_T24_bidirectional-step8-passes4_step24-offset12_density-visible-0.0801_physical_error_vs_frame.png)
+
+<details>
+<summary>展开查看 bidirectional reconstruction GIF（约 12 MB）</summary>
+
+![Bidirectional reconstruction animation](runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine3000_v8/figures_sliding_density_reconstruction_plasmoid_merger/beta0.2_nu2_Bz0_dt2_tau70_T24_bidirectional-step8-passes4_step24-offset12_density-visible-0.0801_physical.gif)
+
+</details>
+
+在约 8.01% Density probes、完整 B 的 T=52 held-out run 上，step=8 overlap refinement 的 1/2/3/4 passes full-run RMSE 分别为 0.03298、0.03132、**0.03111**、0.03170。第 2 遍带来主要收益，第 3 遍达到最低 RMSE，第 4 遍平均误差略退化但尾端更好。相同调用预算下，step=24 independent/shifted controls 的 RMSE 为 0.04502/0.04824，并在最后几帧出现超过 0.1 的逐帧峰值，因此跨窗口 overlap 比单纯重复调用或 offset shift 更重要。
+
+仓库只跟踪上述诊断图、对应 JSON/metrics 和一个约 12 MB 的 bidirectional GIF。约 66–69 MB 的四个 information-suite GIF、约 22 MB 的单向 sliding GIF、逐帧 table PNG、checkpoint、NPZ reconstruction 和原始数据仍由 `.gitignore` 排除，以避免 Git 历史快速膨胀。需要完整动画时应本地重新运行脚本，或将大文件发布到 GitHub Release/外部 artifact storage，而不是直接纳入普通 Git history。
 
 ## 8. Legacy GroupNorm/direct-output checkpoint 结果
 

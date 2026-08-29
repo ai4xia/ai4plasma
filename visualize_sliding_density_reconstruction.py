@@ -33,6 +33,47 @@ from visualize_mask_patterns_unet3d import (
 DEFAULT_RUN_NAME = "beta0.2_nu2_Bz0_dt2_tau70"
 
 
+def framewise_rmse_mae(prediction: np.ndarray, target: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Return spatial RMSE and MAE for every time frame."""
+    reduce_axes = tuple(range(1, target.ndim))
+    error = np.asarray(prediction) - np.asarray(target)
+    return (
+        np.sqrt(np.mean(np.square(error), axis=reduce_axes)),
+        np.mean(np.abs(error), axis=reduce_axes),
+    )
+
+
+def save_framewise_error_plot(
+    predictions: Sequence[np.ndarray],
+    labels: Sequence[str],
+    target: np.ndarray,
+    frame_ids: np.ndarray,
+    out_path: Path,
+    title: str,
+    plot_units: str,
+) -> List[Dict]:
+    """Plot one error curve per GIF row and return JSON-ready values."""
+    fig, axes = plt.subplots(2, 1, figsize=(10.5, 7.0), sharex=True)
+    payload = []
+    for prediction, label in zip(predictions, labels):
+        rmse, mae = framewise_rmse_mae(prediction, target)
+        axes[0].plot(frame_ids, rmse, linewidth=1.8, label=label)
+        axes[1].plot(frame_ids, mae, linewidth=1.8, label=label)
+        payload.append({"label": label, "rmse": rmse.tolist(), "mae": mae.tolist()})
+    axes[0].set_ylabel(f"Frame RMSE ({plot_units})")
+    axes[1].set_ylabel(f"Frame MAE ({plot_units})")
+    axes[1].set_xlabel("Global frame")
+    for ax in axes:
+        ax.grid(alpha=0.25)
+        ax.legend(fontsize=8, ncol=2)
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+    print(f"Saved framewise error plot: {out_path}")
+    return payload
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -1587,6 +1628,18 @@ def save_bidirectional_analysis(
                 **row["metrics"],
             }
         )
+    framewise_errors = save_framewise_error_plot(
+        predictions=[row["final_reconstruction"] for row in rows],
+        labels=[
+            f"row {index}: step={row['slide_step']}, passes={row['pass_count']}"
+            for index, row in enumerate(rows, start=1)
+        ],
+        target=target_density_plot,
+        frame_ids=frame_ids,
+        out_path=out_dir / f"{common_stem}_error_vs_frame.png",
+        title="Bidirectional reconstruction error by frame",
+        plot_units=plot_units,
+    )
     metrics_payload = {
         "checkpoint": str(checkpoint_path),
         "checkpoint_epoch": checkpoint_epoch,
@@ -1616,6 +1669,7 @@ def save_bidirectional_analysis(
             "state repeated once without window outlines"
         ),
         "rows": row_metrics,
+        "framewise_errors": framewise_errors,
     }
     metrics_path = out_dir / f"{common_stem}_metrics.json"
     metrics_path.write_text(json.dumps(metrics_payload, indent=2))
@@ -1814,6 +1868,18 @@ def save_slide_step_analysis(
             for result in results
         },
     }
+    metrics_payload["framewise_errors"] = save_framewise_error_plot(
+        predictions=[result["final_reconstruction"] for result in results],
+        labels=[
+            f"row {index}: step={result['slide_step']}"
+            for index, result in enumerate(results, start=1)
+        ],
+        target=target_density_plot,
+        frame_ids=frame_ids,
+        out_path=out_dir / f"{common_stem}_error_vs_frame.png",
+        title="Sliding-window reconstruction error by frame",
+        plot_units=plot_units,
+    )
     metrics_path = out_dir / f"{common_stem}_metrics.json"
     metrics_path.write_text(json.dumps(metrics_payload, indent=2))
     print(f"Saved metrics: {metrics_path}")
