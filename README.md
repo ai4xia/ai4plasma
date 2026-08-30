@@ -193,16 +193,16 @@ ml load pytorch
 sbatch train_masked_unet3d_4n16g.sbatch
 ```
 
-由脚本自动申请交互 allocation 并训练：
+如果已经位于满足 4 nodes、每节点 4 GPUs 的 allocation 中，直接执行同一文件：
 
 ```bash
-./run_train_masked_unet3d_in_salloc.sh
+./train_masked_unet3d_4n16g.sbatch
 ```
 
-如果已经位于满足 4 nodes、每节点 4 GPUs 的 allocation 中，运行同一脚本会直接启动 `srun + torchrun`。脚本默认使用当前正式 run 名：
+两种入口最终都会由该文件启动 `srun + torchrun`。脚本默认使用当前 continuation run 名：
 
 ```text
-masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine3000_v8
+masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine1500_v9_balancedloss
 ```
 
 额外 CLI 参数会追加给训练脚本；由于 `--auto-resume` 默认开启，同一输出目录存在兼容的 `latest.pt` 时会续训。若确实要训练全新模型，应使用新的 `--out-dir`/`--wandb-name`，不要覆盖现有结果。
@@ -471,8 +471,7 @@ W&B run：<https://wandb.ai/xiabin-georgia-institute-of-technology/ai4plasma/run
 | `data/masking.py` | 四种训练 mask、通道共享规则和损失 helper |
 | `models/unet3d.py` | 三层/四层 3D U-Net |
 | `train_masked_unet3d.py` | DDP 训练、run-level split、validation、checkpoint、W&B |
-| `run_train_masked_unet3d_in_salloc.sh` | 4-node/16-GPU salloc/torchrun launcher |
-| `train_masked_unet3d_4n16g.sbatch` | 4-node/16-GPU sbatch wrapper |
+| `train_masked_unet3d_4n16g.sbatch` | 同时支持现有 salloc 和 sbatch 的 4-node/16-GPU launcher |
 | `visualization.ipynb` | 原始物理可视化及 Ay integration 参考 |
 | `visualize_mask_patterns_unet3d.py` | 四套单窗口 information/forecast experiments |
 | `visualize_sliding_density_reconstruction.py` | 长 run sliding、bidirectional 与 equal-call 分析 |

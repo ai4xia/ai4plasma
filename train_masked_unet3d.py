@@ -241,6 +241,16 @@ def parse_args():
         help="Start a new model even when out-dir/latest.pt exists.",
     )
     p.set_defaults(auto_resume=True)
+    p.add_argument(
+        "--init-checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Initialize model, optimizer, and channel statistics from a checkpoint, "
+            "while starting a new epoch/LR schedule. Ignored when auto-resuming from "
+            "out-dir/latest.pt."
+        ),
+    )
 
     args = p.parse_args()
 
@@ -1072,6 +1082,7 @@ def main():
     rank_print("Device:", device)
 
     resume_checkpoint = None
+    init_checkpoint = None
     latest_path = out_dir / "latest.pt"
     if args.auto_resume and latest_path.exists():
         resume_checkpoint = torch.load(latest_path, map_location=device)
@@ -1080,9 +1091,21 @@ def main():
             f"Auto-resuming from {latest_path} "
             f"(completed epoch {resume_checkpoint['epoch']})"
         )
+    elif args.init_checkpoint is not None:
+        init_path = expand_path(args.init_checkpoint)
+        if not init_path.exists():
+            raise FileNotFoundError(f"Initialization checkpoint not found: {init_path}")
+        init_checkpoint = torch.load(init_path, map_location=device)
+        rank_print(
+            f"Initializing from {init_path} "
+            f"(source epoch {init_checkpoint['epoch']}); starting a new schedule"
+        )
 
-    if resume_checkpoint is not None and "stats" in resume_checkpoint:
-        stats = resume_checkpoint["stats"]
+    state_checkpoint = (
+        resume_checkpoint if resume_checkpoint is not None else init_checkpoint
+    )
+    if state_checkpoint is not None and "stats" in state_checkpoint:
+        stats = state_checkpoint["stats"]
         rank_print("Reusing channel statistics from checkpoint")
     else:
         stats = None
@@ -1141,6 +1164,9 @@ def main():
         optimizer.load_state_dict(resume_checkpoint["optimizer"])
         start_epoch = int(resume_checkpoint["epoch"]) + 1
         best_val_mse = float(resume_checkpoint.get("best_val_mse", float("inf")))
+    elif init_checkpoint is not None:
+        model.load_state_dict(init_checkpoint["model"])
+        optimizer.load_state_dict(init_checkpoint["optimizer"])
 
     if distributed_is_initialized():
         model = DistributedDataParallel(
