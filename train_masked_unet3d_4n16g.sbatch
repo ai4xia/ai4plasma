@@ -62,9 +62,9 @@ if not torch.cuda.is_available():
 PY
 
 H5_DIR=/pscratch/sd/b/binxia/VPIC_PPPL_HDF5_by_beta_official2500_none_compat
-SOURCE_RUN_NAME=masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine3000_v8
+SOURCE_RUN_NAME=masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine1500_v9_balancedloss
 INIT_CHECKPOINT=runs/${SOURCE_RUN_NAME}/latest.pt
-RUN_NAME=masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine1500_v9_balancedloss
+RUN_NAME=masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine1500_v10_temporalboundary
 
 BETAS=(0.2)
 DELTA_T=24

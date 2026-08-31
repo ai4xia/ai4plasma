@@ -112,6 +112,44 @@ def test_temporal_random_masks_whole_frames():
     assert torch.equal(mask[:, 0], mask[:, 3])
 
 
+def test_temporal_random_mixes_scattered_and_bidirectional_boundary_masks():
+    shape = (1, 4, 16, 3, 2)
+    mode_counts = {"random_frames": 0, "contiguous_boundary": 0}
+    direction_counts = {"visible_prefix": 0, "visible_suffix": 0}
+
+    for seed in range(400):
+        mask, info = sample_mask(
+            shape,
+            "temporal_random",
+            0.375,
+            generator=make_generator(seed),
+        )
+        mode_counts[info["temporal_mode"]] += 1
+
+        if info["temporal_mode"] != "contiguous_boundary":
+            continue
+
+        direction = info["temporal_direction"]
+        direction_counts[direction] += 1
+        frames = mask[0, 0, :, 0, 0]
+        transition_index = info["transition_index"]
+
+        if direction == "visible_prefix":
+            assert torch.all(frames[:transition_index] == 1)
+            assert torch.all(frames[transition_index:] == 0)
+        elif direction == "visible_suffix":
+            assert torch.all(frames[:transition_index] == 0)
+            assert torch.all(frames[transition_index:] == 1)
+        else:
+            raise AssertionError(f"Unexpected temporal direction: {direction}")
+
+    assert 0.4 < mode_counts["random_frames"] / 400 < 0.6
+    assert 0.4 < mode_counts["contiguous_boundary"] / 400 < 0.6
+    boundary_count = mode_counts["contiguous_boundary"]
+    assert 0.4 < direction_counts["visible_prefix"] / boundary_count < 0.6
+    assert 0.4 < direction_counts["visible_suffix"] / boundary_count < 0.6
+
+
 def test_spatial_grid_is_a_regular_lattice():
     X, Z = SHAPE[3], SHAPE[4]
 

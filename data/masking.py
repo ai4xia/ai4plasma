@@ -21,7 +21,7 @@ MASK_PATTERNS: Tuple[str, ...] = (
 # Increment this whenever the training-time meaning of a mask changes. It is
 # stored in checkpoints so auto-resume cannot silently mix incompatible mask
 # distributions in one run.
-MASKING_VERSION = "mixedB_sharedLayout_mixedDensityProbeLayouts_v5"
+MASKING_VERSION = "mixedB_sharedLayout_mixedTemporalBoundary_v6"
 
 PATTERN_TO_ID: Dict[str, int] = {name: i for i, name in enumerate(MASK_PATTERNS)}
 
@@ -334,10 +334,53 @@ def _temporal_random_frames(T, p, generator):
     tmask[0, 0, visible, 0, 0] = 1.0
 
     info = {
+        "temporal_mode": "random_frames",
+        "temporal_direction": "scattered",
         "num_visible_frames": int(n_visible),
         "visible_frames": [int(t) for t in visible.tolist()],
     }
     return tmask, info
+
+
+def _temporal_boundary_frames(T, p, generator):
+    """
+    Split the window at one temporal boundary.
+
+    The requested number of visible frames forms either a prefix (forward
+    prediction from the past) or a suffix (backward prediction from the
+    future), with equal probability.
+    """
+    n_visible = _round_clamp((1.0 - p) * T, 0, T)
+    visible_prefix = _rand(generator) < 0.5
+
+    tmask = torch.zeros(1, 1, T, 1, 1)
+    if visible_prefix:
+        tmask[:, :, :n_visible] = 1.0
+        visible = torch.arange(n_visible)
+        direction = "visible_prefix"
+        transition_index = n_visible
+    else:
+        first_visible = T - n_visible
+        tmask[:, :, first_visible:] = 1.0
+        visible = torch.arange(first_visible, T)
+        direction = "visible_suffix"
+        transition_index = first_visible
+
+    info = {
+        "temporal_mode": "contiguous_boundary",
+        "temporal_direction": direction,
+        "transition_index": int(transition_index),
+        "num_visible_frames": int(n_visible),
+        "visible_frames": [int(t) for t in visible.tolist()],
+    }
+    return tmask, info
+
+
+def _temporal_mixed_frames(T, p, generator):
+    """Mix scattered-frame and contiguous-boundary masks 50/50."""
+    if _rand(generator) < 0.5:
+        return _temporal_random_frames(T, p, generator)
+    return _temporal_boundary_frames(T, p, generator)
 
 
 # ---------------------------------------------------------------------------
@@ -469,7 +512,7 @@ def sample_mask(
         density_small = magnetic_small
         density_info = dict(magnetic_info)
     elif pattern == "temporal_random":
-        magnetic_small, magnetic_info = _temporal_random_frames(T, p, generator)
+        magnetic_small, magnetic_info = _temporal_mixed_frames(T, p, generator)
         density_small = magnetic_small
         density_info = dict(magnetic_info)
     else:

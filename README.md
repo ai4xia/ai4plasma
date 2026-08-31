@@ -138,14 +138,14 @@ prediction = visible_normalized_fields + UNet_residual([visible_fields, masks])
 
 ### 4.2 四种 mask pattern
 
-每个 training sample 独立选择一种 pattern。当前四种 pattern 权重均为 1，即期望采样比例各约 25%。`spatial_block` 和 `temporal_random` 从 `[0,1)` 均匀采样 hidden fraction；两个 probe pattern 使用下面的 probe-count 混合分布。空间 mask 在窗口内所有 24 帧保持不变；`temporal_random` 则选择整帧可见或不可见。
+每个 training sample 独立选择一种 pattern。当前四种 pattern 权重均为 1，即期望采样比例各约 25%。`spatial_block` 和 `temporal_random` 从 `[0,1)` 均匀采样 hidden fraction；两个 probe pattern 使用下面的 probe-count 混合分布。空间 mask 在窗口内所有 24 帧保持不变；`temporal_random` 则选择整帧可见或不可见。`temporal_random` 内部以 50% 概率沿用任意散布的可见帧，以 50% 概率生成单一时间边界；后一种情况再等概率选择可见 prefix（`VVVMMM`，正向外推）或可见 suffix（`MMMVVV`，时间反推）。
 
 | Pattern | 空间/时间含义 | 三个磁场 mask | Density 与磁场的关系 |
 |---|---|---|---|
 | `spatial_random` | 完全随机的 Density probe array，所有时间共用 | 50% 完全可见；50% 从 0–`X*Z` 抽取准确可见数，三通道共用随机位置 | 准确数量的 distinct probes，无放回均匀随机位置 |
 | `spatial_grid` | 近规则 Density probe array，所有时间共用 | 50% 完全可见；50% 从 0–`X*Z` 抽取准确可见数，三通道共用随机位置 | 准确 probe 数量，并随机化 grid phase/layout |
 | `spatial_block` | 隐藏一个随机矩形区域 | `Bx/By/Bz` 完全一致 | 四个通道完全共用 mask |
-| `temporal_random` | 随机选择完整可见时间帧 | `Bx/By/Bz` 完全一致 | 四个通道完全共用 mask |
+| `temporal_random` | 50% 随机选择完整可见帧；50% 使用单一时间边界 | `Bx/By/Bz` 完全一致 | 四个通道完全共用 mask；边界 mask 等概率为 `VVVMMM` 或 `MMMVVV` |
 
 因此当前规则是：任何情况下三个磁场通道都共享 mask；训练/验证中的 `spatial_random` 和 `spatial_grid` 独立采样磁场与 Density 的可见点数和位置，Density probe 的位置分布分别采用完全随机和近规则布局；`spatial_block/temporal_random` 则由四通道共用 mask。
 
@@ -202,10 +202,10 @@ sbatch train_masked_unet3d_4n16g.sbatch
 两种入口最终都会由该文件启动 `srun + torchrun`。脚本默认使用当前 continuation run 名：
 
 ```text
-masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine1500_v9_balancedloss
+masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine1500_v10_temporalboundary
 ```
 
-额外 CLI 参数会追加给训练脚本；由于 `--auto-resume` 默认开启，同一输出目录存在兼容的 `latest.pt` 时会续训。若确实要训练全新模型，应使用新的 `--out-dir`/`--wandb-name`，不要覆盖现有结果。
+该 v10 run 从 v9 balanced-loss 的 `latest.pt` 初始化，在新 schedule 中训练包含双向 temporal boundary 的 masking v6。额外 CLI 参数会追加给训练脚本；由于 `--auto-resume` 默认开启，同一输出目录存在兼容的 `latest.pt` 时会续训。若确实要训练全新模型，应使用新的 `--out-dir`/`--wandb-name`，不要覆盖现有结果。
 
 ## 6. 单窗口 visualization 测试案例
 
