@@ -29,29 +29,23 @@ DEFAULT_T0 = 28
 
 
 def save_information_suite_error_plot(
-    target_field: np.ndarray,
-    target_jy: np.ndarray,
+    target_field_normalized: np.ndarray,
+    target_jy_normalized: np.ndarray,
     rows: List[Dict],
     frame_ids: np.ndarray,
     out_path: Path,
     title: str,
-    relative_error_eps: float,
 ) -> Dict:
-    """Plot framewise normalized errors with one line per GIF row."""
-    density_eps = relative_error_epsilon(
-        [target_field[3, t] for t in range(target_field.shape[1])],
-        relative_error_eps,
-    )
-    jy_eps = relative_error_epsilon(
-        [target_jy[t] for t in range(target_jy.shape[0])], relative_error_eps
-    )
+    """Plot framewise RMS errors in preprocessing-standardized units."""
     fig, axes = plt.subplots(2, 1, figsize=(10.5, 7.0), sharex=True)
     payload = []
     for row_index, row in enumerate(rows, start=1):
         density_residual = normalized_residual(
-            row["pred_plot"][3], target_field[3], density_eps
+            row["pred_normalized"][3], target_field_normalized[3]
         )
-        jy_residual = normalized_residual(row["pred_jy"], target_jy, jy_eps)
+        jy_residual = normalized_residual(
+            row["pred_jy_normalized"], target_jy_normalized
+        )
         density_nrmse = np.sqrt(np.mean(np.square(density_residual), axis=(1, 2)))
         jy_nrmse = np.sqrt(np.mean(np.square(jy_residual), axis=(1, 2)))
         label = f"row {row_index}: {row['label']}"
@@ -238,15 +232,6 @@ def parse_args():
         ),
     )
     p.add_argument(
-        "--fixed-density-visible-fraction",
-        type=float,
-        default=0.08,
-        help=(
-            "Target Density grid visibility held fixed during the magnetic "
-            "information ablation."
-        ),
-    )
-    p.add_argument(
         "--magnetic-visible-fractions",
         type=float,
         nargs="+",
@@ -300,17 +285,6 @@ def parse_args():
             "If set, use [-vmax, vmax]."
         ),
     )
-    p.add_argument(
-        "--relative-error-eps",
-        type=float,
-        default=0.05,
-        help=(
-            "Stabilizer for pointwise normalized residuals, expressed as a "
-            "fraction of target RMS: error / (abs(target) + eps * RMS(target)). "
-            "Default: 0.05."
-        ),
-    )
-
     p.add_argument(
         "--ay-levels",
         type=int,
@@ -810,23 +784,20 @@ def build_density_superres_rows(
 def build_magnetic_ablation_rows(
     block: torch.Tensor,
     magnetic_visible_fractions: Sequence[float],
-    density_visible_fraction: float,
     generator: torch.Generator,
 ) -> List[Tuple[str, str, torch.Tensor]]:
     """
-    Hold one Density grid fixed and progressively remove nested magnetic probes.
+    Hide all Density and progressively remove nested magnetic probes.
 
     The same spatial ranking is used for all rows, so every lower-visibility B
     layout is a strict subset of the preceding higher-visibility layout.
     """
-    density_plane, density_info = _density_probe_grid(
-        block=block,
-        target_visible_fraction=density_visible_fraction,
-        generator=generator,
-    )
-    density_actual = float(density_info["actual_visible_fraction"])
-
     batch, _channels, time, size_x, size_z = block.shape
+    density_mask = torch.zeros(
+        (batch, 1, time, size_x, size_z),
+        device=block.device,
+        dtype=block.dtype,
+    )
     num_sites = int(size_x * size_z)
     permutation = torch.randperm(num_sites, generator=generator)
     rank = torch.empty(num_sites, dtype=torch.long)
@@ -839,14 +810,12 @@ def build_magnetic_ablation_rows(
         magnetic_plane = magnetic_plane.to(device=block.device, dtype=block.dtype)
         magnetic_mask = magnetic_plane.expand(batch, 3, time, size_x, size_z)
 
-        mask = torch.cat([magnetic_mask, density_plane], dim=1).contiguous()
+        mask = torch.cat([magnetic_mask, density_mask], dim=1).contiguous()
         magnetic_actual = float(magnetic_mask.mean().item())
         label = (
             "Magnetic information ablation\n"
             f"B visible={100.0 * magnetic_actual:.2f}% (nested random)\n"
-            f"Density grid target={100.0 * density_visible_fraction:g}%, "
-            f"actual={100.0 * density_actual:.2f}%\n"
-            f"Density stride={density_info['stride_x']}x{density_info['stride_z']}"
+            "Density probes=0 (fully hidden)"
         )
         rows.append((f"magnetic_ablation_{visible_fraction:g}", label, mask))
     return rows
@@ -909,10 +878,6 @@ def build_experiment_mask_rows(
     generator: torch.Generator,
 ) -> List[Tuple[str, List[Tuple[str, str, torch.Tensor]]]]:
     """Build the selected table groups in their requested display order."""
-    fixed_density_fraction = _validate_visible_fractions(
-        [args.fixed_density_visible_fraction],
-        "--fixed-density-visible-fraction",
-    )[0]
     magnetic_fractions = _validate_visible_fractions(
         args.magnetic_visible_fractions,
         "--magnetic-visible-fractions",
@@ -950,7 +915,6 @@ def build_experiment_mask_rows(
             rows = build_magnetic_ablation_rows(
                 block=block,
                 magnetic_visible_fractions=magnetic_fractions,
-                density_visible_fraction=fixed_density_fraction,
                 generator=generator,
             )
         elif experiment == "density_forecast":
@@ -974,37 +938,15 @@ def build_experiment_mask_rows(
     return experiments
 
 
-def relative_error_epsilon(
-    targets: Sequence[np.ndarray],
-    epsilon_fraction: float,
-) -> float:
-    """Return an absolute denominator floor tied to the target RMS scale."""
-    finite_values = []
-    for target in targets:
-        values = np.asarray(target, dtype=np.float64)
-        values = values[np.isfinite(values)]
-        if values.size:
-            finite_values.append(values)
-    if not finite_values:
-        return float(np.finfo(np.float64).eps)
-    values = np.concatenate(finite_values)
-    target_rms = float(np.sqrt(np.mean(values**2)))
-    return max(
-        float(epsilon_fraction) * target_rms,
-        float(np.finfo(np.float64).eps),
-    )
-
-
 def normalized_residual(
-    pred: np.ndarray,
-    target: np.ndarray,
-    epsilon_abs: float,
+    prediction_normalized: np.ndarray,
+    target_normalized: np.ndarray,
 ) -> np.ndarray:
-    """Return signed, stabilized pointwise relative residuals."""
-    pred = np.asarray(pred, dtype=np.float64)
-    target = np.asarray(target, dtype=np.float64)
-    residual = (pred - target) / (np.abs(target) + float(epsilon_abs))
-    residual[~(np.isfinite(pred) & np.isfinite(target))] = np.nan
+    """Return residuals in the fixed preprocessing-standardized space."""
+    prediction = np.asarray(prediction_normalized, dtype=np.float64)
+    target = np.asarray(target_normalized, dtype=np.float64)
+    residual = prediction - target
+    residual[~(np.isfinite(prediction) & np.isfinite(target))] = np.nan
     return residual
 
 
@@ -1359,6 +1301,7 @@ def combine_table_images(
 def plot_jy_ay_by_mask_patterns(
     target_ay: np.ndarray,
     target_jy: np.ndarray,
+    target_jy_normalized: np.ndarray,
     target_field: np.ndarray,
     rows: List[Dict],
     metadata: Dict,
@@ -1370,7 +1313,6 @@ def plot_jy_ay_by_mask_patterns(
     field_q: float,
     residual_q: float,
     residual_vmax: float | None,
-    relative_error_eps: float,
     quiver_step: int,
     quiver_scale: float,
     dpi: int,
@@ -1391,12 +1333,17 @@ def plot_jy_ay_by_mask_patterns(
     color_times = [local_time] if limit_times is None else list(limit_times)
     all_target_jy = [target_jy[t] for t in color_times]
     all_pred_jy = [row["pred_jy"][t] for row in rows for t in color_times]
-    epsilon_abs = relative_error_epsilon(all_target_jy, relative_error_eps)
     residual_arrays = [
-        normalized_residual(pred, target, epsilon_abs) for pred in pred_arrays
+        normalized_residual(
+            row["pred_jy_normalized"][local_time],
+            target_jy_normalized[local_time],
+        )
+        for row in rows
     ]
     all_residual_jy = [
-        normalized_residual(row["pred_jy"][t], target_jy[t], epsilon_abs)
+        normalized_residual(
+            row["pred_jy_normalized"][t], target_jy_normalized[t]
+        )
         for row in rows
         for t in color_times
     ]
@@ -1533,8 +1480,7 @@ def plot_jy_ay_by_mask_patterns(
     cb_field.ax.tick_params(labelsize=8, length=2.5)
     cb_res = fig.colorbar(residual_im, cax=cax_residual)
     cb_res.set_label(
-        "(Prediction − target) / "
-        f"(|target| + {relative_error_eps:g} × target RMS)",
+        "Prediction − target (preprocessing-standardized B units)",
         fontsize=9,
         labelpad=8,
     )
@@ -1555,6 +1501,7 @@ def plot_jy_ay_by_mask_patterns(
 
 def plot_density_magnetic_field_by_mask_patterns(
     target_field: np.ndarray,
+    target_field_normalized: np.ndarray,
     target_ay: np.ndarray,
     rows: List[Dict],
     metadata: Dict,
@@ -1568,7 +1515,6 @@ def plot_density_magnetic_field_by_mask_patterns(
     field_q: float,
     residual_q: float,
     residual_vmax: float | None,
-    relative_error_eps: float,
     dpi: int,
     limit_times: Sequence[int] | None = None,
 ) -> None:
@@ -1583,16 +1529,17 @@ def plot_density_magnetic_field_by_mask_patterns(
     all_pred_density = [
         row["pred_plot"][3, t] for row in rows for t in color_times
     ]
-    epsilon_abs = relative_error_epsilon(all_target_density, relative_error_eps)
     residual_arrays = [
-        normalized_residual(pred, target_density, epsilon_abs)
-        for pred in pred_arrays
+        normalized_residual(
+            row["pred_normalized"][3, local_time],
+            target_field_normalized[3, local_time],
+        )
+        for row in rows
     ]
     all_residual_density = [
         normalized_residual(
-            row["pred_plot"][3, t],
-            target_field[3, t],
-            epsilon_abs,
+            row["pred_normalized"][3, t],
+            target_field_normalized[3, t],
         )
         for row in rows
         for t in color_times
@@ -1757,8 +1704,7 @@ def plot_density_magnetic_field_by_mask_patterns(
     cb_field.ax.tick_params(labelsize=8, length=2.5)
     cb_res = fig.colorbar(residual_im, cax=cax_residual)
     cb_res.set_label(
-        "(Prediction − target) / "
-        f"(|target| + {relative_error_eps:g} × target RMS)",
+        "Prediction − target (preprocessing std units)",
         fontsize=9,
         labelpad=8,
     )
@@ -1819,12 +1765,6 @@ def main():
         raise ValueError(f"--local-time must be in [0, {delta_t - 1}], got {args.local_time}")
     if args.all_times and args.fps <= 0:
         raise ValueError(f"--fps must be positive, got {args.fps}")
-    if args.relative_error_eps <= 0:
-        raise ValueError(
-            "--relative-error-eps must be positive, got "
-            f"{args.relative_error_eps}"
-        )
-
     print("HDF5 dir:", h5_dir)
     print("Betas:", betas)
     print("delta_t:", delta_t)
@@ -1842,7 +1782,6 @@ def main():
     else:
         print("sample selector: legacy validation sample_index", args.sample_index)
     print("density_probe_counts:", args.density_probe_counts)
-    print("fixed_density_visible_fraction:", args.fixed_density_visible_fraction)
     print("magnetic_visible_fractions:", args.magnetic_visible_fractions)
     print(
         "density_forecast_visible_frames:",
@@ -1854,7 +1793,6 @@ def main():
         print("animation_format:", args.animation_format)
         print("fps:", args.fps)
     print("plot_units:", args.plot_units)
-    print("relative_error_eps:", args.relative_error_eps)
 
     dataset = VPICWindowDataset(
         h5_dir=h5_dir,
@@ -1916,6 +1854,8 @@ def main():
     # In particular, no gradients or path integrations are applied to the
     # masked Visible input arrays.
     target_ay, target_jy = compute_ay_jy(y_plot_np, args.extent)
+    y_norm_np = y_norm[0].detach().cpu().numpy()
+    _, target_jy_normalized = compute_ay_jy(y_norm_np, args.extent)
     experiment_mask_groups = build_experiment_mask_rows(
         args=args,
         block=y_norm,
@@ -1944,9 +1884,13 @@ def main():
                 "mask": mask[0].detach().cpu().numpy(),
                 "visible_plot": visible_plot_tensor[0].detach().cpu().numpy(),
                 "pred_plot": pred_plot_tensor[0].detach().cpu().numpy(),
+                "pred_normalized": pred_norm[0].detach().cpu().numpy(),
             }
             row["pred_ay"], row["pred_jy"] = compute_ay_jy(
                 row["pred_plot"], args.extent
+            )
+            _, row["pred_jy_normalized"] = compute_ay_jy(
+                row["pred_normalized"], args.extent
             )
             rows_for_plot.append(row)
         experiment_rows.append((experiment_name, rows_for_plot))
@@ -1981,13 +1925,12 @@ def main():
             int(metadata["t0"]), int(metadata["t0"]) + delta_t
         )
         error_payload = save_information_suite_error_plot(
-            target_field=y_plot_np,
-            target_jy=target_jy,
+            target_field_normalized=y_norm_np,
+            target_jy_normalized=target_jy_normalized,
             rows=rows_for_plot,
             frame_ids=frame_ids,
             out_path=out_dir / f"{experiment_stem}_error_vs_frame.png",
             title=f"{experiment_name}: error by frame",
-            relative_error_eps=args.relative_error_eps,
         )
         error_path = out_dir / f"{experiment_stem}_error_vs_frame.json"
         error_path.write_text(json.dumps(error_payload, indent=2))
@@ -2006,6 +1949,7 @@ def main():
             plot_jy_ay_by_mask_patterns(
                 target_ay=target_ay,
                 target_jy=target_jy,
+                target_jy_normalized=target_jy_normalized,
                 target_field=y_plot_np,
                 rows=rows_for_plot,
                 metadata=metadata,
@@ -2017,7 +1961,6 @@ def main():
                 field_q=args.field_q,
                 residual_q=args.residual_q,
                 residual_vmax=args.residual_vmax,
-                relative_error_eps=args.relative_error_eps,
                 quiver_step=args.quiver_step,
                 quiver_scale=args.quiver_scale,
                 dpi=args.dpi,
@@ -2026,6 +1969,7 @@ def main():
 
             plot_density_magnetic_field_by_mask_patterns(
                 target_field=y_plot_np,
+                target_field_normalized=y_norm_np,
                 target_ay=target_ay,
                 rows=rows_for_plot,
                 metadata=metadata,
@@ -2039,7 +1983,6 @@ def main():
                 field_q=args.field_q,
                 residual_q=args.residual_q,
                 residual_vmax=args.residual_vmax,
-                relative_error_eps=args.relative_error_eps,
                 dpi=args.dpi,
                 limit_times=limit_times,
             )

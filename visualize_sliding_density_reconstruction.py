@@ -24,7 +24,6 @@ from visualize_mask_patterns_unet3d import (
     compute_normalized_metrics,
     make_nan_cmap,
     normalized_residual,
-    relative_error_epsilon,
     robust_limits,
     write_animation,
 )
@@ -158,15 +157,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--residual-q", type=float, default=99.0)
     parser.add_argument("--residual-vmax", type=float, default=None)
     parser.add_argument(
-        "--relative-error-eps",
-        type=float,
-        default=0.05,
-        help=(
-            "Stabilizer for pointwise normalized residuals, expressed as a "
-            "fraction of target RMS (default: 0.05)."
-        ),
-    )
-    parser.add_argument(
         "--animation-format",
         choices=["quicktime", "mp4", "gif", "both"],
         default="gif",
@@ -286,11 +276,10 @@ def rmse_mae(prediction: np.ndarray, target: np.ndarray) -> Tuple[float, float]:
 
 
 def nrmse_nmae(
-    prediction: np.ndarray,
-    target: np.ndarray,
-    epsilon_abs: float,
+    prediction_normalized: np.ndarray,
+    target_normalized: np.ndarray,
 ) -> Tuple[float, float]:
-    residual = normalized_residual(prediction, target, epsilon_abs)
+    residual = normalized_residual(prediction_normalized, target_normalized)
     return compute_normalized_metrics(residual)
 
 
@@ -351,7 +340,6 @@ def reconstruct_with_slide_step(
     x_index: int | None,
     amp: bool,
     retain_state: bool = False,
-    relative_error_eps: float = 0.05,
 ) -> Dict:
     """Run recursive reconstruction and retain a compact projection per update."""
     channels, run_length, size_x, size_z = target_normalized.shape
@@ -367,9 +355,7 @@ def reconstruct_with_slide_step(
     )
     conditioning_reconstruction = raw_reconstruction.clone()
     probe_bool = probe_mask > 0.5
-    epsilon_abs = relative_error_epsilon(
-        [target_density_plot], relative_error_eps
-    )
+    target_density_normalized = target_normalized[3].detach().cpu().numpy()
     snapshots = []
     covered_end = 0
 
@@ -429,9 +415,10 @@ def reconstruct_with_slide_step(
             plot_units=plot_units,
         )
         raw_plot = raw_plot_tensor.detach().cpu().numpy()
+        raw_normalized = raw_reconstruction.detach().cpu().numpy()
         prediction_projection = project_time_z(raw_plot, x_index=x_index)
         residual_projection = project_time_z(
-            normalized_residual(raw_plot, target_density_plot, epsilon_abs),
+            normalized_residual(raw_normalized, target_density_normalized),
             x_index=x_index,
         )
         covered_rmse, covered_mae = rmse_mae(
@@ -444,17 +431,15 @@ def reconstruct_with_slide_step(
             raw_plot[start:valid_end], target_density_plot[start:valid_end]
         )
         covered_nrmse, covered_nmae = nrmse_nmae(
-            raw_plot[:covered_end], target_density_plot[:covered_end], epsilon_abs
+            raw_normalized[:covered_end], target_density_normalized[:covered_end]
         )
         last_slice_nrmse, last_slice_nmae = nrmse_nmae(
-            raw_plot[covered_end - 1],
-            target_density_plot[covered_end - 1],
-            epsilon_abs,
+            raw_normalized[covered_end - 1],
+            target_density_normalized[covered_end - 1],
         )
         current_window_nrmse, current_window_nmae = nrmse_nmae(
-            raw_plot[start:valid_end],
-            target_density_plot[start:valid_end],
-            epsilon_abs,
+            raw_normalized[start:valid_end],
+            target_density_normalized[start:valid_end],
         )
         snapshots.append(
             {
@@ -494,16 +479,16 @@ def reconstruct_with_slide_step(
         final_plot[-1], target_density_plot[-1]
     )
     full_rmse, full_mae = rmse_mae(final_plot, target_density_plot)
+    final_normalized = raw_reconstruction.detach().cpu().numpy()
     final_window_nrmse, final_window_nmae = nrmse_nmae(
-        final_plot[final_window_start:],
-        target_density_plot[final_window_start:],
-        epsilon_abs,
+        final_normalized[final_window_start:],
+        target_density_normalized[final_window_start:],
     )
     final_slice_nrmse, final_slice_nmae = nrmse_nmae(
-        final_plot[-1], target_density_plot[-1], epsilon_abs
+        final_normalized[-1], target_density_normalized[-1]
     )
     full_nrmse, full_nmae = nrmse_nmae(
-        final_plot, target_density_plot, epsilon_abs
+        final_normalized, target_density_normalized
     )
 
     result = {
@@ -516,8 +501,7 @@ def reconstruct_with_slide_step(
             "full_run_mae": full_mae,
             "full_run_nrmse": full_nrmse,
             "full_run_nmae": full_nmae,
-            "relative_error_epsilon_fraction": relative_error_eps,
-            "relative_error_epsilon_absolute": epsilon_abs,
+            "normalized_metric_space": "preprocessing channel mean/std",
             "final_window_start": final_window_start,
             "final_window_padded_slots": max(
                 0, final_window_start + window_size - run_length
@@ -543,13 +527,13 @@ def reconstruct_with_slide_step(
 
 def summarize_density_state(
     raw_state_normalized: torch.Tensor,
+    target_density_normalized: np.ndarray,
     target_density_plot: np.ndarray,
     density_mean: torch.Tensor,
     density_std: torch.Tensor,
     probe_mask: torch.Tensor,
     plot_units: str,
     x_index: int | None,
-    relative_error_eps: float = 0.05,
 ) -> Dict:
     """Convert one complete raw state to plot arrays and transparent metrics."""
     raw_plot = convert_density_units(
@@ -558,10 +542,8 @@ def summarize_density_state(
         density_std=density_std,
         plot_units=plot_units,
     ).detach().cpu().numpy()
+    raw_normalized = raw_state_normalized.detach().cpu().numpy()
     probe_bool = probe_mask.detach().cpu().numpy() > 0.5
-    epsilon_abs = relative_error_epsilon(
-        [target_density_plot], relative_error_eps
-    )
     full_rmse, full_mae = rmse_mae(raw_plot, target_density_plot)
     probe_rmse, probe_mae = rmse_mae(
         raw_plot[:, probe_bool],
@@ -572,23 +554,21 @@ def summarize_density_state(
         target_density_plot[:, ~probe_bool],
     )
     full_nrmse, full_nmae = nrmse_nmae(
-        raw_plot, target_density_plot, epsilon_abs
+        raw_normalized, target_density_normalized
     )
     probe_nrmse, probe_nmae = nrmse_nmae(
-        raw_plot[:, probe_bool],
-        target_density_plot[:, probe_bool],
-        epsilon_abs,
+        raw_normalized[:, probe_bool],
+        target_density_normalized[:, probe_bool],
     )
     hidden_nrmse, hidden_nmae = nrmse_nmae(
-        raw_plot[:, ~probe_bool],
-        target_density_plot[:, ~probe_bool],
-        epsilon_abs,
+        raw_normalized[:, ~probe_bool],
+        target_density_normalized[:, ~probe_bool],
     )
     return {
         "final_reconstruction": raw_plot,
         "prediction_projection": project_time_z(raw_plot, x_index=x_index),
         "residual_projection": project_time_z(
-            normalized_residual(raw_plot, target_density_plot, epsilon_abs),
+            normalized_residual(raw_normalized, target_density_normalized),
             x_index=x_index,
         ),
         "metrics": {
@@ -604,8 +584,7 @@ def summarize_density_state(
             "probe_nmae": probe_nmae,
             "hidden_nrmse": hidden_nrmse,
             "hidden_nmae": hidden_nmae,
-            "relative_error_epsilon_fraction": relative_error_eps,
-            "relative_error_epsilon_absolute": epsilon_abs,
+            "normalized_metric_space": "preprocessing channel mean/std",
         },
     }
 
@@ -737,7 +716,6 @@ def build_bidirectional_rows(
     x_index: int | None,
     amp: bool,
     initial_results: Dict[int, Dict] | None = None,
-    relative_error_eps: float = 0.05,
 ) -> List[Dict]:
     """Build the repeated-sweep rows requested for bidirectional comparison."""
     if refinement_passes < 1:
@@ -752,6 +730,7 @@ def build_bidirectional_rows(
         )
 
     cached = {} if initial_results is None else initial_results
+    target_density_normalized = target_normalized[3].detach().cpu().numpy()
 
     def initial_result(step: int) -> Dict:
         result = cached.get(step)
@@ -770,19 +749,18 @@ def build_bidirectional_rows(
             x_index=x_index,
             amp=amp,
             retain_state=True,
-            relative_error_eps=relative_error_eps,
         )
 
     def compact_snapshot(raw_state: torch.Tensor) -> Dict:
         summary = summarize_density_state(
             raw_state_normalized=raw_state,
+            target_density_normalized=target_density_normalized,
             target_density_plot=target_density_plot,
             density_mean=density_mean,
             density_std=density_std,
             probe_mask=probe_mask,
             plot_units=plot_units,
             x_index=x_index,
-            relative_error_eps=relative_error_eps,
         )
         summary.pop("final_reconstruction")
         return summary
@@ -844,13 +822,13 @@ def build_bidirectional_rows(
     ) -> Dict:
         summary = summarize_density_state(
             raw_state_normalized=raw_state,
+            target_density_normalized=target_density_normalized,
             target_density_plot=target_density_plot,
             density_mean=density_mean,
             density_std=density_std,
             probe_mask=probe_mask,
             plot_units=plot_units,
             x_index=x_index,
-            relative_error_eps=relative_error_eps,
         )
         summary.update(
             {
@@ -1502,7 +1480,6 @@ def save_bidirectional_analysis(
     field_q: float,
     residual_q: float,
     residual_vmax: float | None,
-    relative_error_eps: float,
     checkpoint_path: Path,
     checkpoint_epoch: int | None,
     h5_path: Path,
@@ -1659,10 +1636,9 @@ def save_bidirectional_analysis(
         ),
         "metric_policy": "raw model predictions, including probe locations",
         "normalized_residual_policy": (
-            "(prediction - target) / (abs(target) + epsilon_fraction * "
-            "target_RMS)"
+            "prediction_normalized - target_normalized, using checkpoint "
+            "preprocessing mean/std"
         ),
-        "relative_error_epsilon_fraction": relative_error_eps,
         "animation_frames": len(frame_paths),
         "animation_policy": (
             "all rows synchronized by cumulative model window calls; final "
@@ -1707,7 +1683,6 @@ def save_slide_step_analysis(
     field_q: float,
     residual_q: float,
     residual_vmax: float | None,
-    relative_error_eps: float,
     animation_format: str,
     fps: float,
     checkpoint_path: Path,
@@ -1832,10 +1807,9 @@ def save_slide_step_analysis(
         "projection": projection_label,
         "probe_metric_policy": "raw model predictions included",
         "normalized_residual_policy": (
-            "(prediction - target) / (abs(target) + epsilon_fraction * "
-            "target_RMS)"
+            "prediction_normalized - target_normalized, using checkpoint "
+            "preprocessing mean/std"
         ),
-        "relative_error_epsilon_fraction": relative_error_eps,
         "results": {
             str(result["slide_step"]): {
                 "window_starts": result["window_starts"],
@@ -1949,12 +1923,6 @@ def main() -> None:
         raise ValueError(f"--fps must be positive, got {args.fps}.")
     if args.dpi <= 0 or args.animation_dpi <= 0:
         raise ValueError("--dpi and --animation-dpi must both be positive.")
-    if args.relative_error_eps <= 0:
-        raise ValueError(
-            "--relative-error-eps must be positive, got "
-            f"{args.relative_error_eps}."
-        )
-
     target = torch.from_numpy(
         np.transpose(fields_time_first, (1, 0, 2, 3))
     ).to(device=device, dtype=torch.float32)
@@ -2012,7 +1980,7 @@ def main() -> None:
     print("Projection:", projection_label)
     print("Probe values are clamped only for recursive conditioning.")
     print("Figures and metrics retain raw model predictions at probe positions.")
-    print("Relative-error epsilon fraction:", args.relative_error_eps)
+    print("Normalized residuals use checkpoint preprocessing mean/std.")
 
     render_slide_steps = args.analysis in {"both", "slide_steps"}
     render_bidirectional = args.analysis in {"both", "bidirectional"}
@@ -2042,7 +2010,6 @@ def main() -> None:
                 render_bidirectional
                 and slide_step in {args.refinement_step, window_size}
             ),
-            relative_error_eps=args.relative_error_eps,
         )
         print("  starts:", result["window_starts"])
         print("  metrics:", result["metrics"])
@@ -2067,7 +2034,6 @@ def main() -> None:
             field_q=args.field_q,
             residual_q=args.residual_q,
             residual_vmax=args.residual_vmax,
-            relative_error_eps=args.relative_error_eps,
             animation_format=args.animation_format,
             fps=args.fps,
             checkpoint_path=checkpoint_path,
@@ -2094,7 +2060,6 @@ def main() -> None:
             x_index=args.x_index,
             amp=True,
             initial_results=results_by_step,
-            relative_error_eps=args.relative_error_eps,
         )
         for row_index, row in enumerate(bidirectional_rows, start=1):
             print(
@@ -2121,7 +2086,6 @@ def main() -> None:
             field_q=args.field_q,
             residual_q=args.residual_q,
             residual_vmax=args.residual_vmax,
-            relative_error_eps=args.relative_error_eps,
             checkpoint_path=checkpoint_path,
             checkpoint_epoch=checkpoint.get("epoch"),
             h5_path=h5_path,

@@ -17,7 +17,6 @@ from visualize_mask_patterns_unet3d import (  # noqa: E402
     default_density_forecast_visible_frames,
     compute_normalized_metrics,
     normalized_residual,
-    relative_error_epsilon,
     select_run_t0_index,
     write_animation,
 )
@@ -34,17 +33,16 @@ def make_generator() -> torch.Generator:
     return torch.Generator().manual_seed(1234)
 
 
-def test_stabilized_pointwise_normalized_residual_is_finite_near_zero():
-    target = np.asarray([0.0, 1.0, -2.0])
-    prediction = np.asarray([1.0, 2.0, -1.0])
-    epsilon_abs = relative_error_epsilon([target], epsilon_fraction=0.05)
-    residual = normalized_residual(prediction, target, epsilon_abs)
+def test_normalized_residual_is_direct_difference_in_standardized_space():
+    target_normalized = np.asarray([0.0, 1.0, -2.0, np.nan])
+    prediction_normalized = np.asarray([1.0, 2.0, -1.0, 5.0])
+    residual = normalized_residual(prediction_normalized, target_normalized)
     nrmse, nmae = compute_normalized_metrics(residual)
 
-    assert epsilon_abs > 0
-    assert np.isfinite(residual).all()
-    assert np.isfinite(nrmse)
-    assert np.isfinite(nmae)
+    np.testing.assert_allclose(residual[:3], [1.0, 1.0, 1.0])
+    assert np.isnan(residual[3])
+    assert np.isclose(nrmse, 1.0)
+    assert np.isclose(nmae, 1.0)
 
 
 def test_multifunction_masks_only_density():
@@ -80,19 +78,19 @@ def test_density_superres_uses_exact_requested_probe_counts():
         assert int(mask[0, 3, 0].sum()) == target
 
 
-def test_magnetic_ablation_is_nested_and_reuses_density_grid():
+def test_magnetic_ablation_is_nested_and_hides_all_density():
     targets = [1.0, 0.8, 0.6, 0.4]
     rows = build_magnetic_ablation_rows(
         block=make_block(),
         magnetic_visible_fractions=targets,
-        density_visible_fraction=0.08,
         generator=make_generator(),
     )
 
-    density_reference = rows[0][2][:, 3:4]
-    for (_, _, mask), target in zip(rows, targets):
+    assert len(rows) == 4
+    for (_, label, mask), target in zip(rows, targets):
         assert abs(float(mask[:, :3].mean()) - target) < 1e-4
-        assert torch.equal(mask[:, 3:4], density_reference)
+        assert torch.all(mask[:, 3:4] == 0)
+        assert "Density probes=0" in label
 
     for (_, _, higher), (_, _, lower) in zip(rows, rows[1:]):
         assert torch.all(lower[:, :3] <= higher[:, :3])

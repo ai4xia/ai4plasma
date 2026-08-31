@@ -109,7 +109,9 @@ def test_probes_are_clamped_only_for_recursive_input_not_output_metrics():
     model = RecordingDensityModel()
     target = torch.zeros((4, 6, 2, 2), dtype=torch.float32)
     target[3] = 2.0
-    target_density = target[3].numpy()
+    density_mean = torch.tensor(10.0)
+    density_std = torch.tensor(2.0)
+    target_density = (target[3] * density_std + density_mean).numpy()
     probe_mask = torch.zeros((2, 2), dtype=torch.float32)
     probe_mask[0, 0] = 1.0
 
@@ -117,12 +119,12 @@ def test_probes_are_clamped_only_for_recursive_input_not_output_metrics():
         model=model,
         target_normalized=target,
         target_density_plot=target_density,
-        density_mean=torch.tensor(0.0),
-        density_std=torch.tensor(1.0),
+        density_mean=density_mean,
+        density_std=density_std,
         probe_mask=probe_mask,
         window_size=4,
         slide_step=2,
-        plot_units="normalized",
+        plot_units="physical",
         x_index=None,
         amp=False,
     )
@@ -141,9 +143,12 @@ def test_probes_are_clamped_only_for_recursive_input_not_output_metrics():
     assert torch.all(density_masks[2:, 1, 1] == 0.0)
     assert torch.all(density_values[2:, 0, 0] == 2.0)
 
-    # Raw probe predictions remain 5 rather than being overwritten by target=2.
-    assert np.all(result["final_reconstruction"] == 5.0)
-    assert np.isclose(result["metrics"]["full_run_rmse"], 3.0)
+    # Raw normalized probe predictions remain 5 rather than being overwritten
+    # by target=2. In physical plot units these values are 20 and 14, while
+    # NRMSE remains the direct standardized-space RMS of 5 - 2.
+    assert np.all(result["final_reconstruction"] == 20.0)
+    assert np.isclose(result["metrics"]["full_run_rmse"], 6.0)
+    assert np.isclose(result["metrics"]["full_run_nrmse"], 3.0)
     assert result["metrics"]["final_window_padded_slots"] == 0
 
 

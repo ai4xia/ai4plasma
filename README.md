@@ -221,7 +221,7 @@ masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine1500_
 
 ### 6.3 Magnetic ablation：磁场信息量扫描
 
-Density 固定为约 8% visible 的 super-resolution grid；磁场 visible fraction 依次为 100%、80%、60%、40%。较低比例的磁场点严格嵌套于较高比例的点集，避免每行随机位置变化干扰信息量比较。三个磁场通道始终使用完全一致的 mask。
+Density 在四行中均为完全不可见（0 probes），防止模型从较密的 Density probe 直接完成 reconstruction，从而掩盖磁场信息量的影响。磁场 visible fraction 仍依次为 100%、80%、60%、40%。较低比例的磁场点严格嵌套于较高比例的点集，避免每行随机位置变化干扰信息量比较。三个磁场通道始终使用完全一致的 mask。
 
 ### 6.4 Density forecast：窗口末帧条件外推
 
@@ -249,15 +249,15 @@ Jy =  dBx/dz - dBz/dx
 
 所有 masked/visible panel 中黑色代表 invisible。Density table 的彩色位置是实际输入模型的 target 数值；左侧第二列则是为展示磁场观测范围而应用共同 B mask 的 Target `Jy`。
 
-第四列和 sliding/bidirectional residual panel 使用无量纲的 stabilized pointwise normalized residual：
+第四列和 sliding/bidirectional residual panel 统一使用 preprocessing 的 channel mean/std 标准化空间。对 Density，residual 直接由 checkpoint 标准化后的 prediction 和 target 相减：
 
 ```text
-r = (prediction - target) / (abs(target) + epsilon * RMS(target))
+r = prediction_normalized - target_normalized
 NRMSE = sqrt(mean(r**2))
 NMAE = mean(abs(r))
 ```
 
-默认 `epsilon=0.05`，可通过 `--relative-error-eps` 调整。`RMS(target)` 在当前比较所覆盖的完整 target 范围上计算，因此真实值接近零时分母仍有与场尺度相称的下限。`--residual-vmax` 和 residual colorbar 相应变为无量纲。sliding JSON 同时保留原始物理单位 RMSE/MAE 与新增 NRMSE/NMAE。
+这个分母在所有时间和空间位置都是同一个训练集 channel std，不再根据局部 target 幅值调整误差权重。Jy 是派生量；它的 normalized residual 由各自按 checkpoint 统计量标准化后的 `Bx/Bz` 先计算 Jy，再对 prediction/target 相减。`--residual-vmax` 仍可固定 residual colorbar 范围。sliding JSON 同时保留 plot units 中的 RMSE/MAE 和标准化空间中的 NRMSE/NMAE。
 
 ### 6.6 运行全部四套单窗口实验
 
@@ -363,7 +363,7 @@ srun -n 1 -c 32 -G 1 --gpu-bind=none \
 
 - global frames 49–51 在所有任务中同时变难，说明末端误差峰值不只是 recursive sliding 的累计误差，也与 plasmoid merger 后期动力学或窗口边界上下文不足有关；
 - B 完整可见时，30/20/10/0 个 Density probes 的 Density NRMSE 几乎重合，提示网络主要依靠 B 重建 Density，可能没有充分利用稀疏 Density probes；
-- B 可见率由 100% 降到 40% 时 Density NRMSE 只小幅变化，但 Jy NRMSE 约增至三倍，说明逐点场值重建尚不能可靠保证空间导数/current-sheet 结构；
+- 现有 magnetic-ablation 图来自旧的约 8% Density-visible 设置；改为 0 Density probes 后需重新生成曲线，再判断 B 可见率对 Density/Jy NRMSE 的影响；
 - conditional Density forecast 的误差随 horizon 从 1、6、12 到 18 steps 单调增大，模型仍明显受有限时间上下文约束。
 
 #### 完整 run sliding reconstruction
