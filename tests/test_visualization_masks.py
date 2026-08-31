@@ -144,7 +144,7 @@ def test_multifunction_masks_only_density():
 
 
 def test_density_superres_uses_exact_requested_probe_counts():
-    targets = [30, 20, 10, 0]
+    targets = [0, 10, 100, 1000]
     rows = build_density_superres_rows(make_block(), targets)
 
     for (_, _, mask), target in zip(rows, targets):

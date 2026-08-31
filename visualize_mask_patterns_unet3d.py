@@ -227,10 +227,10 @@ def parse_args():
         "--density-probe-counts",
         type=int,
         nargs="+",
-        default=[30, 20, 10, 0],
+        default=[0, 10, 100, 1000],
         help=(
             "Numbers of Density probes for rows in the super-resolution sweep. "
-            "Default: 30 20 10 0."
+            "Default: 0 10 100 1000."
         ),
     )
     p.add_argument(

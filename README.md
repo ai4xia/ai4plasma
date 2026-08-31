@@ -217,7 +217,7 @@ masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine1500_
 
 ### 6.2 Density super-resolution：probe 数量扫描
 
-磁场始终 100% visible；Density 使用规则 probe grid。四行 probe 数量默认为 30、20、10、0，用于重点研究极稀疏 Density probe 数量与重建误差的关系。实现会生成包含准确 probe 数量的近各向同性 grid。
+磁场始终 100% visible；Density 使用规则 probe grid。四行 probe 数量默认为 0、10、100、1000，以拉开观测密度、使 Density probes 对磁场和密度预测的影响更容易辨认。实现会生成包含准确 probe 数量的近各向同性 grid。
 
 ### 6.3 Magnetic ablation：磁场信息量扫描
 
@@ -366,7 +366,7 @@ information-suite 默认还会对 `split.json` 中全部 validation runs 生成 
 这些曲线目前支持以下判断：
 
 - global frames 49–51 在所有任务中同时变难，说明末端误差峰值不只是 recursive sliding 的累计误差，也与 plasmoid merger 后期动力学或窗口边界上下文不足有关；
-- B 完整可见时，30/20/10/0 个 Density probes 的 Density NRMSE 几乎重合，提示网络主要依靠 B 重建 Density，可能没有充分利用稀疏 Density probes；
+- 旧的 30/20/10/0-probe 扫描中，各行 Density NRMSE 几乎重合，提示网络主要依靠 B 重建 Density；默认扫描现已改为 0/10/100/1000，需重新生成图后判断更宽 probe 数量范围的影响；
 - 现有 magnetic-ablation 图来自旧的约 8% Density-visible 设置；改为 0 Density probes 后需重新生成曲线，再判断 B 可见率对 Density/Jy NRMSE 的影响；
 - conditional Density forecast 的误差随 horizon 从 1、6、12 到 18 steps 单调增大，模型仍明显受有限时间上下文约束。
 
