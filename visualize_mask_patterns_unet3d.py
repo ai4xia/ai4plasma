@@ -26,6 +26,8 @@ from models.unet3d import LEGACY_MODEL_VERSION, UNet3D
 
 DEFAULT_RUN_NAME = "beta0.2_nu2_Bz0_dt2_tau70"
 DEFAULT_T0 = 28
+DEFAULT_RESIDUAL_VMAX = 1.0
+RESIDUAL_CMAP = "RdBu_r"
 
 
 def save_information_suite_error_plot(
@@ -252,6 +254,34 @@ def parse_args():
             "T=24: 23 18 12 6; other T values use equivalent relative lengths."
         ),
     )
+    p.add_argument(
+        "--skip-validation-statistics",
+        action="store_true",
+        help=(
+            "Skip the cross-validation-run median and 16th-84th percentile "
+            "error plots. By default they are generated in addition to the "
+            "selected single-window GIFs."
+        ),
+    )
+    p.add_argument(
+        "--statistics-window-stride",
+        type=int,
+        default=None,
+        help=(
+            "Stride used to crop validation runs into context windows for "
+            "aggregate statistics. Default: one context length; a final "
+            "run-end-aligned window is also included when needed."
+        ),
+    )
+    p.add_argument(
+        "--statistics-max-windows-per-run",
+        type=int,
+        default=None,
+        help=(
+            "Optional cap on aggregate-statistics windows per validation run. "
+            "Selected windows are spread evenly over each run."
+        ),
+    )
 
     p.add_argument(
         "--plot-units",
@@ -274,16 +304,25 @@ def parse_args():
         "--residual-q",
         type=float,
         default=99.0,
-        help="Percentile used for robust residual color limits.",
+        help="Percentile used with --auto-residual-range.",
     )
     p.add_argument(
         "--residual-vmax",
         type=float,
-        default=None,
+        default=DEFAULT_RESIDUAL_VMAX,
         help=(
-            "Optional fixed symmetric normalized-residual color limit. "
-            "If set, use [-vmax, vmax]."
+            "Fixed symmetric normalized-residual color limit. "
+            f"Default: {DEFAULT_RESIDUAL_VMAX}, giving "
+            f"[-{DEFAULT_RESIDUAL_VMAX}, {DEFAULT_RESIDUAL_VMAX}]."
         ),
+    )
+    p.add_argument(
+        "--auto-residual-range",
+        action="store_const",
+        const=None,
+        dest="residual_vmax",
+        default=argparse.SUPPRESS,
+        help="Use robust percentile-based residual limits instead of a fixed range.",
     )
     p.add_argument(
         "--ay-levels",
@@ -996,7 +1035,7 @@ def compute_ay_jy(
     x, z = physical_coordinates((X, Z), extent)
 
     ay = np.zeros((T, X, Z), dtype=np.float64)
-    jy = np.empty((T, X, Z), dtype=np.float64)
+    jy = compute_jy(field, extent)
 
     for t in range(T):
         # First integrate Bz along x at the left z boundary, then integrate
@@ -1014,11 +1053,295 @@ def compute_ay_jy(
             ) * dz
 
         ay[t] -= np.mean(ay[t])
-        d_bx_dz = np.gradient(bx[t], z, axis=1)
-        d_bz_dx = np.gradient(bz[t], x, axis=0)
-        jy[t] = d_bx_dz - d_bz_dx
-
     return ay, jy
+
+
+def compute_jy(field: np.ndarray, extent: Sequence[float]) -> np.ndarray:
+    """Derive Jy(T,X,Z) without the more expensive Ay path integration."""
+    if field.ndim != 4 or field.shape[0] < 3:
+        raise ValueError(f"Expected (C, T, X, Z) with Bx/Bz channels, got {field.shape}")
+    bx = np.asarray(field[0], dtype=np.float64)
+    bz = np.asarray(field[2], dtype=np.float64)
+    x, z = physical_coordinates(bx.shape[-2:], extent)
+    d_bx_dz = np.gradient(bx, z, axis=2)
+    d_bz_dx = np.gradient(bz, x, axis=1)
+    return d_bx_dz - d_bz_dx
+
+
+def select_validation_statistics_indices(
+    dataset: VPICWindowDataset,
+    val_runs: set[str],
+    window_stride: int,
+    max_windows_per_run: int | None,
+) -> List[int]:
+    """Select deterministic validation windows, optionally capped per run."""
+    if window_stride < 1:
+        raise ValueError("statistics window stride must be positive.")
+    grouped: Dict[str, List[Tuple[int, int]]] = {}
+    for index, (_file_index, run_name, t0) in enumerate(dataset.samples):
+        if run_name in val_runs:
+            grouped.setdefault(run_name, []).append((int(t0), index))
+    missing = sorted(val_runs - set(grouped))
+    if missing:
+        raise RuntimeError(
+            "Validation runs have no complete context window: " + ", ".join(missing)
+        )
+    if max_windows_per_run is not None and max_windows_per_run < 1:
+        raise ValueError("--statistics-max-windows-per-run must be positive.")
+
+    selected = []
+    for run_name in sorted(grouped):
+        t0_to_index = dict(grouped[run_name])
+        first_t0 = min(t0_to_index)
+        final_t0 = max(t0_to_index)
+        starts = list(range(first_t0, final_t0 + 1, window_stride))
+        if starts[-1] != final_t0:
+            starts.append(final_t0)
+        indices = [t0_to_index[t0] for t0 in starts]
+        if max_windows_per_run is not None and len(indices) > max_windows_per_run:
+            positions = np.linspace(
+                0, len(indices) - 1, max_windows_per_run
+            ).round().astype(int)
+            indices = [indices[position] for position in positions]
+        selected.extend(indices)
+    return selected
+
+
+def aggregate_run_window_profiles(
+    profiles_by_run: Dict[str, List[np.ndarray]],
+) -> Dict:
+    """Give every run equal weight after median-combining its windows."""
+    if not profiles_by_run:
+        raise ValueError("Cannot aggregate an empty set of validation profiles.")
+    run_names = sorted(profiles_by_run)
+    run_profiles = []
+    window_counts = {}
+    for run_name in run_names:
+        windows = np.stack(profiles_by_run[run_name], axis=0)
+        run_profiles.append(np.median(windows, axis=0))
+        window_counts[run_name] = int(windows.shape[0])
+    values = np.stack(run_profiles, axis=0)
+    return {
+        "run_names": run_names,
+        "window_counts": window_counts,
+        "run_profiles": values,
+        "median": np.median(values, axis=0),
+        "p16": np.percentile(values, 16.0, axis=0),
+        "p84": np.percentile(values, 84.0, axis=0),
+    }
+
+
+def validation_statistics_legend_label(
+    experiment_name: str,
+    row: Dict,
+    context_length: int,
+) -> str:
+    """Return a compact legend label for an aggregate validation curve."""
+    name = str(row["name"])
+    if experiment_name == "density_forecast":
+        history = int(name.rsplit("_", 1)[1])
+        return f"history={history}, horizon={context_length - history}"
+    if experiment_name == "density_superres":
+        probes = int(name.rsplit("_", 1)[1])
+        return f"Density probes={probes}"
+    if experiment_name == "magnetic_ablation":
+        visible_fraction = float(name.rsplit("_", 1)[1])
+        return f"B visible={100.0 * visible_fraction:g}%"
+    if experiment_name == "multifunction":
+        return name.replace("_", " ")
+    return name.replace("_", " ")
+
+
+def save_validation_statistics_plot(
+    experiment_name: str,
+    row_statistics: List[Dict],
+    context_length: int,
+    total_windows: int,
+    out_path: Path,
+) -> Dict:
+    """Plot cross-run median curves and same-color 16th-84th percentile bands."""
+    local_frames = np.arange(context_length)
+    fig, axes = plt.subplots(2, 1, figsize=(10.5, 7.0), sharex=True)
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    payload_rows = []
+    for row_index, row in enumerate(row_statistics):
+        color = colors[row_index % len(colors)]
+        label = validation_statistics_legend_label(
+            experiment_name,
+            row,
+            context_length,
+        )
+        for axis, metric_name in zip(axes, ("density", "jy")):
+            stats = row[metric_name]
+            axis.plot(
+                local_frames,
+                stats["median"],
+                color=color,
+                linewidth=2.4,
+                label=label,
+            )
+            axis.fill_between(
+                local_frames,
+                stats["p16"],
+                stats["p84"],
+                color=color,
+                alpha=0.14,
+                linewidth=0,
+            )
+        payload_rows.append(
+            {
+                "row": row_index + 1,
+                "name": row["name"],
+                "label": row["label"],
+                "density_nrmse": {
+                    key: row["density"][key].tolist()
+                    for key in ("median", "p16", "p84")
+                },
+                "jy_nrmse": {
+                    key: row["jy"][key].tolist()
+                    for key in ("median", "p16", "p84")
+                },
+                "per_run": {
+                    run_name: {
+                        "density_nrmse": row["density"]["run_profiles"][run_index].tolist(),
+                        "jy_nrmse": row["jy"]["run_profiles"][run_index].tolist(),
+                    }
+                    for run_index, run_name in enumerate(row["density"]["run_names"])
+                },
+            }
+        )
+    axes[0].set_ylabel("Density frame NRMSE")
+    axes[1].set_ylabel("Jy frame NRMSE")
+    axes[1].set_xlabel(f"Local frame in {context_length}-frame context window")
+    for axis in axes:
+        axis.grid(alpha=0.25)
+    run_count = len(row_statistics[0]["density"]["run_names"])
+    fig.suptitle(
+        f"{experiment_name}: validation-run median and 16th-84th percentile\n"
+        f"{run_count} runs, {total_windows} windows; windows median-combined per run"
+    )
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.88),
+        ncol=min(4, len(labels)),
+        fontsize=8,
+        frameon=False,
+    )
+    fig.subplots_adjust(
+        left=0.10,
+        right=0.985,
+        bottom=0.09,
+        top=0.79,
+        hspace=0.12,
+    )
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+    print(f"Saved validation statistics plot: {out_path}")
+    return {
+        "experiment": experiment_name,
+        "local_frames": local_frames.tolist(),
+        "context_length": context_length,
+        "run_count": run_count,
+        "window_count": total_windows,
+        "aggregation_policy": (
+            "median across windows within each run, then cross-run median and "
+            "16th-84th percentiles"
+        ),
+        "mask_policy": "reuse the corresponding canonical GIF row mask for every window",
+        "window_counts_by_run": row_statistics[0]["density"]["window_counts"],
+        "rows": payload_rows,
+    }
+
+
+@torch.no_grad()
+def collect_validation_statistics(
+    model: torch.nn.Module,
+    dataset: VPICWindowDataset,
+    sample_indices: Sequence[int],
+    args: argparse.Namespace,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    device: torch.device,
+    canonical_rows: Dict[str, List[Dict]],
+) -> Dict[str, List[Dict]]:
+    """Evaluate all selected validation windows and aggregate by independent run."""
+    collected: Dict[str, List[Dict]] = {
+        experiment_name: [
+            {
+                "name": row["name"],
+                "label": row["label"],
+                "density_by_run": {},
+                "jy_by_run": {},
+            }
+            for row in rows
+        ]
+        for experiment_name, rows in canonical_rows.items()
+    }
+
+    for sample_number, dataset_index in enumerate(sample_indices, start=1):
+        sample = dataset[dataset_index]
+        target = sample["block"].unsqueeze(0).to(device)
+        target_normalized = normalize(target, mean, std)
+        target_np = target_normalized[0].detach().cpu().numpy()
+        target_jy = compute_jy(target_np, args.extent)
+        run_name = sample["metadata"]["run_name"]
+        for experiment_name, canonical_experiment_rows in canonical_rows.items():
+            masks = torch.stack(
+                [
+                    torch.as_tensor(
+                        row["mask"],
+                        device=device,
+                        dtype=target_normalized.dtype,
+                    )
+                    for row in canonical_experiment_rows
+                ],
+                dim=0,
+            )
+            if masks.shape[1:] != target_normalized.shape[1:]:
+                raise ValueError(
+                    f"Validation window shape {tuple(target_normalized.shape[1:])} "
+                    f"does not match canonical masks {tuple(masks.shape[1:])}."
+                )
+            targets = target_normalized.expand(
+                len(canonical_experiment_rows), -1, -1, -1, -1
+            )
+            model_input = torch.cat([targets * masks, masks], dim=1)
+            predictions = model(model_input).float().detach().cpu().numpy()
+            for row_index, canonical_row in enumerate(canonical_experiment_rows):
+                row = collected[experiment_name][row_index]
+                if canonical_row["name"] != row["name"]:
+                    raise RuntimeError("Canonical row order changed during statistics.")
+                density_residual = predictions[row_index, 3] - target_np[3]
+                density_nrmse = np.sqrt(
+                    np.mean(np.square(density_residual), axis=(1, 2))
+                )
+                prediction_jy = compute_jy(predictions[row_index], args.extent)
+                jy_nrmse = np.sqrt(
+                    np.mean(np.square(prediction_jy - target_jy), axis=(1, 2))
+                )
+                row["density_by_run"].setdefault(run_name, []).append(density_nrmse)
+                row["jy_by_run"].setdefault(run_name, []).append(jy_nrmse)
+        if sample_number == 1 or sample_number % 10 == 0 or sample_number == len(sample_indices):
+            print(
+                f"Validation statistics: {sample_number}/{len(sample_indices)} windows"
+            )
+
+    aggregated = {}
+    for experiment_name, rows in collected.items():
+        aggregated[experiment_name] = []
+        for row in rows:
+            aggregated[experiment_name].append(
+                {
+                    "name": row["name"],
+                    "label": row["label"],
+                    "density": aggregate_run_window_profiles(row["density_by_run"]),
+                    "jy": aggregate_run_window_profiles(row["jy_by_run"]),
+                }
+            )
+    return aggregated
 
 
 def add_ay_contours(
@@ -1364,7 +1687,7 @@ def plot_jy_ay_by_mask_patterns(
         res_vmin, res_vmax = -float(residual_vmax), float(residual_vmax)
 
     jy_cmap = make_nan_cmap("seismic", bad_color="black")
-    residual_cmap = make_nan_cmap("PRGn")
+    residual_cmap = make_nan_cmap(RESIDUAL_CMAP)
     field_im = None
     residual_im = None
 
@@ -1561,7 +1884,7 @@ def plot_density_magnetic_field_by_mask_patterns(
         res_vmin, res_vmax = -float(residual_vmax), float(residual_vmax)
 
     density_cmap = make_nan_cmap("plasma", bad_color="black")
-    residual_cmap = make_nan_cmap("PRGn")
+    residual_cmap = make_nan_cmap(RESIDUAL_CMAP)
     field_im = None
     residual_im = None
 
@@ -1726,6 +2049,8 @@ def plot_density_magnetic_field_by_mask_patterns(
 @torch.no_grad()
 def main():
     args = parse_args()
+    if args.residual_vmax is not None and args.residual_vmax <= 0:
+        raise ValueError("--residual-vmax must be positive.")
 
     run_dir = expand_path(args.run_dir)
     out_dir = (
@@ -1765,6 +2090,18 @@ def main():
         raise ValueError(f"--local-time must be in [0, {delta_t - 1}], got {args.local_time}")
     if args.all_times and args.fps <= 0:
         raise ValueError(f"--fps must be positive, got {args.fps}")
+    statistics_window_stride = (
+        delta_t
+        if args.statistics_window_stride is None
+        else int(args.statistics_window_stride)
+    )
+    if statistics_window_stride < 1:
+        raise ValueError("--statistics-window-stride must be positive.")
+    if (
+        args.statistics_max_windows_per_run is not None
+        and args.statistics_max_windows_per_run < 1
+    ):
+        raise ValueError("--statistics-max-windows-per-run must be positive.")
     print("HDF5 dir:", h5_dir)
     print("Betas:", betas)
     print("delta_t:", delta_t)
@@ -1793,6 +2130,13 @@ def main():
         print("animation_format:", args.animation_format)
         print("fps:", args.fps)
     print("plot_units:", args.plot_units)
+    print("validation_statistics:", not args.skip_validation_statistics)
+    if not args.skip_validation_statistics:
+        print("statistics_window_stride:", statistics_window_stride)
+        print(
+            "statistics_max_windows_per_run:",
+            args.statistics_max_windows_per_run,
+        )
 
     dataset = VPICWindowDataset(
         h5_dir=h5_dir,
@@ -1804,6 +2148,11 @@ def main():
     )
 
     val_runs = get_val_runs(run_dir)
+    if not args.skip_validation_statistics and val_runs is None:
+        raise FileNotFoundError(
+            "Cross-run validation statistics require run-dir/split.json. "
+            "Use --skip-validation-statistics only if aggregate plots are not needed."
+        )
     if args.sample_index is None:
         dataset_idx = select_run_t0_index(
             dataset=dataset,
@@ -1894,6 +2243,66 @@ def main():
             )
             rows_for_plot.append(row)
         experiment_rows.append((experiment_name, rows_for_plot))
+
+    if not args.skip_validation_statistics:
+        statistics_dataset = VPICWindowDataset(
+            h5_dir=h5_dir,
+            betas=betas,
+            delta_t=delta_t,
+            stride_t=1,
+            layout="C T X Z",
+            return_metadata=True,
+        )
+        statistics_indices = select_validation_statistics_indices(
+            dataset=statistics_dataset,
+            val_runs=val_runs,
+            window_stride=statistics_window_stride,
+            max_windows_per_run=args.statistics_max_windows_per_run,
+        )
+        selected_statistics_runs = {
+            statistics_dataset.samples[index][1] for index in statistics_indices
+        }
+        print(
+            "Collecting validation statistics from "
+            f"{len(selected_statistics_runs)} runs and "
+            f"{len(statistics_indices)} windows."
+        )
+        validation_statistics = collect_validation_statistics(
+            model=model,
+            dataset=statistics_dataset,
+            sample_indices=statistics_indices,
+            args=args,
+            mean=mean,
+            std=std,
+            device=device,
+            canonical_rows=dict(experiment_rows),
+        )
+        for experiment_name, row_statistics in validation_statistics.items():
+            statistics_stem = (
+                f"validation-runs_stride-{statistics_window_stride}_"
+                f"experiment-{experiment_name}_error_vs_local_frame"
+            )
+            statistics_payload = save_validation_statistics_plot(
+                experiment_name=experiment_name,
+                row_statistics=row_statistics,
+                context_length=delta_t,
+                total_windows=len(statistics_indices),
+                out_path=out_dir / f"{statistics_stem}.png",
+            )
+            statistics_payload.update(
+                {
+                    "checkpoint": str(ckpt_path),
+                    "checkpoint_epoch": ckpt.get("epoch"),
+                    "validation_runs": sorted(selected_statistics_runs),
+                    "window_stride": statistics_window_stride,
+                    "max_windows_per_run": args.statistics_max_windows_per_run,
+                    "mask_seed": args.seed,
+                }
+            )
+            statistics_path = out_dir / f"{statistics_stem}.json"
+            statistics_path.write_text(json.dumps(statistics_payload, indent=2))
+            print(f"Saved validation statistics data: {statistics_path}")
+        statistics_dataset.close()
 
     sample_stem = (
         f"{selection_stem}_"

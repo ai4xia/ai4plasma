@@ -13,12 +13,6 @@ readonly PLASMOID_X_INDEX=130
 readonly INFO_OUT="${RUN_DIR}/figures_information_suite_plasmoid_merger"
 readonly SLIDING_OUT="${RUN_DIR}/figures_sliding_density_reconstruction_plasmoid_merger"
 
-if [[ -z "${SLURM_JOB_ID:-}" ]]; then
-    echo "ERROR: visualization.sh must be run inside an active Slurm GPU allocation." >&2
-    echo "Start/enter the allocation first, then run: bash visualization.sh" >&2
-    exit 1
-fi
-
 if [[ ! -f "${RUN_DIR}/best.pt" ]]; then
     echo "ERROR: checkpoint not found: ${RUN_DIR}/best.pt" >&2
     exit 1
@@ -30,8 +24,7 @@ mkdir -p "$INFO_OUT" "$SLIDING_OUT"
 
 echo
 echo "[1/2] Rendering all 24-frame information-suite experiments"
-srun -n 1 -c 32 -G 1 --gpu-bind=none \
-    python visualize_mask_patterns_unet3d.py \
+python visualize_mask_patterns_unet3d.py \
     --run-dir "$RUN_DIR" \
     --run-name "$RUN_NAME" \
     --t0 "$WINDOW_T0" \
@@ -43,8 +36,7 @@ srun -n 1 -c 32 -G 1 --gpu-bind=none \
 
 echo
 echo "[2/2] Rendering full-run sliding and bidirectional reconstruction"
-srun -n 1 -c 32 -G 1 --gpu-bind=none \
-    python visualize_sliding_density_reconstruction.py \
+python visualize_sliding_density_reconstruction.py \
     --run-dir "$RUN_DIR" \
     --run-name "$RUN_NAME" \
     --analysis both \

@@ -257,7 +257,7 @@ NRMSE = sqrt(mean(r**2))
 NMAE = mean(abs(r))
 ```
 
-这个分母在所有时间和空间位置都是同一个训练集 channel std，不再根据局部 target 幅值调整误差权重。Jy 是派生量；它的 normalized residual 由各自按 checkpoint 统计量标准化后的 `Bx/Bz` 先计算 Jy，再对 prediction/target 相减。`--residual-vmax` 仍可固定 residual colorbar 范围。sliding JSON 同时保留 plot units 中的 RMSE/MAE 和标准化空间中的 NRMSE/NMAE。
+这个分母在所有时间和空间位置都是同一个训练集 channel std，不再根据局部 target 幅值调整误差权重。Jy 是派生量；它的 normalized residual 由各自按 checkpoint 统计量标准化后的 `Bx/Bz` 先计算 Jy，再对 prediction/target 相减。所有 residual panel 默认使用固定的 `[-1, 1]` colorbar 和 `RdBu_r` colormap（负误差为蓝、正误差为红），便于跨样本、时间和实验直接比较；`--residual-vmax` 可覆盖这个对称范围，`--auto-residual-range` 可恢复基于分位数的自动范围。sliding JSON 同时保留 plot units 中的 RMSE/MAE 和标准化空间中的 NRMSE/NMAE。
 
 ### 6.6 运行全部四套单窗口实验
 
@@ -347,7 +347,11 @@ srun -n 1 -c 32 -G 1 --gpu-bind=none \
 
 ### 7.5 逐帧误差诊断
 
-每个 GIF 现在另存一张 `*_error_vs_frame.png`：GIF 中每一行对应图中的一条曲线。information-suite 同时报告 Density/Jy frame NRMSE；sliding reconstruction 报告物理单位 frame RMSE/MAE。逐帧数值写入相邻 JSON 或 metrics JSON，便于复算而不需要从图片读数。
+每个 GIF 另存一张当前 canonical window/run 的 `*_error_vs_frame.png`：GIF 中每一行对应图中的一条曲线。information-suite 同时报告 Density/Jy frame NRMSE；sliding reconstruction 报告 plot units 中的 frame RMSE/MAE。逐帧数值写入相邻 JSON 或 metrics JSON，便于复算而不需要从图片读数。
+
+information-suite 默认还会对 `split.json` 中全部 validation runs 生成 `validation-runs_*_error_vs_local_frame.png/json`。每个 run 按 context length 为默认 stride 切成 window，并在未整除时额外加入一个与 run 末端对齐的 window。所有 run/window 复用 canonical GIF 各行的同一个 mask layout，避免把 mask 位置的随机性混入 run-to-run variation。同一 run 内的多个 window 先按 local frame 取 median，再在 runs 之间计算 median 以及 16th–84th percentile band，因此长 run 不会因为产生更多 window 而获得更高权重。曲线和它的 shaded region 使用同一颜色，不同颜色仍与 GIF 中不同行一一对应。横轴固定为 context window 内的 local frame `0..T-1`。
+
+`--statistics-window-stride` 可调整切窗 stride，`--statistics-max-windows-per-run` 可对每个 run 的 window 数设上限（在整个 run 上均匀抽取），`--skip-validation-statistics` 可关闭这一额外评估。
 
 #### 单窗口 information-suite
 

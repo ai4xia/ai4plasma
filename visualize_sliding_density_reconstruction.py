@@ -20,6 +20,8 @@ from matplotlib.patches import Rectangle
 from data.vpic_hdf5_dataset import find_h5_files, parse_run_name
 from models.unet3d import LEGACY_MODEL_VERSION, UNet3D
 from visualize_mask_patterns_unet3d import (
+    DEFAULT_RESIDUAL_VMAX,
+    RESIDUAL_CMAP,
     _density_probe_grid,
     compute_normalized_metrics,
     make_nan_cmap,
@@ -154,8 +156,29 @@ def parse_args() -> argparse.Namespace:
         default="physical",
     )
     parser.add_argument("--field-q", type=float, default=99.0)
-    parser.add_argument("--residual-q", type=float, default=99.0)
-    parser.add_argument("--residual-vmax", type=float, default=None)
+    parser.add_argument(
+        "--residual-q",
+        type=float,
+        default=99.0,
+        help="Percentile used with --auto-residual-range.",
+    )
+    parser.add_argument(
+        "--residual-vmax",
+        type=float,
+        default=DEFAULT_RESIDUAL_VMAX,
+        help=(
+            "Fixed symmetric normalized-residual color limit. "
+            f"Default: {DEFAULT_RESIDUAL_VMAX}."
+        ),
+    )
+    parser.add_argument(
+        "--auto-residual-range",
+        action="store_const",
+        const=None,
+        dest="residual_vmax",
+        default=argparse.SUPPRESS,
+        help="Use robust percentile-based residual limits instead of a fixed range.",
+    )
     parser.add_argument(
         "--animation-format",
         choices=["quicktime", "mp4", "gif", "both"],
@@ -1133,7 +1156,7 @@ def plot_progress_frame(
         zmax,
     ]
     density_cmap = make_nan_cmap("plasma", bad_color="black")
-    residual_cmap = make_nan_cmap("PRGn", bad_color="black")
+    residual_cmap = make_nan_cmap(RESIDUAL_CMAP, bad_color="black")
     density_image = None
     residual_image = None
 
@@ -1271,7 +1294,7 @@ def plot_bidirectional_refinement_figure(
         zmax,
     ]
     density_cmap = make_nan_cmap("plasma", bad_color="black")
-    residual_cmap = make_nan_cmap("PRGn", bad_color="black")
+    residual_cmap = make_nan_cmap(RESIDUAL_CMAP, bad_color="black")
     density_image = None
     residual_image = None
 
@@ -1877,6 +1900,8 @@ def save_slide_step_analysis(
 @torch.no_grad()
 def main() -> None:
     args = parse_args()
+    if args.residual_vmax is not None and args.residual_vmax <= 0:
+        raise ValueError("--residual-vmax must be positive.")
     run_dir = expand_path(args.run_dir)
     checkpoint_path = Path(args.checkpoint)
     if not checkpoint_path.is_absolute():
