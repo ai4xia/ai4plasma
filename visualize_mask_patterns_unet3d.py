@@ -2184,6 +2184,7 @@ def main():
         base_channels=base_channels,
         channel_mults=channel_mults,
         architecture=ckpt_args.get("model_version", LEGACY_MODEL_VERSION),
+        use_attention=bool(ckpt_args.get("use_attention", False)),
     ).to(device)
 
     model.load_state_dict(ckpt["model"])

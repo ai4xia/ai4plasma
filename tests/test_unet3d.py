@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from models.unet3d import (  # noqa: E402
     LEGACY_MODEL_VERSION,
     MODEL_VERSION,
+    SpatiotemporalAttention3D,
     UNet3D,
 )
 
@@ -93,3 +94,121 @@ def test_legacy_architecture_keeps_groupnorm_for_old_checkpoints():
         architecture=LEGACY_MODEL_VERSION,
     )
     assert any(isinstance(module, nn.GroupNorm) for module in model.modules())
+
+
+def test_attention_selects_heads_and_partitions_3d_rope():
+    attention = SpatiotemporalAttention3D(channels=96)
+    assert attention.num_heads == 8
+    assert attention.head_dim == 12
+    assert attention.rotary_dim == 12
+    assert attention.axis_rotary_dim == 4
+
+    assert SpatiotemporalAttention3D(channels=60).num_heads == 6
+
+
+def test_3d_rope_uses_distinct_temporal_x_and_z_coordinates():
+    attention = SpatiotemporalAttention3D(channels=48)
+    tensor = torch.zeros(1, attention.num_heads, 8, attention.head_dim)
+    tensor[..., 0::2] = 1.0
+
+    rotated = attention._apply_3d_rope(tensor, time=2, size_x=2, size_z=2)
+    origin = rotated[0, 0, 0]
+    z_shift = rotated[0, 0, 1]
+    x_shift = rotated[0, 0, 2]
+    t_shift = rotated[0, 0, 4]
+
+    assert not torch.equal(t_shift[0:2], origin[0:2])
+    assert torch.equal(t_shift[2:], origin[2:])
+    assert not torch.equal(x_shift[2:4], origin[2:4])
+    assert torch.equal(x_shift[0:2], origin[0:2])
+    assert torch.equal(x_shift[4:], origin[4:])
+    assert not torch.equal(z_shift[4:6], origin[4:6])
+    assert torch.equal(z_shift[:4], origin[:4])
+
+
+def test_attention_zero_output_projection_starts_as_identity():
+    attention = SpatiotemporalAttention3D(channels=24)
+    x = torch.randn(2, 24, 3, 5, 4)
+
+    with torch.no_grad():
+        y = attention(x)
+
+    assert torch.equal(y, x)
+    assert torch.count_nonzero(attention.out_proj.weight) == 0
+    assert torch.count_nonzero(attention.out_proj.bias) == 0
+
+
+def test_four_level_attention_placement_and_shape():
+    model = UNet3D(
+        in_channels=8,
+        out_channels=4,
+        base_channels=6,
+        channel_mults=(1, 2, 4, 8),
+        use_attention=True,
+    )
+    assert isinstance(model.attention_enc2, SpatiotemporalAttention3D)
+    assert isinstance(model.attention_mid, SpatiotemporalAttention3D)
+
+    x = torch.randn(1, 8, 8, 16, 16)
+    with torch.no_grad():
+        y = model(x)
+    assert tuple(y.shape) == (1, 4, 8, 16, 16)
+
+
+def test_three_level_attention_only_uses_mid_block():
+    model = UNet3D(
+        in_channels=8,
+        out_channels=4,
+        base_channels=6,
+        channel_mults=(1, 2, 4),
+        use_attention=True,
+    )
+    assert model.attention_enc2 is None
+    assert isinstance(model.attention_mid, SpatiotemporalAttention3D)
+
+
+def test_attention_off_keeps_original_state_dict_structure():
+    default_model = UNet3D(base_channels=4, channel_mults=(1, 2, 4))
+    attention_off_model = UNet3D(
+        base_channels=4,
+        channel_mults=(1, 2, 4),
+        use_attention=False,
+    )
+
+    assert default_model.state_dict().keys() == attention_off_model.state_dict().keys()
+    assert not any(
+        key.startswith(("attention_enc2.", "attention_mid."))
+        for key in attention_off_model.state_dict()
+    )
+
+
+def test_zero_initialized_attention_preserves_pretrained_unet_output():
+    attention_off_model = UNet3D(
+        base_channels=6,
+        channel_mults=(1, 2, 4, 8),
+        use_attention=False,
+    ).eval()
+    with torch.no_grad():
+        attention_off_model.out.weight.normal_()
+        attention_off_model.out.bias.normal_()
+
+    attention_on_model = UNet3D(
+        base_channels=6,
+        channel_mults=(1, 2, 4, 8),
+        use_attention=True,
+    ).eval()
+    incompatible = attention_on_model.load_state_dict(
+        attention_off_model.state_dict(),
+        strict=False,
+    )
+    assert not incompatible.unexpected_keys
+    assert all(
+        key.startswith(("attention_enc2.", "attention_mid."))
+        for key in incompatible.missing_keys
+    )
+
+    x = torch.randn(1, 8, 8, 16, 16)
+    with torch.no_grad():
+        attention_off_output = attention_off_model(x)
+        attention_on_output = attention_on_model(x)
+    assert torch.equal(attention_on_output, attention_off_output)

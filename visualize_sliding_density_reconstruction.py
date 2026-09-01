@@ -1974,6 +1974,7 @@ def main() -> None:
         base_channels=base_channels,
         channel_mults=channel_mults,
         architecture=checkpoint_args.get("model_version", LEGACY_MODEL_VERSION),
+        use_attention=bool(checkpoint_args.get("use_attention", False)),
     ).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()

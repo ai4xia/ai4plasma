@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Sequence, Type
+from typing import Sequence, Tuple, Type
 
 import torch
 import torch.nn as nn
@@ -103,6 +103,146 @@ class UpBlock3D(nn.Module):
         return self.conv(x)
 
 
+class SpatiotemporalAttention3D(nn.Module):
+    """Global self-attention over unified (T, X, Z) tokens with axial 3D RoPE."""
+
+    _HEAD_CANDIDATES: Tuple[int, ...] = (8, 6, 4, 3, 2, 1)
+
+    def __init__(
+        self,
+        channels: int,
+        max_heads: int = 8,
+        rope_base: float = 10_000.0,
+    ):
+        super().__init__()
+        self.channels = int(channels)
+        self.num_heads = next(
+            heads
+            for heads in self._HEAD_CANDIDATES
+            if heads <= max_heads and self.channels % heads == 0
+        )
+        self.head_dim = self.channels // self.num_heads
+        self.rotary_dim = (self.head_dim // 6) * 6
+        self.axis_rotary_dim = self.rotary_dim // 3
+        self.rope_base = float(rope_base)
+
+        self.norm = nn.LayerNorm(self.channels)
+        self.qkv = nn.Linear(self.channels, 3 * self.channels)
+        self.out_proj = nn.Linear(self.channels, self.channels)
+
+        # The attention branch starts as an exact zero correction, leaving the
+        # convolutional U-Net identity path unchanged at initialization.
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def _apply_axis_rope(
+        self,
+        tensor: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply RoPE to adjacent pairs in one axis-specific head slice."""
+        axis_dim = tensor.shape[-1]
+        inv_freq = self.rope_base ** (
+            -torch.arange(
+                0,
+                axis_dim,
+                2,
+                device=tensor.device,
+                dtype=torch.float32,
+            )
+            / axis_dim
+        )
+        angles = positions.to(dtype=torch.float32).unsqueeze(-1) * inv_freq
+        cos = angles.cos().to(dtype=tensor.dtype)[None, None]
+        sin = angles.sin().to(dtype=tensor.dtype)[None, None]
+
+        even = tensor[..., 0::2]
+        odd = tensor[..., 1::2]
+        rotated_even = even * cos - odd * sin
+        rotated_odd = even * sin + odd * cos
+        return torch.stack((rotated_even, rotated_odd), dim=-1).flatten(-2)
+
+    def _apply_3d_rope(
+        self,
+        tensor: torch.Tensor,
+        time: int,
+        size_x: int,
+        size_z: int,
+    ) -> torch.Tensor:
+        """Apply separate temporal, X and Z rotations to (B, H, N, D)."""
+        if self.rotary_dim == 0:
+            return tensor
+
+        device = tensor.device
+        t_positions = (
+            torch.arange(time, device=device)
+            .view(time, 1, 1)
+            .expand(time, size_x, size_z)
+            .reshape(-1)
+        )
+        x_positions = (
+            torch.arange(size_x, device=device)
+            .view(1, size_x, 1)
+            .expand(time, size_x, size_z)
+            .reshape(-1)
+        )
+        z_positions = (
+            torch.arange(size_z, device=device)
+            .view(1, 1, size_z)
+            .expand(time, size_x, size_z)
+            .reshape(-1)
+        )
+
+        axis_dim = self.axis_rotary_dim
+        temporal = self._apply_axis_rope(tensor[..., :axis_dim], t_positions)
+        spatial_x = self._apply_axis_rope(
+            tensor[..., axis_dim : 2 * axis_dim],
+            x_positions,
+        )
+        spatial_z = self._apply_axis_rope(
+            tensor[..., 2 * axis_dim : 3 * axis_dim],
+            z_positions,
+        )
+        return torch.cat(
+            (temporal, spatial_x, spatial_z, tensor[..., self.rotary_dim :]),
+            dim=-1,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, channels, time, size_x, size_z = x.shape
+        if channels != self.channels:
+            raise ValueError(
+                f"Expected {self.channels} attention channels, got {channels}."
+            )
+
+        tokens = x.permute(0, 2, 3, 4, 1).reshape(batch, -1, channels)
+        normalized = self.norm(tokens)
+        qkv = self.qkv(normalized).reshape(
+            batch,
+            tokens.shape[1],
+            3,
+            self.num_heads,
+            self.head_dim,
+        )
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        q = self._apply_3d_rope(q, time, size_x, size_z)
+        k = self._apply_3d_rope(k, time, size_x, size_z)
+
+        attended = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            is_causal=False,
+        )
+        attended = attended.transpose(1, 2).reshape(batch, -1, channels)
+        correction = self.out_proj(attended)
+        output = tokens + correction
+        return output.reshape(batch, time, size_x, size_z, channels).permute(
+            0, 4, 1, 2, 3
+        )
+
+
 class UNet3D(nn.Module):
     """
     Lightweight 3D U-Net.
@@ -121,6 +261,7 @@ class UNet3D(nn.Module):
         base_channels: int = 24,
         channel_mults: Sequence[int] = (1, 2, 4, 8),
         architecture: str = MODEL_VERSION,
+        use_attention: bool = False,
     ):
         super().__init__()
 
@@ -136,6 +277,7 @@ class UNet3D(nn.Module):
         self.num_levels = len(channels)
         self.out_channels = int(out_channels)
         self.architecture = architecture
+        self.use_attention = bool(use_attention)
 
         if architecture == MODEL_VERSION:
             block_cls = ResidualConvBlock3D
@@ -167,6 +309,20 @@ class UNet3D(nn.Module):
         self.up1 = UpBlock3D(c2, c1, c1, block_cls)
         self.up0 = UpBlock3D(c1, c0, c0, block_cls)
 
+        # Do not instantiate these modules when attention is disabled, so old
+        # checkpoint state_dict keys remain exactly compatible.
+        self.attention_enc2 = (
+            SpatiotemporalAttention3D(c2)
+            if self.use_attention and self.num_levels == 4
+            else None
+        )
+        mid_channels = channels[-1]
+        self.attention_mid = (
+            SpatiotemporalAttention3D(mid_channels)
+            if self.use_attention
+            else None
+        )
+
         self.out = nn.Conv3d(c0, out_channels, kernel_size=1)
         if self.residual_output:
             # Start from identity on visible normalized fields and zero (the
@@ -182,10 +338,14 @@ class UNet3D(nn.Module):
         x = self.enc2(s1)
 
         if self.num_levels == 4:
+            if self.attention_enc2 is not None:
+                x = self.attention_enc2(x)
             s2 = x
             x = self.enc3(s2)
 
         x = self.mid(x)
+        if self.attention_mid is not None:
+            x = self.attention_mid(x)
 
         if self.num_levels == 4:
             x = self.up2(x, s2)

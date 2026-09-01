@@ -129,6 +129,14 @@ def parse_args():
             "three-level checkpoints."
         ),
     )
+    p.add_argument(
+        "--use-attention",
+        action="store_true",
+        help=(
+            "Enable unified spatiotemporal self-attention with 3D RoPE at "
+            "the low-resolution enc2 and bottleneck feature maps."
+        ),
+    )
 
     p.add_argument(
         "--mask-patterns",
@@ -460,6 +468,7 @@ RESUME_PARAMETER_KEYS = (
     "density_probe_max",
     "base_channels",
     "channel_mults",
+    "use_attention",
     "val_frac",
     "seed",
     "stats_batches",
@@ -480,7 +489,12 @@ def validate_resume_parameters(args, checkpoint_args: Dict[str, Any]) -> None:
 
     mismatches = []
     for key in RESUME_PARAMETER_KEYS:
-        old_value = checkpoint_args.get(key)
+        if key == "use_attention":
+            # Checkpoints created before the optional attention extension are
+            # exactly the attention-disabled architecture.
+            old_value = bool(checkpoint_args.get(key, False))
+        else:
+            old_value = checkpoint_args.get(key)
         new_value = getattr(args, key)
         if old_value != new_value:
             mismatches.append(f"{key}: checkpoint={old_value!r}, current={new_value!r}")
@@ -1146,6 +1160,7 @@ def main():
         base_channels=args.base_channels,
         channel_mults=args.channel_mults,
         architecture=args.model_version,
+        use_attention=args.use_attention,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -1165,8 +1180,46 @@ def main():
         start_epoch = int(resume_checkpoint["epoch"]) + 1
         best_val_mse = float(resume_checkpoint.get("best_val_mse", float("inf")))
     elif init_checkpoint is not None:
-        model.load_state_dict(init_checkpoint["model"])
-        optimizer.load_state_dict(init_checkpoint["optimizer"])
+        source_uses_attention = bool(
+            init_checkpoint.get("args", {}).get("use_attention", False)
+        )
+        if source_uses_attention == args.use_attention:
+            model.load_state_dict(init_checkpoint["model"])
+            optimizer.load_state_dict(init_checkpoint["optimizer"])
+        else:
+            source_state = init_checkpoint["model"]
+            if args.use_attention:
+                incompatible = model.load_state_dict(source_state, strict=False)
+                invalid_missing = [
+                    key
+                    for key in incompatible.missing_keys
+                    if not key.startswith(("attention_enc2.", "attention_mid."))
+                ]
+                invalid_unexpected = list(incompatible.unexpected_keys)
+            else:
+                convolutional_state = {
+                    key: value
+                    for key, value in source_state.items()
+                    if not key.startswith(("attention_enc2.", "attention_mid."))
+                }
+                incompatible = model.load_state_dict(
+                    convolutional_state,
+                    strict=False,
+                )
+                invalid_missing = list(incompatible.missing_keys)
+                invalid_unexpected = list(incompatible.unexpected_keys)
+
+            if invalid_missing or invalid_unexpected:
+                raise RuntimeError(
+                    "Initialization checkpoint is incompatible beyond its "
+                    "attention setting: "
+                    f"missing={invalid_missing}, unexpected={invalid_unexpected}"
+                )
+            rank_print(
+                "Attention setting differs from the initialization checkpoint; "
+                "loaded compatible convolutional weights and started a fresh "
+                "optimizer state."
+            )
 
     if distributed_is_initialized():
         model = DistributedDataParallel(

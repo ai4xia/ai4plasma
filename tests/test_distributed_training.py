@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from train_masked_unet3d import (  # noqa: E402
     DistributedEvalSampler,
+    RESUME_PARAMETER_KEYS,
     learning_rate_for_epoch,
     sample_mixed_magnetic_visible_counts,
     sample_mixed_density_probe_counts,
+    validate_resume_parameters,
 )
 
 
@@ -114,3 +117,23 @@ def test_probe_patterns_use_half_full_half_random_magnetic_counts():
         assert 0.46 < full_share < 0.54
         assert 0.72 < mean_visible_fraction < 0.78
         assert any(count < spatial_sites for count in pattern_counts)
+
+
+def test_old_resume_args_default_to_attention_off():
+    values = {key: None for key in RESUME_PARAMETER_KEYS}
+    values["mask_pattern_weights"] = {"temporal_random": 1.0}
+    values["use_attention"] = False
+    args = SimpleNamespace(**values)
+    old_checkpoint_args = {
+        key: value for key, value in values.items() if key != "use_attention"
+    }
+
+    validate_resume_parameters(args, old_checkpoint_args)
+
+    args.use_attention = True
+    try:
+        validate_resume_parameters(args, old_checkpoint_args)
+    except ValueError as exc:
+        assert "use_attention" in str(exc)
+    else:
+        raise AssertionError("Expected attention mismatch to block auto-resume")
