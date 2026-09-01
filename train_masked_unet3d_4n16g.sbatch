@@ -63,7 +63,7 @@ PY
 H5_DIR=/pscratch/sd/b/binxia/VPIC_PPPL_HDF5_by_beta_official2500_none_compat
 SOURCE_RUN_NAME=masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine1500_v9_balancedloss
 INIT_CHECKPOINT=runs/${SOURCE_RUN_NAME}/latest.pt
-RUN_NAME=masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine1500_v10_temporalboundary_attention
+RUN_NAME=masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine1500_v11_temporalboundary_attention_spatialpool
 
 BETAS=(0.2)
 DELTA_T=24
@@ -117,6 +117,7 @@ TRAIN_ARGS=(
     --base-channels "${BASE_CHANNELS}"
     --channel-mults "${CHANNEL_MULTS[@]}"
     --use-attention
+    --spatial-only-pooling
     --amp
     --mask-patterns "${MASK_PATTERNS[@]}"
     --init-checkpoint "${INIT_CHECKPOINT}"
@@ -135,6 +136,7 @@ echo "DDP world size: ${WORLD_SIZE}"
 echo "Per-GPU batch size: ${BATCH_SIZE}"
 echo "Global batch size: $((BATCH_SIZE * WORLD_SIZE))"
 echo "Unified spatiotemporal attention: enabled"
+echo "Spatial-only pooling: enabled"
 echo "Master: ${MASTER_ADDR}:${MASTER_PORT}"
 echo "Output dir: ${OUT_DIR}"
 echo "Log: ${LOG}"

@@ -10,6 +10,7 @@ from train_masked_unet3d import (  # noqa: E402
     DistributedEvalSampler,
     RESUME_PARAMETER_KEYS,
     learning_rate_for_epoch,
+    parse_args,
     sample_mixed_magnetic_visible_counts,
     sample_mixed_density_probe_counts,
     validate_resume_parameters,
@@ -119,13 +120,28 @@ def test_probe_patterns_use_half_full_half_random_magnetic_counts():
         assert any(count < spatial_sites for count in pattern_counts)
 
 
-def test_old_resume_args_default_to_attention_off():
+def test_spatial_only_pooling_cli_defaults_off_and_flag_enables(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["train_masked_unet3d.py"])
+    assert parse_args().spatial_only_pooling is False
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["train_masked_unet3d.py", "--spatial-only-pooling"],
+    )
+    assert parse_args().spatial_only_pooling is True
+
+
+def test_old_resume_args_default_to_optional_architecture_features_off():
     values = {key: None for key in RESUME_PARAMETER_KEYS}
     values["mask_pattern_weights"] = {"temporal_random": 1.0}
     values["use_attention"] = False
+    values["spatial_only_pooling"] = False
     args = SimpleNamespace(**values)
     old_checkpoint_args = {
-        key: value for key, value in values.items() if key != "use_attention"
+        key: value
+        for key, value in values.items()
+        if key not in {"use_attention", "spatial_only_pooling"}
     }
 
     validate_resume_parameters(args, old_checkpoint_args)
@@ -137,3 +153,12 @@ def test_old_resume_args_default_to_attention_off():
         assert "use_attention" in str(exc)
     else:
         raise AssertionError("Expected attention mismatch to block auto-resume")
+
+    args.use_attention = False
+    args.spatial_only_pooling = True
+    try:
+        validate_resume_parameters(args, old_checkpoint_args)
+    except ValueError as exc:
+        assert "spatial_only_pooling" in str(exc)
+    else:
+        raise AssertionError("Expected pooling mismatch to block auto-resume")

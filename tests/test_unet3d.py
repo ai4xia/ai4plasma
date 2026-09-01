@@ -16,6 +16,73 @@ from models.unet3d import (  # noqa: E402
 )
 
 
+def _full_resolution_shape(
+    *,
+    use_attention: bool,
+    spatial_only_pooling: bool,
+):
+    model = UNet3D(
+        in_channels=8,
+        out_channels=4,
+        base_channels=24,
+        channel_mults=(1, 2, 4, 8),
+        use_attention=use_attention,
+        spatial_only_pooling=spatial_only_pooling,
+    ).to("meta")
+    x = torch.empty(1, 8, 24, 154, 62, device="meta")
+    return model, model(x)
+
+
+def test_full_resolution_attention_off_old_pooling_preserves_shape():
+    _, y = _full_resolution_shape(
+        use_attention=False,
+        spatial_only_pooling=False,
+    )
+    assert tuple(y.shape) == (1, 4, 24, 154, 62)
+
+
+def test_full_resolution_attention_on_old_pooling_preserves_shape():
+    _, y = _full_resolution_shape(
+        use_attention=True,
+        spatial_only_pooling=False,
+    )
+    assert tuple(y.shape) == (1, 4, 24, 154, 62)
+
+
+def test_full_resolution_attention_on_spatial_pooling_preserves_time_and_shape():
+    model = UNet3D(
+        in_channels=8,
+        out_channels=4,
+        base_channels=24,
+        channel_mults=(1, 2, 4, 8),
+        use_attention=True,
+        spatial_only_pooling=True,
+    ).to("meta")
+    encoder_shapes = {}
+    handles = []
+    for name in ("enc0", "enc1", "enc2", "enc3"):
+        handles.append(
+            getattr(model, name).register_forward_hook(
+                lambda _module, _inputs, output, name=name: encoder_shapes.__setitem__(
+                    name, tuple(output.shape[2:])
+                )
+            )
+        )
+
+    x = torch.empty(1, 8, 24, 154, 62, device="meta")
+    y = model(x)
+    for handle in handles:
+        handle.remove()
+
+    assert tuple(y.shape) == (1, 4, 24, 154, 62)
+    assert encoder_shapes == {
+        "enc0": (24, 154, 62),
+        "enc1": (24, 77, 31),
+        "enc2": (24, 38, 15),
+        "enc3": (24, 19, 7),
+    }
+
+
 def test_four_level_unet_preserves_shape():
     model = UNet3D(
         in_channels=8,
@@ -180,6 +247,32 @@ def test_attention_off_keeps_original_state_dict_structure():
         key.startswith(("attention_enc2.", "attention_mid."))
         for key in attention_off_model.state_dict()
     )
+
+
+def test_spatial_pooling_keeps_parameter_and_state_dict_structure():
+    old_pooling_model = UNet3D(
+        base_channels=6,
+        channel_mults=(1, 2, 4, 8),
+        use_attention=True,
+        spatial_only_pooling=False,
+    )
+    spatial_pooling_model = UNet3D(
+        base_channels=6,
+        channel_mults=(1, 2, 4, 8),
+        use_attention=True,
+        spatial_only_pooling=True,
+    )
+
+    assert old_pooling_model.enc1.pool.kernel_size == (2, 2, 2)
+    assert spatial_pooling_model.enc1.pool.kernel_size == (1, 2, 2)
+    assert (
+        old_pooling_model.state_dict().keys()
+        == spatial_pooling_model.state_dict().keys()
+    )
+    assert sum(p.numel() for p in old_pooling_model.parameters()) == sum(
+        p.numel() for p in spatial_pooling_model.parameters()
+    )
+    spatial_pooling_model.load_state_dict(old_pooling_model.state_dict())
 
 
 def test_zero_initialized_attention_preserves_pretrained_unet_output():

@@ -71,9 +71,10 @@ class DownBlock3D(nn.Module):
         in_channels: int,
         out_channels: int,
         block_cls: Type[nn.Module] = ConvBlock3D,
+        pooling_kernel: Tuple[int, int, int] = (2, 2, 2),
     ):
         super().__init__()
-        self.pool = nn.MaxPool3d(kernel_size=2)
+        self.pool = nn.MaxPool3d(kernel_size=pooling_kernel)
         self.conv = block_cls(in_channels, out_channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -262,6 +263,7 @@ class UNet3D(nn.Module):
         channel_mults: Sequence[int] = (1, 2, 4, 8),
         architecture: str = MODEL_VERSION,
         use_attention: bool = False,
+        spatial_only_pooling: bool = False,
     ):
         super().__init__()
 
@@ -278,6 +280,7 @@ class UNet3D(nn.Module):
         self.out_channels = int(out_channels)
         self.architecture = architecture
         self.use_attention = bool(use_attention)
+        self.spatial_only_pooling = bool(spatial_only_pooling)
 
         if architecture == MODEL_VERSION:
             block_cls = ResidualConvBlock3D
@@ -294,13 +297,14 @@ class UNet3D(nn.Module):
                 f"out_channels={out_channels}."
             )
 
+        pooling_kernel = (1, 2, 2) if self.spatial_only_pooling else (2, 2, 2)
         self.enc0 = block_cls(in_channels, c0)
-        self.enc1 = DownBlock3D(c0, c1, block_cls)
-        self.enc2 = DownBlock3D(c1, c2, block_cls)
+        self.enc1 = DownBlock3D(c0, c1, block_cls, pooling_kernel)
+        self.enc2 = DownBlock3D(c1, c2, block_cls, pooling_kernel)
 
         if self.num_levels == 4:
             c3 = channels[3]
-            self.enc3 = DownBlock3D(c2, c3, block_cls)
+            self.enc3 = DownBlock3D(c2, c3, block_cls, pooling_kernel)
             self.mid = block_cls(c3, c3)
             self.up2 = UpBlock3D(c3, c2, c2, block_cls)
         else:

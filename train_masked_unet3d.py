@@ -137,6 +137,14 @@ def parse_args():
             "the low-resolution enc2 and bottleneck feature maps."
         ),
     )
+    p.add_argument(
+        "--spatial-only-pooling",
+        action="store_true",
+        help=(
+            "Downsample only X/Z with pooling kernel (1, 2, 2), preserving "
+            "the temporal resolution at every encoder level."
+        ),
+    )
 
     p.add_argument(
         "--mask-patterns",
@@ -469,6 +477,7 @@ RESUME_PARAMETER_KEYS = (
     "base_channels",
     "channel_mults",
     "use_attention",
+    "spatial_only_pooling",
     "val_frac",
     "seed",
     "stats_batches",
@@ -489,9 +498,9 @@ def validate_resume_parameters(args, checkpoint_args: Dict[str, Any]) -> None:
 
     mismatches = []
     for key in RESUME_PARAMETER_KEYS:
-        if key == "use_attention":
-            # Checkpoints created before the optional attention extension are
-            # exactly the attention-disabled architecture.
+        if key in {"use_attention", "spatial_only_pooling"}:
+            # Checkpoints created before either optional architecture extension
+            # use the original attention-off, full-3D-pooling behavior.
             old_value = bool(checkpoint_args.get(key, False))
         else:
             old_value = checkpoint_args.get(key)
@@ -1161,6 +1170,7 @@ def main():
         channel_mults=args.channel_mults,
         architecture=args.model_version,
         use_attention=args.use_attention,
+        spatial_only_pooling=args.spatial_only_pooling,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())

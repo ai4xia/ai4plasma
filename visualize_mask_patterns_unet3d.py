@@ -2185,6 +2185,7 @@ def main():
         channel_mults=channel_mults,
         architecture=ckpt_args.get("model_version", LEGACY_MODEL_VERSION),
         use_attention=bool(ckpt_args.get("use_attention", False)),
+        spatial_only_pooling=bool(ckpt_args.get("spatial_only_pooling", False)),
     ).to(device)
 
     model.load_state_dict(ckpt["model"])
