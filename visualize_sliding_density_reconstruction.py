@@ -67,8 +67,8 @@ def save_framewise_error_plot(
     for ax in axes:
         ax.grid(alpha=0.25)
         ax.legend(fontsize=8, ncol=2)
-    fig.suptitle(title)
-    fig.tight_layout()
+    fig.suptitle(title, y=0.98)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
     fig.savefig(out_path, dpi=180)
     plt.close(fig)
     print(f"Saved framewise error plot: {out_path}")
@@ -1158,10 +1158,13 @@ def plot_progress_frame(
     magnetic_label: str = "B fully observed",
 ) -> None:
     n_rows = len(results)
+    title_inches = 0.90
+    bottom_inches = 0.55
+    fig_h = 3.35 * n_rows + title_inches + bottom_inches
     fig, axes = plt.subplots(
         n_rows,
         3,
-        figsize=(14.0, 3.35 * n_rows + 1.7),
+        figsize=(14.0, fig_h),
         sharex=True,
         sharey=True,
         constrained_layout=False,
@@ -1241,11 +1244,11 @@ def plot_progress_frame(
         axes[0, column].set_title(title, fontsize=11)
         axes[-1, column].set_xlabel("time slice", fontsize=10)
 
-    axes_top = 0.83 if n_rows == 1 else 0.91
+    axes_top = 1.0 - title_inches / fig_h
     fig.subplots_adjust(
         left=0.10,
         right=0.90,
-        bottom=0.07,
+        bottom=bottom_inches / fig_h,
         top=axes_top,
         wspace=0.08,
         hspace=0.12,
@@ -1269,7 +1272,7 @@ def plot_progress_frame(
         f"{int(frame_ids[min(covered_end, len(frame_ids)) - 1])}"
         f"{outline_text}",
         fontsize=12,
-        y=0.985,
+        y=0.99,
     )
     fig.savefig(out_path, dpi=dpi)
     plt.close(fig)
@@ -1297,10 +1300,13 @@ def plot_bidirectional_refinement_figure(
 ) -> None:
     """Plot final states after alternating bidirectional reconstruction sweeps."""
     n_rows = len(rows)
+    title_inches = 1.05
+    bottom_inches = 0.50
+    fig_h = 3.15 * n_rows + title_inches + bottom_inches
     fig, axes = plt.subplots(
         n_rows,
         3,
-        figsize=(14.0, 3.15 * n_rows + 1.8),
+        figsize=(14.0, fig_h),
         sharex=True,
         sharey=True,
         constrained_layout=False,
@@ -1436,8 +1442,8 @@ def plot_bidirectional_refinement_figure(
     fig.subplots_adjust(
         left=0.115,
         right=0.90,
-        bottom=0.055,
-        top=0.92,
+        bottom=bottom_inches / fig_h,
+        top=1.0 - title_inches / fig_h,
         wspace=0.08,
         hspace=0.12,
     )
@@ -1463,7 +1469,7 @@ def plot_bidirectional_refinement_figure(
         f"{magnetic_label}, {projection_label}; raw predictions include probes"
         f"{progress_text}{outline_text}",
         fontsize=12,
-        y=0.985,
+        y=0.99,
     )
     fig.savefig(out_path, dpi=dpi)
     plt.close(fig)

@@ -67,8 +67,8 @@ def save_information_suite_error_plot(
     for ax in axes:
         ax.grid(alpha=0.25)
         ax.legend(fontsize=8, ncol=2)
-    fig.suptitle(title)
-    fig.tight_layout()
+    fig.suptitle(title, y=0.98)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
     fig.savefig(out_path, dpi=180)
     plt.close(fig)
     print(f"Saved framewise error plot: {out_path}")
@@ -1283,14 +1283,15 @@ def save_validation_statistics_plot(
     run_count = len(row_statistics[0]["density"]["run_names"])
     fig.suptitle(
         f"{experiment_name}: validation-run median and 16th-84th percentile\n"
-        f"{run_count} runs, {total_windows} windows; windows median-combined per run"
+        f"{run_count} runs, {total_windows} windows; windows median-combined per run",
+        y=0.98,
     )
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(
         handles,
         labels,
         loc="upper center",
-        bbox_to_anchor=(0.5, 0.88),
+        bbox_to_anchor=(0.5, 0.935),
         ncol=min(4, len(labels)),
         fontsize=8,
         frameon=False,
@@ -1299,7 +1300,7 @@ def save_validation_statistics_plot(
         left=0.10,
         right=0.985,
         bottom=0.09,
-        top=0.79,
+        top=0.86,
         hspace=0.12,
     )
     fig.savefig(out_path, dpi=180)
@@ -1495,8 +1496,13 @@ def add_inplane_quiver(
 
 def _make_comparison_axes(n_rows: int):
     """Create Target | Visible/mask | Prediction | Residual comparison axes."""
+    # Keep a nearly fixed title band in inches so extra rows do not open a
+    # growing gap between the suptitle and the first row of panels.
+    title_inches = 0.70
+    bottom_inches = 0.52
+    fig_h = 4.55 * n_rows + title_inches + bottom_inches
     fig = plt.figure(
-        figsize=(13.0, 5 * n_rows + 2),
+        figsize=(13.0, fig_h),
         constrained_layout=False,
     )
     gs = gridspec.GridSpec(
@@ -1508,8 +1514,8 @@ def _make_comparison_axes(n_rows: int):
         hspace=0.075,
         left=0.16,
         right=0.965,
-        bottom=0.075,
-        top=0.90,
+        bottom=bottom_inches / fig_h,
+        top=1.0 - title_inches / fig_h,
     )
 
     axes = np.empty((n_rows, 4), dtype=object)
