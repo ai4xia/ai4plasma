@@ -22,18 +22,16 @@ MASK_PATTERNS: Tuple[str, ...] = (
 # Increment this whenever the training-time meaning of a mask changes. It is
 # stored in checkpoints so auto-resume cannot silently mix incompatible mask
 # distributions in one run.
-MASKING_VERSION = "independentBD_fiveMask_orientedTemporalBlock_v7"
+MASKING_VERSION = "independentBD_fiveMask_logUniformCounts_v8"
 
 PATTERN_TO_ID: Dict[str, int] = {name: i for i, name in enumerate(MASK_PATTERNS)}
 
-# Bx, By and Bz always share one observation layout. During training/validation,
-# the exact-count path samples their common magnetic layout independently of
-# Density for spatial_grid and spatial_random. Density is near-regular for
-# spatial_grid and uniformly random without replacement for spatial_random. The
-# legacy shared-pattern API remains available to visualization and controlled
-# validation callers. Training uses sample_independent_batch_masks so B and
-# Density also choose their pattern and severity independently. Spatial layouts
-# remain fixed throughout a window.
+# Bx, By and Bz always share one observation layout. Training samples B and
+# Density independently: probe patterns use a 0 / log-uniform / full mixture
+# of exact visible counts, spatial_block keeps a Uniform(0, 1) area fraction,
+# and temporal patterns draw a uniform visible-frame count. The legacy shared-
+# pattern API remains available to visualization and controlled validation.
+# Spatial layouts remain fixed throughout a window.
 SPATIAL_MASK_PATTERNS: Tuple[str, ...] = (
     "spatial_random",
     "spatial_grid",
@@ -145,6 +143,98 @@ def sample_patterns(
     probs = torch.tensor([weights[name] for name in names], dtype=torch.float32)
     idx = torch.multinomial(probs, n, replacement=True, generator=generator)
     return [names[i] for i in idx.tolist()]
+
+
+PROBE_COUNT_PATTERNS: Tuple[str, ...] = ("spatial_random", "spatial_grid")
+UNIFORM_FRAME_COUNT_PATTERNS: Tuple[str, ...] = (
+    "temporal_random",
+    "temporal_block",
+)
+
+
+def _validate_endpoint_probabilities(p_zero: float, p_full: float) -> None:
+    if not (0.0 <= p_zero <= 1.0 and 0.0 <= p_full <= 1.0):
+        raise ValueError(
+            "Endpoint probabilities must lie in [0, 1], got "
+            f"p_zero={p_zero} and p_full={p_full}."
+        )
+    if p_zero + p_full > 1.0:
+        raise ValueError(
+            "p_zero + p_full must be <= 1, got "
+            f"{p_zero} + {p_full} = {p_zero + p_full}."
+        )
+
+
+def sample_endpoint_log_uniform_count(
+    n_max: int,
+    p_zero: float,
+    p_full: float,
+    generator: Optional[torch.Generator] = None,
+) -> int:
+    """Draw 0, a log-uniform interior count, or n_max."""
+    n_max = int(n_max)
+    if n_max < 1:
+        raise ValueError(f"n_max must be >= 1, got {n_max}.")
+    _validate_endpoint_probabilities(p_zero, p_full)
+
+    u = _rand(generator)
+    if u < p_zero:
+        return 0
+    if u < p_zero + p_full:
+        return n_max
+    if n_max == 1:
+        return n_max
+    return _round_clamp(
+        _log_uniform(1.0, float(n_max - 1), generator), 1, n_max - 1
+    )
+
+
+def sample_training_severity_counts(
+    patterns: Sequence[str],
+    *,
+    spatial_sites: int,
+    time_steps: int,
+    p_zero: float,
+    p_full: float,
+    generator: Optional[torch.Generator] = None,
+) -> List[Optional[int]]:
+    """Draw training-time visible counts for one modality.
+
+    Probe patterns use the 0 / log-uniform / full mixture. Temporal patterns
+    draw a uniform visible-frame count in [0, T]. spatial_block keeps its
+    Uniform(0, 1) area fraction and therefore returns None.
+    """
+    _validate_endpoint_probabilities(p_zero, p_full)
+    spatial_sites = int(spatial_sites)
+    time_steps = int(time_steps)
+    if spatial_sites < 1:
+        raise ValueError(f"spatial_sites must be >= 1, got {spatial_sites}.")
+    if time_steps < 1:
+        raise ValueError(f"time_steps must be >= 1, got {time_steps}.")
+
+    counts: List[Optional[int]] = []
+    for pattern in patterns:
+        if pattern not in MASK_PATTERNS:
+            raise ValueError(
+                f"Unknown mask pattern {pattern!r}. Available: {list(MASK_PATTERNS)}"
+            )
+        if pattern in PROBE_COUNT_PATTERNS:
+            counts.append(
+                sample_endpoint_log_uniform_count(
+                    spatial_sites, p_zero, p_full, generator
+                )
+            )
+        elif pattern in UNIFORM_FRAME_COUNT_PATTERNS:
+            counts.append(
+                int(
+                    torch.randint(
+                        0, time_steps + 1, (1,), generator=generator
+                    ).item()
+                )
+            )
+        else:
+            counts.append(None)
+    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -326,13 +416,20 @@ def _spatial_block_plane(B, C, X, Z, p, generator):
     return plane, info
 
 
-def _temporal_random_frames(T, p, generator):
+def _temporal_random_frames(T, p, generator, n_visible=None):
     """
     Keep a random subset of frames. The whole spatial field is observed on a
     visible frame and fully hidden otherwise. The visible frames can be
     scattered, contiguous, or anything in between.
     """
-    n_visible = _round_clamp((1.0 - p) * T, 0, T)
+    if n_visible is None:
+        n_visible = _round_clamp((1.0 - p) * T, 0, T)
+    else:
+        n_visible = int(n_visible)
+        if not (0 <= n_visible <= T):
+            raise ValueError(
+                f"n_visible must lie in [0, {T}], got {n_visible}."
+            )
 
     visible = torch.randperm(T, generator=generator)[:n_visible]
     visible, _ = torch.sort(visible)
@@ -393,6 +490,29 @@ def _temporal_block_frames(T, generator):
     )
 
 
+def _temporal_block_from_visible_count(T, n_visible, generator):
+    """Build an oriented contiguous block with an exact visible-frame count."""
+    n_visible = int(n_visible)
+    if not (0 <= n_visible <= T):
+        raise ValueError(f"n_visible must lie in [0, {T}], got {n_visible}.")
+
+    if n_visible == 0:
+        return _temporal_block_from_boundaries(T, 0, T)
+    if n_visible == T:
+        return _temporal_block_from_boundaries(T, T, 0)
+
+    # Both orientations can realize any interior count. inside_masked hides a
+    # contiguous block of T - n_visible frames; inside_visible keeps a
+    # contiguous block of n_visible frames.
+    if _rand(generator) < 0.5:
+        hidden = T - n_visible
+        start = int(torch.randint(0, T - hidden + 1, (1,), generator=generator).item())
+        return _temporal_block_from_boundaries(T, start, start + hidden)
+
+    end = int(torch.randint(0, T - n_visible + 1, (1,), generator=generator).item())
+    return _temporal_block_from_boundaries(T, end + n_visible, end)
+
+
 def _sample_modality_mask(
     *,
     modality: str,
@@ -420,9 +540,13 @@ def _sample_modality_mask(
     if pattern == "spatial_block":
         return _spatial_block_plane(1, 1, X, Z, p, generator)
     if pattern == "temporal_random":
-        return _temporal_random_frames(T, p, generator)
+        return _temporal_random_frames(
+            T, p, generator, n_visible=visible_count
+        )
     if pattern == "temporal_block":
-        return _temporal_block_frames(T, generator)
+        if visible_count is None:
+            return _temporal_block_frames(T, generator)
+        return _temporal_block_from_visible_count(T, visible_count, generator)
     raise ValueError(f"Unhandled mask pattern {pattern!r}")
 
 

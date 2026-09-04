@@ -68,7 +68,7 @@ def save_framewise_error_plot(
         ax.grid(alpha=0.25)
         ax.legend(fontsize=8, ncol=2)
     fig.suptitle(title, y=0.98)
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
     fig.savefig(out_path, dpi=180)
     plt.close(fig)
     print(f"Saved framewise error plot: {out_path}")
@@ -1244,7 +1244,7 @@ def plot_progress_frame(
         axes[0, column].set_title(title, fontsize=11)
         axes[-1, column].set_xlabel("time slice", fontsize=10)
 
-    axes_top = 1.0 - title_inches / fig_h
+    axes_top = 1.0 - title_inches / fig_h - 0.02
     fig.subplots_adjust(
         left=0.10,
         right=0.90,
@@ -1443,7 +1443,7 @@ def plot_bidirectional_refinement_figure(
         left=0.115,
         right=0.90,
         bottom=bottom_inches / fig_h,
-        top=1.0 - title_inches / fig_h,
+        top=1.0 - title_inches / fig_h - 0.03,
         wspace=0.08,
         hspace=0.12,
     )

@@ -15,11 +15,14 @@ from data.masking import (  # noqa: E402
     SPATIAL_MASK_PATTERNS,
     TEMPORAL_MASK_PATTERNS,
     _temporal_block_from_boundaries,
+    _temporal_block_from_visible_count,
     parse_pattern_weights,
     sample_batch_masks,
+    sample_endpoint_log_uniform_count,
     sample_independent_batch_masks,
     sample_mask,
     sample_patterns,
+    sample_training_severity_counts,
 )
 
 
@@ -458,6 +461,199 @@ def test_sample_patterns_follows_weights():
 def test_default_weights_cover_every_pattern():
     assert set(DEFAULT_PATTERN_WEIGHTS) == set(MASK_PATTERNS)
     assert all(w > 0 for w in DEFAULT_PATTERN_WEIGHTS.values())
+
+
+def test_endpoint_log_uniform_count_hits_zero_middle_and_full():
+    n_max = 64
+    counts = [
+        sample_endpoint_log_uniform_count(
+            n_max, 0.2, 0.3, generator=make_generator(11 + i)
+        )
+        for i in range(4000)
+    ]
+
+    assert 0 in counts
+    assert n_max in counts
+    assert any(1 <= count <= n_max - 1 for count in counts)
+    assert all(0 <= count <= n_max for count in counts)
+
+    zero_share = counts.count(0) / len(counts)
+    full_share = counts.count(n_max) / len(counts)
+    assert 0.17 < zero_share < 0.23
+    assert 0.27 < full_share < 0.33
+
+
+def test_interior_counts_are_log_uniform_not_linear():
+    n_max = 1000
+    interior = [
+        sample_endpoint_log_uniform_count(
+            n_max, 0.0, 0.0, generator=make_generator(20_000 + i)
+        )
+        for i in range(8000)
+    ]
+
+    assert min(interior) >= 1
+    assert max(interior) <= n_max - 1
+    assert 0 not in interior
+    assert n_max not in interior
+
+    share_le_32 = sum(count <= 32 for count in interior) / len(interior)
+    # log-uniform on [1, 999] has P(N <= 32) ~ log(32)/log(999) ~ 0.50;
+    # linear uniform would be only ~0.03.
+    assert 0.42 < share_le_32 < 0.58
+
+    median = sorted(interior)[len(interior) // 2]
+    geometric_mean = int(round((n_max - 1) ** 0.5))
+    assert median < 4 * geometric_mean
+    assert median < n_max / 8
+
+
+def test_training_severity_counts_use_independent_endpoint_probabilities():
+    patterns = ["spatial_random", "spatial_grid"] * 3000
+    spatial_sites = 128
+    density = sample_training_severity_counts(
+        patterns,
+        spatial_sites=spatial_sites,
+        time_steps=24,
+        p_zero=0.15,
+        p_full=0.10,
+        generator=make_generator(31),
+    )
+    magnetic = sample_training_severity_counts(
+        patterns,
+        spatial_sites=spatial_sites,
+        time_steps=24,
+        p_zero=0.10,
+        p_full=0.30,
+        generator=make_generator(32),
+    )
+
+    density_zero = sum(count == 0 for count in density) / len(density)
+    density_full = sum(count == spatial_sites for count in density) / len(density)
+    magnetic_zero = sum(count == 0 for count in magnetic) / len(magnetic)
+    magnetic_full = sum(count == spatial_sites for count in magnetic) / len(
+        magnetic
+    )
+
+    assert 0.12 < density_zero < 0.18
+    assert 0.07 < density_full < 0.13
+    assert 0.07 < magnetic_zero < 0.13
+    assert 0.27 < magnetic_full < 0.33
+    assert density_full < magnetic_full
+    assert magnetic_zero < density_zero
+
+
+def test_training_severity_keeps_block_and_temporal_count_semantics():
+    patterns = [
+        "spatial_block",
+        "temporal_random",
+        "temporal_block",
+    ] * 2000
+    time_steps = 12
+    counts = sample_training_severity_counts(
+        patterns,
+        spatial_sites=64,
+        time_steps=time_steps,
+        p_zero=0.4,
+        p_full=0.4,
+        generator=make_generator(41),
+    )
+
+    spatial_block_counts = [
+        count
+        for pattern, count in zip(patterns, counts)
+        if pattern == "spatial_block"
+    ]
+    temporal_counts = [
+        count
+        for pattern, count in zip(patterns, counts)
+        if pattern in {"temporal_random", "temporal_block"}
+    ]
+
+    assert all(count is None for count in spatial_block_counts)
+    assert all(0 <= count <= time_steps for count in temporal_counts)
+    assert set(temporal_counts) == set(range(time_steps + 1))
+    mean_frames = sum(temporal_counts) / len(temporal_counts)
+    assert abs(mean_frames - time_steps / 2) < 0.3
+
+
+def test_shared_spatial_block_and_temporal_block_paths_are_unchanged():
+    # Validation/visualization still ignore the requested fraction for
+    # temporal_block and still hide one rectangle for spatial_block.
+    a, info_a = sample_mask(
+        SHAPE, "temporal_block", 0.1, generator=make_generator(7)
+    )
+    b, info_b = sample_mask(
+        SHAPE, "temporal_block", 0.9, generator=make_generator(7)
+    )
+    assert torch.equal(a, b)
+    assert info_a["orientation"] == info_b["orientation"]
+    assert info_a["start"] == info_b["start"]
+    assert info_a["end"] == info_b["end"]
+    assert info_a["temporal_mode"] == "oriented_block"
+
+    mask, info = sample_mask(
+        SHAPE, "spatial_block", 0.35, generator=make_generator(5)
+    )
+    hidden = mask[0, 0, 0] < 0.5
+    ys, xs = torch.where(hidden)
+    assert hidden.sum() == info["rect_height"] * info["rect_width"]
+    assert int(ys.min()) == info["rect_x0"]
+    assert int(xs.min()) == info["rect_z0"]
+    assert int(ys.max()) == info["rect_x0"] + info["rect_height"] - 1
+    assert int(xs.max()) == info["rect_z0"] + info["rect_width"] - 1
+
+
+def test_training_temporal_block_from_visible_count_stays_oriented():
+    tmask, info = _temporal_block_from_visible_count(
+        16, 5, generator=make_generator(51)
+    )
+    assert info["temporal_mode"] == "oriented_block"
+    assert info["num_visible_frames"] == 5
+    frames = tmask[0, 0, :, 0, 0]
+    transitions = int(torch.count_nonzero(frames[1:] != frames[:-1]))
+    assert transitions in {1, 2}
+
+    empty, empty_info = _temporal_block_from_visible_count(
+        16, 0, generator=make_generator(52)
+    )
+    assert float(empty.mean()) == 0.0
+    assert empty_info["num_visible_frames"] == 0
+
+    full, full_info = _temporal_block_from_visible_count(
+        16, 16, generator=make_generator(53)
+    )
+    assert float(full.mean()) == 1.0
+    assert full_info["num_visible_frames"] == 16
+
+
+def test_independent_masks_honor_training_temporal_visible_counts():
+    mask, infos = sample_independent_batch_masks(
+        (1, 4, 8, 10, 6),
+        magnetic_patterns=["temporal_random"],
+        density_patterns=["temporal_block"],
+        magnetic_mask_fractions=[0.5],
+        density_mask_fractions=[0.5],
+        density_probe_counts=[3],
+        magnetic_visible_counts=[5],
+        generator=make_generator(60),
+    )
+
+    assert infos[0]["magnetic_num_visible_frames"] == 5
+    assert infos[0]["magnetic_temporal_direction"] == "scattered"
+    assert infos[0]["density_num_visible_frames"] == 3
+    assert infos[0]["density_temporal_mode"] == "oriented_block"
+    assert int(mask[0, 0, :, 0, 0].sum()) == 5
+    assert int(mask[0, 3, :, 0, 0].sum()) == 3
+
+
+def test_endpoint_probabilities_are_validated():
+    try:
+        sample_endpoint_log_uniform_count(16, 0.7, 0.4)
+    except ValueError as exc:
+        assert "p_zero + p_full" in str(exc)
+    else:
+        raise AssertionError("Expected invalid endpoint probabilities to fail")
 
 
 if __name__ == "__main__":

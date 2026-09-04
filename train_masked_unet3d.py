@@ -9,7 +9,7 @@ import math
 import os
 import random
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -25,6 +25,7 @@ from data.masking import (
     MASKING_VERSION,
     MASK_PATTERNS,
     PATTERN_TO_ID,
+    PROBE_COUNT_PATTERNS,
     full_mae_loss,
     full_mse_loss,
     make_visible_input,
@@ -32,6 +33,7 @@ from data.masking import (
     sample_batch_masks,
     sample_independent_batch_masks,
     sample_patterns,
+    sample_training_severity_counts,
 )
 from models.unet3d import MODEL_VERSION, UNet3D
 
@@ -184,8 +186,8 @@ def parse_args():
         type=int,
         default=0,
         help=(
-            "Minimum of the sparse Density-probe interval used by "
-            "spatial_grid and spatial_random (default: 0)."
+            "Validation-only: minimum of the sparse Density-probe interval used "
+            "by spatial_grid and spatial_random (default: 0)."
         ),
     )
     p.add_argument(
@@ -193,10 +195,46 @@ def parse_args():
         type=int,
         default=30,
         help=(
-            "Maximum of the sparse Density-probe interval used by "
-            "spatial_grid and spatial_random (default: 30). Each sample has "
-            "50%% probability of using this interval and 50%% probability "
-            "of using [maximum + 1, X * Z]."
+            "Validation-only: maximum of the sparse Density-probe interval used "
+            "by spatial_grid and spatial_random (default: 30). Each validation "
+            "sample has 50%% probability of using this interval and 50%% "
+            "probability of using [maximum + 1, X * Z]."
+        ),
+    )
+    p.add_argument(
+        "--density-visible-p-zero",
+        type=float,
+        default=0.15,
+        help=(
+            "Training-only: probability that a Density probe pattern has "
+            "zero visible sites (default: 0.15)."
+        ),
+    )
+    p.add_argument(
+        "--density-visible-p-full",
+        type=float,
+        default=0.10,
+        help=(
+            "Training-only: probability that a Density probe pattern keeps "
+            "every spatial site (default: 0.10)."
+        ),
+    )
+    p.add_argument(
+        "--magnetic-visible-p-zero",
+        type=float,
+        default=0.10,
+        help=(
+            "Training-only: probability that a magnetic probe pattern has "
+            "zero visible sites (default: 0.10)."
+        ),
+    )
+    p.add_argument(
+        "--magnetic-visible-p-full",
+        type=float,
+        default=0.30,
+        help=(
+            "Training-only: probability that a magnetic probe pattern keeps "
+            "every spatial site (default: 0.30)."
         ),
     )
 
@@ -264,8 +302,9 @@ def parse_args():
         default=None,
         help=(
             "Initialize model weights and channel statistics from a checkpoint, "
-            "with a fresh optimizer and epoch/LR schedule. Ignored when "
-            "auto-resuming from out-dir/latest.pt."
+            "with a fresh optimizer and epoch/LR schedule. Masking-version "
+            "mismatches are allowed here because only weights are loaded. "
+            "Ignored when auto-resuming from out-dir/latest.pt."
         ),
     )
 
@@ -298,6 +337,25 @@ def parse_args():
         p.error(
             "Expected 0 <= density-probe-min <= density-probe-max, got "
             f"{args.density_probe_min} and {args.density_probe_max}"
+        )
+    for option_name in (
+        "density_visible_p_zero",
+        "density_visible_p_full",
+        "magnetic_visible_p_zero",
+        "magnetic_visible_p_full",
+    ):
+        value = getattr(args, option_name)
+        if not (0.0 <= value <= 1.0):
+            p.error(f"--{option_name.replace('_', '-')} must lie in [0, 1], got {value}")
+    if args.density_visible_p_zero + args.density_visible_p_full > 1.0:
+        p.error(
+            "--density-visible-p-zero + --density-visible-p-full must be <= 1, "
+            f"got {args.density_visible_p_zero} + {args.density_visible_p_full}"
+        )
+    if args.magnetic_visible_p_zero + args.magnetic_visible_p_full > 1.0:
+        p.error(
+            "--magnetic-visible-p-zero + --magnetic-visible-p-full must be <= 1, "
+            f"got {args.magnetic_visible_p_zero} + {args.magnetic_visible_p_full}"
         )
 
     return args
@@ -475,6 +533,10 @@ RESUME_PARAMETER_KEYS = (
     "val_mask_seed",
     "density_probe_min",
     "density_probe_max",
+    "density_visible_p_zero",
+    "density_visible_p_full",
+    "magnetic_visible_p_zero",
+    "magnetic_visible_p_full",
     "base_channels",
     "channel_mults",
     "use_attention",
@@ -485,6 +547,34 @@ RESUME_PARAMETER_KEYS = (
     "grad_clip",
     "amp",
 )
+
+
+class CheckpointPlan(NamedTuple):
+    """How training obtains starting weights and optimizer state."""
+
+    mode: str
+    path: Optional[Path]
+
+
+def resolve_checkpoint_plan(
+    out_dir: Path,
+    *,
+    auto_resume: bool,
+    init_checkpoint: Optional[str] = None,
+) -> CheckpointPlan:
+    """Prefer an in-run latest checkpoint over a one-shot weight initialization.
+
+    Resume is only considered for ``out_dir/latest.pt``. An ``init_checkpoint``
+    never restores optimizer, scheduler, or epoch state, and is ignored once a
+    resume file exists. Masking-version compatibility is enforced only for
+    resume, not for weight-only initialization.
+    """
+    latest_path = Path(out_dir) / "latest.pt"
+    if auto_resume and latest_path.is_file():
+        return CheckpointPlan("resume", latest_path)
+    if init_checkpoint:
+        return CheckpointPlan("init", expand_path(init_checkpoint))
+    return CheckpointPlan("fresh", None)
 
 
 def validate_resume_parameters(args, checkpoint_args: Dict[str, Any]) -> None:
@@ -600,6 +690,33 @@ def normalize(y: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.T
     return (y - mean) / (std + 1e-8)
 
 
+def _apply_training_visible_counts(
+    patterns: Sequence[str],
+    counts: Sequence[Optional[int]],
+    fractions: List[float],
+    *,
+    spatial_sites: int,
+    time_steps: int,
+    modality: str,
+) -> None:
+    """Overwrite requested mask fractions from exact training-time counts."""
+    for i, (pattern, count) in enumerate(zip(patterns, counts)):
+        if count is None:
+            continue
+        if pattern in PROBE_COUNT_PATTERNS:
+            maximum = spatial_sites
+            label = "spatial sites"
+        else:
+            maximum = time_steps
+            label = "time steps"
+        if not (0 <= count <= maximum):
+            raise ValueError(
+                f"{modality} visible count {count} is outside [0, {maximum}] "
+                f"{label} for pattern {pattern}."
+            )
+        fractions[i] = 1.0 - count / maximum
+
+
 def train_one_epoch(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -608,8 +725,10 @@ def train_one_epoch(
     mean: torch.Tensor,
     std: torch.Tensor,
     pattern_weights: Dict[str, float],
-    density_probe_min: int,
-    density_probe_max: int,
+    density_visible_p_zero: float,
+    density_visible_p_full: float,
+    magnetic_visible_p_zero: float,
+    magnetic_visible_p_full: float,
     amp: bool,
     grad_clip: float,
     postfix_every: int = 50,
@@ -633,10 +752,12 @@ def train_one_epoch(
     total_batches = 0
     density_probe_sum = 0
     density_probe_sample_count = 0
-    sparse_density_sample_count = 0
+    density_zero_sample_count = 0
+    density_full_sample_count = 0
     magnetic_visible_sum = 0
     magnetic_sample_count = 0
-    fully_visible_magnetic_sample_count = 0
+    magnetic_zero_sample_count = 0
+    magnetic_full_sample_count = 0
     spatial_sites = 0
 
     scaler = torch.cuda.amp.GradScaler(enabled=(amp and device.type == "cuda"))
@@ -648,49 +769,57 @@ def train_one_epoch(
         y = normalize(y, mean, std)
 
         batch_size = y.shape[0]
+        time_steps = int(y.shape[-3])
+        spatial_sites = int(y.shape[-2] * y.shape[-1])
 
         magnetic_patterns = sample_patterns(pattern_weights, batch_size)
         density_patterns = sample_patterns(pattern_weights, batch_size)
         magnetic_fractions = torch.rand(batch_size).tolist()
         density_fractions = torch.rand(batch_size).tolist()
-        spatial_sites = int(y.shape[-2] * y.shape[-1])
-        density_probe_counts = sample_mixed_density_probe_counts(
+        density_visible_counts = sample_training_severity_counts(
             density_patterns,
-            minimum=density_probe_min,
-            maximum=density_probe_max,
             spatial_sites=spatial_sites,
+            time_steps=time_steps,
+            p_zero=density_visible_p_zero,
+            p_full=density_visible_p_full,
         )
-        magnetic_visible_counts = sample_mixed_magnetic_visible_counts(
+        magnetic_visible_counts = sample_training_severity_counts(
             magnetic_patterns,
             spatial_sites=spatial_sites,
+            time_steps=time_steps,
+            p_zero=magnetic_visible_p_zero,
+            p_full=magnetic_visible_p_full,
         )
-        probe_counts_in_batch = [
-            count for count in density_probe_counts if count is not None
-        ]
-        density_probe_sum += sum(probe_counts_in_batch)
-        density_probe_sample_count += len(probe_counts_in_batch)
-        sparse_density_sample_count += sum(
-            count <= density_probe_max for count in probe_counts_in_batch
+        for pattern, count in zip(density_patterns, density_visible_counts):
+            if pattern not in PROBE_COUNT_PATTERNS:
+                continue
+            density_probe_sum += int(count)
+            density_probe_sample_count += 1
+            density_zero_sample_count += int(count == 0)
+            density_full_sample_count += int(count == spatial_sites)
+        for pattern, count in zip(magnetic_patterns, magnetic_visible_counts):
+            if pattern not in PROBE_COUNT_PATTERNS:
+                continue
+            magnetic_visible_sum += int(count)
+            magnetic_sample_count += 1
+            magnetic_zero_sample_count += int(count == 0)
+            magnetic_full_sample_count += int(count == spatial_sites)
+        _apply_training_visible_counts(
+            density_patterns,
+            density_visible_counts,
+            density_fractions,
+            spatial_sites=spatial_sites,
+            time_steps=time_steps,
+            modality="Density",
         )
-        magnetic_counts_in_batch = [
-            count for count in magnetic_visible_counts if count is not None
-        ]
-        magnetic_visible_sum += sum(magnetic_counts_in_batch)
-        magnetic_sample_count += len(magnetic_counts_in_batch)
-        fully_visible_magnetic_sample_count += sum(
-            count == spatial_sites for count in magnetic_counts_in_batch
+        _apply_training_visible_counts(
+            magnetic_patterns,
+            magnetic_visible_counts,
+            magnetic_fractions,
+            spatial_sites=spatial_sites,
+            time_steps=time_steps,
+            modality="magnetic",
         )
-        for i, probe_count in enumerate(density_probe_counts):
-            if probe_count is not None:
-                if probe_count > spatial_sites:
-                    raise ValueError(
-                        f"Density probe count {probe_count} exceeds the "
-                        f"{spatial_sites} spatial sites."
-                    )
-                density_fractions[i] = 1.0 - probe_count / spatial_sites
-        for i, magnetic_count in enumerate(magnetic_visible_counts):
-            if magnetic_count is not None:
-                magnetic_fractions[i] = 1.0 - magnetic_count / spatial_sites
 
         mask, mask_infos = sample_independent_batch_masks(
             y.shape,
@@ -700,7 +829,7 @@ def train_one_epoch(
             density_mask_fractions=density_fractions,
             device=device,
             dtype=y.dtype,
-            density_probe_counts=density_probe_counts,
+            density_probe_counts=density_visible_counts,
             magnetic_visible_counts=magnetic_visible_counts,
         )
 
@@ -787,10 +916,12 @@ def train_one_epoch(
             float(count_samples),
             float(density_probe_sum),
             float(density_probe_sample_count),
-            float(sparse_density_sample_count),
+            float(density_zero_sample_count),
+            float(density_full_sample_count),
             float(magnetic_visible_sum),
             float(magnetic_sample_count),
-            float(fully_visible_magnetic_sample_count),
+            float(magnetic_zero_sample_count),
+            float(magnetic_full_sample_count),
         ],
         dtype=torch.float64,
         device=device,
@@ -809,10 +940,12 @@ def train_one_epoch(
         global_samples,
         global_probe_sum,
         global_probe_sample_count,
-        global_sparse_sample_count,
+        global_density_zero_sample_count,
+        global_density_full_sample_count,
         global_magnetic_visible_sum,
         global_magnetic_sample_count,
-        global_fully_visible_magnetic_sample_count,
+        global_magnetic_zero_sample_count,
+        global_magnetic_full_sample_count,
     ) = totals.tolist()
     total_count = max(global_samples, 1)
     probe_count = max(global_probe_sample_count, 1)
@@ -827,11 +960,15 @@ def train_one_epoch(
         "actual_mask_fraction": float(sum_actual_fraction.cpu()) / total_count,
         "density_probe_count": mean_density_probes,
         "density_visible_fraction": mean_density_probes / max(spatial_sites, 1),
-        "sparse_density_sample_share": global_sparse_sample_count / probe_count,
+        "density_zero_sample_share": global_density_zero_sample_count / probe_count,
+        "density_full_sample_share": global_density_full_sample_count / probe_count,
         "magnetic_visible_count": mean_magnetic_visible,
         "magnetic_visible_fraction": mean_magnetic_visible / max(spatial_sites, 1),
-        "fully_visible_magnetic_sample_share": (
-            global_fully_visible_magnetic_sample_count / magnetic_count
+        "magnetic_zero_sample_share": (
+            global_magnetic_zero_sample_count / magnetic_count
+        ),
+        "magnetic_full_sample_share": (
+            global_magnetic_full_sample_count / magnetic_count
         ),
         "magnetic_pattern_share": {
             name: float(magnetic_pattern_counts[i].cpu()) / total_count
@@ -1013,11 +1150,18 @@ def main():
     rank_print("Betas:", args.betas)
     rank_print("Model version:", args.model_version)
     rank_print(
-        "spatial_grid/spatial_random: B uses a 50/50 mixture of fully visible "
-        "and an exact count uniformly drawn from [0, X*Z]; Density uses "
-        f"a 50/50 mixture of [{args.density_probe_min}, "
+        "Training spatial_grid/spatial_random severity: 0 / log-uniform / full "
+        "mixture with independent B and Density endpoint probabilities "
+        f"(Density p_zero={args.density_visible_p_zero:g}, "
+        f"p_full={args.density_visible_p_full:g}; "
+        f"B p_zero={args.magnetic_visible_p_zero:g}, "
+        f"p_full={args.magnetic_visible_p_full:g}). "
+        "spatial_block keeps Uniform(0, 1) area; temporal patterns draw a "
+        "uniform visible-frame count in [0, T]. Validation still uses the "
+        f"legacy Density 50/50 mixture of [{args.density_probe_min}, "
         f"{args.density_probe_max}] and "
-        f"[{args.density_probe_max + 1}, X*Z]"
+        f"[{args.density_probe_max + 1}, X*Z] plus the legacy 50/50 full/"
+        "uniform magnetic counts."
     )
     rank_print(
         "Learning-rate schedule: "
@@ -1117,21 +1261,29 @@ def main():
     resume_checkpoint = None
     init_checkpoint = None
     latest_path = out_dir / "latest.pt"
-    if args.auto_resume and latest_path.exists():
-        resume_checkpoint = torch.load(latest_path, map_location=device)
+    checkpoint_plan = resolve_checkpoint_plan(
+        out_dir,
+        auto_resume=args.auto_resume,
+        init_checkpoint=args.init_checkpoint,
+    )
+    if checkpoint_plan.mode == "resume":
+        resume_checkpoint = torch.load(checkpoint_plan.path, map_location=device)
         validate_resume_parameters(args, resume_checkpoint.get("args", {}))
         rank_print(
-            f"Auto-resuming from {latest_path} "
+            f"Auto-resuming from {checkpoint_plan.path} "
             f"(completed epoch {resume_checkpoint['epoch']})"
         )
-    elif args.init_checkpoint is not None:
-        init_path = expand_path(args.init_checkpoint)
-        if not init_path.exists():
-            raise FileNotFoundError(f"Initialization checkpoint not found: {init_path}")
-        init_checkpoint = torch.load(init_path, map_location=device)
+    elif checkpoint_plan.mode == "init":
+        if checkpoint_plan.path is None or not checkpoint_plan.path.is_file():
+            raise FileNotFoundError(
+                f"Initialization checkpoint not found: {checkpoint_plan.path}"
+            )
+        init_checkpoint = torch.load(checkpoint_plan.path, map_location=device)
         rank_print(
-            f"Initializing from {init_path} "
-            f"(source epoch {init_checkpoint['epoch']}); starting a new schedule"
+            f"Initializing model weights from {checkpoint_plan.path} "
+            f"(source epoch {init_checkpoint['epoch']}); "
+            "optimizer, scheduler, and epoch counter start fresh. "
+            "Masking-version mismatch is allowed for this weight-only init."
         )
 
     state_checkpoint = (
@@ -1339,8 +1491,10 @@ def main():
             mean=mean,
             std=std,
             pattern_weights=args.mask_pattern_weights,
-            density_probe_min=args.density_probe_min,
-            density_probe_max=args.density_probe_max,
+            density_visible_p_zero=args.density_visible_p_zero,
+            density_visible_p_full=args.density_visible_p_full,
+            magnetic_visible_p_zero=args.magnetic_visible_p_zero,
+            magnetic_visible_p_full=args.magnetic_visible_p_full,
             amp=args.amp,
             grad_clip=args.grad_clip,
             epoch_number=epoch,
@@ -1376,8 +1530,11 @@ def main():
             "train_density_visible_fraction": train_metrics[
                 "density_visible_fraction"
             ],
-            "train_sparse_density_sample_share": train_metrics[
-                "sparse_density_sample_share"
+            "train_density_zero_sample_share": train_metrics[
+                "density_zero_sample_share"
+            ],
+            "train_density_full_sample_share": train_metrics[
+                "density_full_sample_share"
             ],
             "train_magnetic_visible_count": train_metrics[
                 "magnetic_visible_count"
@@ -1385,8 +1542,11 @@ def main():
             "train_magnetic_visible_fraction": train_metrics[
                 "magnetic_visible_fraction"
             ],
-            "train_fully_visible_magnetic_sample_share": train_metrics[
-                "fully_visible_magnetic_sample_share"
+            "train_magnetic_zero_sample_share": train_metrics[
+                "magnetic_zero_sample_share"
+            ],
+            "train_magnetic_full_sample_share": train_metrics[
+                "magnetic_full_sample_share"
             ],
             "train_magnetic_pattern_share": train_metrics[
                 "magnetic_pattern_share"
@@ -1418,8 +1578,11 @@ def main():
                 "mask/density_probe_patterns/visible_fraction": row[
                     "train_density_visible_fraction"
                 ],
-                "mask/density_probe_patterns/sparse_sample_share": row[
-                    "train_sparse_density_sample_share"
+                "mask/density_probe_patterns/zero_sample_share": row[
+                    "train_density_zero_sample_share"
+                ],
+                "mask/density_probe_patterns/full_sample_share": row[
+                    "train_density_full_sample_share"
                 ],
                 "mask/magnetic_probe_patterns/visible_count": row[
                     "train_magnetic_visible_count"
@@ -1427,8 +1590,11 @@ def main():
                 "mask/magnetic_probe_patterns/visible_fraction": row[
                     "train_magnetic_visible_fraction"
                 ],
-                "mask/magnetic_probe_patterns/fully_visible_sample_share": row[
-                    "train_fully_visible_magnetic_sample_share"
+                "mask/magnetic_probe_patterns/zero_sample_share": row[
+                    "train_magnetic_zero_sample_share"
+                ],
+                "mask/magnetic_probe_patterns/full_sample_share": row[
+                    "train_magnetic_full_sample_share"
                 ],
                 "optimization/learning_rate": row["learning_rate"],
             }
@@ -1455,11 +1621,15 @@ def main():
             f"val_mae={row['val_mae']:.6f} "
             f"density_probes="
             f"{row['train_density_probe_count']:.2f} "
-            f"sparse_probe_share="
-            f"{row['train_sparse_density_sample_share']:.3f} "
+            f"D_zero_share="
+            f"{row['train_density_zero_sample_share']:.3f} "
+            f"D_full_share="
+            f"{row['train_density_full_sample_share']:.3f} "
             f"B_visible={row['train_magnetic_visible_fraction']:.3f} "
+            f"B_zero_share="
+            f"{row['train_magnetic_zero_sample_share']:.3f} "
             f"B_full_share="
-            f"{row['train_fully_visible_magnetic_sample_share']:.3f}"
+            f"{row['train_magnetic_full_sample_share']:.3f}"
         )
         epoch_log(
             "  val by pattern: "

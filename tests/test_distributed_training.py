@@ -11,6 +11,7 @@ from train_masked_unet3d import (  # noqa: E402
     RESUME_PARAMETER_KEYS,
     learning_rate_for_epoch,
     parse_args,
+    resolve_checkpoint_plan,
     sample_mixed_magnetic_visible_counts,
     sample_mixed_density_probe_counts,
     validate_resume_parameters,
@@ -120,6 +121,17 @@ def test_probe_patterns_use_half_full_half_random_magnetic_counts():
         assert any(count < spatial_sites for count in pattern_counts)
 
 
+def test_training_visible_endpoint_probability_defaults(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["train_masked_unet3d.py"])
+    args = parse_args()
+    assert args.density_visible_p_zero == 0.15
+    assert args.density_visible_p_full == 0.10
+    assert args.magnetic_visible_p_zero == 0.10
+    assert args.magnetic_visible_p_full == 0.30
+    assert args.density_probe_min == 0
+    assert args.density_probe_max == 30
+
+
 def test_spatial_only_pooling_cli_defaults_off_and_flag_enables(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["train_masked_unet3d.py"])
     assert parse_args().spatial_only_pooling is False
@@ -130,6 +142,55 @@ def test_spatial_only_pooling_cli_defaults_off_and_flag_enables(monkeypatch):
         ["train_masked_unet3d.py", "--spatial-only-pooling"],
     )
     assert parse_args().spatial_only_pooling is True
+
+
+def test_checkpoint_plan_prefers_in_run_latest_over_init(tmp_path):
+    latest = tmp_path / "latest.pt"
+    latest.write_bytes(b"placeholder")
+    init_path = tmp_path / "source_best.pt"
+    init_path.write_bytes(b"source")
+
+    plan = resolve_checkpoint_plan(
+        tmp_path,
+        auto_resume=True,
+        init_checkpoint=str(init_path),
+    )
+    assert plan.mode == "resume"
+    assert plan.path == latest
+
+
+def test_checkpoint_plan_uses_init_when_out_dir_has_no_latest(tmp_path):
+    init_path = tmp_path / "source_best.pt"
+    init_path.write_bytes(b"source")
+
+    plan = resolve_checkpoint_plan(
+        tmp_path / "new_run",
+        auto_resume=True,
+        init_checkpoint=str(init_path),
+    )
+    assert plan.mode == "init"
+    assert plan.path == init_path.resolve()
+
+
+def test_masking_version_mismatch_blocks_resume_but_not_weight_init():
+    values = {key: None for key in RESUME_PARAMETER_KEYS}
+    values["mask_pattern_weights"] = {"temporal_random": 1.0}
+    values["use_attention"] = True
+    values["spatial_only_pooling"] = True
+    values["masking_version"] = "independentBD_fiveMask_logUniformCounts_v8"
+    args = SimpleNamespace(**values)
+
+    checkpoint_args = dict(values)
+    checkpoint_args["masking_version"] = (
+        "independentBD_fiveMask_orientedTemporalBlock_v7"
+    )
+
+    try:
+        validate_resume_parameters(args, checkpoint_args)
+    except ValueError as exc:
+        assert "masking_version" in str(exc)
+    else:
+        raise AssertionError("Expected masking-version mismatch to block resume")
 
 
 def test_old_resume_args_default_to_optional_architecture_features_off():

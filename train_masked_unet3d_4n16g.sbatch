@@ -61,9 +61,9 @@ print("  CUDA availability will be checked inside the srun workers.")
 PY
 
 H5_DIR=/pscratch/sd/b/binxia/VPIC_PPPL_HDF5_by_beta_official2500_none_compat
-SOURCE_RUN_NAME=masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine1500_v11_temporalboundary_attention_spatialpool
+SOURCE_RUN_NAME=masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v12_independentBD_fivemask_attention_spatialpool_b8_e4500
 INIT_CHECKPOINT=runs/${SOURCE_RUN_NAME}/best.pt
-RUN_NAME=masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v12_independentBD_fivemask_attention_spatialpool_b8_e4500
+RUN_NAME=masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v13_independentBD_logUniformCounts_attention_spatialpool_b8_e3000
 
 BETAS=(0.2)
 DELTA_T=24
@@ -72,12 +72,17 @@ STRIDE_T=2
 # Per-GPU batch size. With 16 GPUs this gives global batch size 128.
 BATCH_SIZE=8
 NUM_WORKERS=4
-EPOCHS=4500
+EPOCHS=3000
 LR=2e-4
 WARMUP_EPOCHS=10
 MIN_LR=2e-6
+WEIGHT_DECAY=1e-4
 DENSITY_PROBE_MIN=0
 DENSITY_PROBE_MAX=30
+DENSITY_VISIBLE_P_ZERO=0.05
+DENSITY_VISIBLE_P_FULL=0.05
+MAGNETIC_VISIBLE_P_ZERO=0.05
+MAGNETIC_VISIBLE_P_FULL=0.05
 BASE_CHANNELS=24
 CHANNEL_MULTS=(1 2 4 8)
 
@@ -113,8 +118,13 @@ TRAIN_ARGS=(
     --lr "${LR}"
     --warmup-epochs "${WARMUP_EPOCHS}"
     --min-lr "${MIN_LR}"
+    --weight-decay "${WEIGHT_DECAY}"
     --density-probe-min "${DENSITY_PROBE_MIN}"
     --density-probe-max "${DENSITY_PROBE_MAX}"
+    --density-visible-p-zero "${DENSITY_VISIBLE_P_ZERO}"
+    --density-visible-p-full "${DENSITY_VISIBLE_P_FULL}"
+    --magnetic-visible-p-zero "${MAGNETIC_VISIBLE_P_ZERO}"
+    --magnetic-visible-p-full "${MAGNETIC_VISIBLE_P_FULL}"
     --base-channels "${BASE_CHANNELS}"
     --channel-mults "${CHANNEL_MULTS[@]}"
     --use-attention
@@ -136,6 +146,9 @@ echo "GPUs per node: ${GPUS_PER_NODE}"
 echo "DDP world size: ${WORLD_SIZE}"
 echo "Per-GPU batch size: ${BATCH_SIZE}"
 echo "Global batch size: $((BATCH_SIZE * WORLD_SIZE))"
+echo "Epochs: ${EPOCHS}"
+echo "Init checkpoint (weights only): ${INIT_CHECKPOINT}"
+echo "Auto-resume latest path: ${OUT_DIR}/latest.pt"
 echo "Unified spatiotemporal attention: enabled"
 echo "Spatial-only pooling: enabled"
 echo "Master: ${MASTER_ADDR}:${MASTER_PORT}"

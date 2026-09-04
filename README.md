@@ -138,19 +138,19 @@ prediction = visible_normalized_fields + UNet_residual([visible_fields, masks])
 
 ### 4.2 五种 mask pattern
 
-每个 training sample 分别为磁场和 Density 独立选择一种 pattern；五种 pattern 默认等权。两种 modality 的 pattern、hidden severity 和具体 layout 均独立，只有 `Bx/By/Bz` 始终共享同一个 magnetic mask。`temporal_random` 只随机抽取 scattered visible frames；`temporal_block` 从 `[0,T]` 中抽取两个有方向的不同 boundary，自然覆盖中间缺失和中间可见/两侧缺失。
+每个 training sample 分别为磁场和 Density 独立选择一种 pattern；五种 pattern 默认等权。两种 modality 的 pattern、hidden severity 和具体 layout 均独立，只有 `Bx/By/Bz` 始终共享同一个 magnetic mask。`temporal_random` 只随机抽取 scattered visible frames；`temporal_block` 保持 oriented contiguous block（中间缺失或中间可见）。训练时这两种 temporal pattern 都先在 `[0, T]` 上均匀抽取可见帧数，再按各自几何放置；controlled validation 仍使用旧的两边界 `temporal_block` sampler。
 
 | Pattern | 空间/时间含义 | 三个磁场 mask | Density 与磁场的关系 |
 |---|---|---|---|
-| `spatial_random` | 完全随机的 Density probe array，所有时间共用 | 50% 完全可见；50% 从 0–`X*Z` 抽取准确可见数，三通道共用随机位置 | 准确数量的 distinct probes，无放回均匀随机位置 |
-| `spatial_grid` | 近规则 Density probe array，所有时间共用 | 50% 完全可见；50% 从 0–`X*Z` 抽取准确可见数，三通道共用随机位置 | 准确 probe 数量，并随机化 grid phase/layout |
+| `spatial_random` | 完全随机的 Density probe array，所有时间共用 | 与 Density 独立的 0 / log-uniform / full 可见点数，三通道共用随机位置 | 准确数量的 distinct probes，无放回均匀随机位置 |
+| `spatial_grid` | 近规则 Density probe array，所有时间共用 | 与 Density 独立的 0 / log-uniform / full 可见点数，三通道共用随机位置 | 准确 probe 数量，并随机化 grid phase/layout |
 | `spatial_block` | 隐藏一个随机矩形区域 | `Bx/By/Bz` 完全一致 | B/Density 独立选择矩形和位置 |
 | `temporal_random` | 随机选择 scattered 完整可见帧 | `Bx/By/Bz` 完全一致 | B/Density 独立选择可见帧和数量 |
-| `temporal_block` | oriented 连续时间块：中间缺失或中间可见 | `Bx/By/Bz` 完全一致 | B/Density 独立选择 boundaries/orientation |
+| `temporal_block` | oriented 连续时间块：中间缺失或中间可见 | `Bx/By/Bz` 完全一致 | B/Density 独立选择可见帧数、位置和 orientation |
 
 训练使用独立 B/Density sampler；controlled validation 和 visualization 保留旧 shared-pattern API，可以用同一 pattern 覆盖四个通道以维持标准 benchmark。
 
-两个 probe pattern 的 Density 都先以 50% 概率选择稀疏区间 0–30、以 50% 概率选择稠密区间 31–`X*Z`，再在所选闭区间内离散均匀抽取准确 probe 数量。磁场独立地以 50% 概率完全可见，以 50% 概率从 0–`X*Z` 均匀抽取准确可见点数；后一分支使用 `randperm(X*Z)` 无放回选址，三个磁场通道共用位置。这样两个 probe pattern 的平均磁场可见率约为 75%，且完整磁场与各种稀疏度都会出现。`spatial_grid` 的 Density 近规则阵列具有随机 phase，不能整齐分解成矩形 grid 时会从稍大的近各向同性 lattice 随机去掉多余位置；`spatial_random` 的 Density 同样使用无放回随机位置。可视化的 custom/multifunction grid 仍可使用显式固定 stride，不受训练专用 exact-count 路径影响。
+训练时两个 probe pattern 对 B 和 Density 都使用同一套三部分 mixture：以 `p_zero` 取 `N_visible=0`，以 `p_full` 取 `N_visible=X*Z`，其余在 `[1, X*Z-1]` 上 log-uniform 抽取准确可见点数。默认 Density 为 `p_zero=0.15`、`p_full=0.10`，磁场为 `p_zero=0.10`、`p_full=0.30`，两者独立可配。磁场三个通道仍共用一次 `randperm` 选址。`spatial_block` 继续按 `mask_fraction ~ Uniform(0,1)` 采样矩形面积，并随机位置和长宽比。`spatial_grid` 的 Density 近规则阵列具有随机 phase，不能整齐分解成矩形 grid 时会从稍大的近各向同性 lattice 随机去掉多余位置。可视化的 custom/multifunction grid 仍可使用显式固定 stride。controlled validation 仍使用旧的 Density 0–30 / 31–`X*Z` 两段均匀和磁场 50% full + 50% uniform count，以便历史 benchmark 可比。
 
 ### 4.3 损失、优化和验证
 
@@ -167,7 +167,7 @@ loss = mean((prediction - target)^2)
 - AdamW，learning rate `2e-4`，weight decay `1e-4`；
 - 前 10 epochs 线性 warmup：epoch 1 从 `2e-5` 开始，epoch 10 到达 `2e-4`；
 - epoch 11–3000 使用 cosine decay，最终降到 `2e-6`；
-- `spatial_grid` 和 `spatial_random` 的磁场以 50/50 概率选择完全可见或从 0–`X*Z` 均匀抽取准确可见数；Density 分别以 50/50 概率从 0–30 和 31–`X*Z` 抽取准确 probe 数量；
+- `spatial_grid` 和 `spatial_random` 训练时对 B/Density 独立使用 0 / log-uniform / full 可见点数 mixture（默认 Density `p_zero=0.15`、`p_full=0.10`，磁场 `p_zero=0.10`、`p_full=0.30`）；validation 仍用旧的 50/50 sparse/dense 与 50/50 full/uniform；
 - gradient norm clipping 为 1.0；
 - AMP mixed precision；
 - 3000 epochs；
@@ -200,13 +200,13 @@ sbatch train_masked_unet3d_4n16g.sbatch
 ./train_masked_unet3d_4n16g.sbatch
 ```
 
-两种入口最终都会由该文件启动 `srun + torchrun`。脚本默认使用当前 continuation run 名：
+两种入口最终都会由该文件启动 `srun + torchrun`。当前正式训练配置是 v13：
 
 ```text
-masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine1500_v10_temporalboundary
+masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v13_independentBD_logUniformCounts_attention_spatialpool_b8_e3000
 ```
 
-该 v10 run 从 v9 balanced-loss 的 `latest.pt` 初始化，在新 schedule 中训练包含双向 temporal boundary 的 masking v6。额外 CLI 参数会追加给训练脚本；由于 `--auto-resume` 默认开启，同一输出目录存在兼容的 `latest.pt` 时会续训。若确实要训练全新模型，应使用新的 `--out-dir`/`--wandb-name`，不要覆盖现有结果。
+该 v13 run 从 v12 `best.pt`（epoch 3731）只加载 model weights 作为初始化，使用新的 output directory、fresh optimizer/scheduler，以及 `independentBD_fiveMask_logUniformCounts_v8` 的训练 mask sampler，总共 3000 epochs。`--auto-resume` 默认开启：第一次启动走 `--init-checkpoint`；如果 v13 自己的 `latest.pt` 已存在，则从该文件完整 resume（含 optimizer 和 epoch），并检查 masking version。不要把 `--out-dir` 指回 v12，否则 auto-resume 会因 `MASKING_VERSION` 不匹配而拒绝。额外 CLI 参数会追加给训练脚本。
 
 ## 6. 单窗口 visualization 测试案例
 
@@ -222,7 +222,7 @@ masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine1500_
 
 ### 6.3 Magnetic ablation：磁场信息量扫描
 
-Density 在六行中均为完全不可见（0 probes），防止模型从较密的 Density probe 直接完成 reconstruction，从而掩盖磁场信息量的影响。磁场 visible fraction 仍依次为 100%、80%、60%、40%、20%、0%。较低比例的磁场点严格嵌套于较高比例的点集，避免每行随机位置变化干扰信息量比较。三个磁场通道始终使用完全一致的 mask。
+Density 在所有行中均为完全不可见（0 probes），防止模型从较密的 Density probe 直接完成 reconstruction，从而掩盖磁场信息量的影响。磁场 visible percent 依次为 100%、30%、10%、3%、1%、0.3%、0.1%、0%。较低比例的磁场点严格嵌套于较高比例的点集，避免每行随机位置变化干扰信息量比较。0% 与 100% 分别是精确的全 hidden / 全 visible；中间档位按 `round(percent / 100 * X * Z)` 取整。三个磁场通道始终使用完全一致的 mask。
 
 ### 6.4 Density forecast：窗口末帧条件外推
 

@@ -28,6 +28,61 @@ DEFAULT_RUN_NAME = "beta0.2_nu2_Bz0_dt2_tau70"
 DEFAULT_T0 = 28
 DEFAULT_RESIDUAL_VMAX = 1.0
 RESIDUAL_CMAP = "RdBu_r"
+DEFAULT_MAGNETIC_ABLATION_VISIBLE_PERCENTS = (
+    100.0,
+    30.0,
+    10.0,
+    3.0,
+    1.0,
+    0.3,
+    0.1,
+    0.0,
+)
+DEFAULT_MAGNETIC_ABLATION_VISIBLE_FRACTIONS = tuple(
+    percent / 100.0 for percent in DEFAULT_MAGNETIC_ABLATION_VISIBLE_PERCENTS
+)
+
+
+def format_magnetic_visible_percent(visible_fraction: float) -> str:
+    return f"B visible={100.0 * float(visible_fraction):g}%"
+
+
+def magnetic_ablation_visible_count(num_sites: int, visible_fraction: float) -> int:
+    """Convert a requested visible fraction into an exact probe count."""
+    num_sites = int(num_sites)
+    visible_fraction = float(visible_fraction)
+    if not (0.0 <= visible_fraction <= 1.0):
+        raise ValueError(
+            "Magnetic visible fractions must lie in [0, 1], "
+            f"got {visible_fraction}."
+        )
+    if visible_fraction <= 0.0:
+        return 0
+    if visible_fraction >= 1.0:
+        return num_sites
+    return int(round(visible_fraction * num_sites))
+
+
+def apply_log_yscale_if_strictly_positive(
+    axis,
+    values: np.ndarray,
+    panel_name: str,
+) -> str:
+    """Use a log y-axis only when every finite drawn value is > 0."""
+    flat = np.asarray(values, dtype=np.float64).ravel()
+    finite = flat[np.isfinite(flat)]
+    if finite.size == 0:
+        print(f"{panel_name}: no finite NRMSE values; leaving linear y-scale.")
+        return "linear"
+    nonpositive = finite[finite <= 0.0]
+    if nonpositive.size:
+        print(
+            f"{panel_name}: found {int(nonpositive.size)} non-positive NRMSE "
+            f"value(s); min={float(finite.min()):.6g}. Leaving linear y-scale."
+        )
+        return "linear"
+    axis.set_yscale("log")
+    return "log"
 
 
 def save_information_suite_error_plot(
@@ -37,10 +92,13 @@ def save_information_suite_error_plot(
     frame_ids: np.ndarray,
     out_path: Path,
     title: str,
+    experiment_name: str = "",
 ) -> Dict:
     """Plot framewise RMS errors in preprocessing-standardized units."""
     fig, axes = plt.subplots(2, 1, figsize=(10.5, 7.0), sharex=True)
     payload = []
+    density_series = []
+    jy_series = []
     for row_index, row in enumerate(rows, start=1):
         density_residual = normalized_residual(
             row["pred_normalized"][3], target_field_normalized[3]
@@ -50,13 +108,22 @@ def save_information_suite_error_plot(
         )
         density_nrmse = np.sqrt(np.mean(np.square(density_residual), axis=(1, 2)))
         jy_nrmse = np.sqrt(np.mean(np.square(jy_residual), axis=(1, 2)))
-        label = f"row {row_index}: {row['label']}"
+        if experiment_name == "magnetic_ablation":
+            label = validation_statistics_legend_label(
+                experiment_name, row, context_length=0
+            )
+        else:
+            label = f"row {row_index}: {row['label']}"
         axes[0].plot(frame_ids, density_nrmse, linewidth=1.8, label=label)
         axes[1].plot(frame_ids, jy_nrmse, linewidth=1.8, label=label)
+        density_series.append(density_nrmse)
+        jy_series.append(jy_nrmse)
         payload.append(
             {
                 "row": row_index,
+                "name": row.get("name"),
                 "label": row["label"],
+                "legend_label": label,
                 "density_nrmse": density_nrmse.tolist(),
                 "jy_nrmse": jy_nrmse.tolist(),
             }
@@ -64,15 +131,32 @@ def save_information_suite_error_plot(
     axes[0].set_ylabel("Density frame NRMSE")
     axes[1].set_ylabel("Jy frame NRMSE")
     axes[1].set_xlabel("Global frame")
+    yscales = {"density": "linear", "jy": "linear"}
+    if experiment_name == "magnetic_ablation" and density_series:
+        yscales["density"] = apply_log_yscale_if_strictly_positive(
+            axes[0],
+            np.concatenate(density_series),
+            "magnetic_ablation named-window Density NRMSE",
+        )
+        yscales["jy"] = apply_log_yscale_if_strictly_positive(
+            axes[1],
+            np.concatenate(jy_series),
+            "magnetic_ablation named-window Jy NRMSE",
+        )
     for ax in axes:
         ax.grid(alpha=0.25)
         ax.legend(fontsize=8, ncol=2)
     fig.suptitle(title, y=0.98)
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
     fig.savefig(out_path, dpi=180)
     plt.close(fig)
     print(f"Saved framewise error plot: {out_path}")
-    return {"frame_ids": frame_ids.tolist(), "rows": payload}
+    return {
+        "frame_ids": frame_ids.tolist(),
+        "density_nrmse_yscale": yscales["density"],
+        "jy_nrmse_yscale": yscales["jy"],
+        "rows": payload,
+    }
 
 
 def parse_args():
@@ -248,10 +332,12 @@ def parse_args():
         "--magnetic-visible-fractions",
         type=float,
         nargs="+",
-        default=[1.0, 0.8, 0.6, 0.4, 0.2, 0.0],
+        default=list(DEFAULT_MAGNETIC_ABLATION_VISIBLE_FRACTIONS),
         help=(
-            "Magnetic visible fractions for the nested spatial-random ablation. "
-            "Default: 1.0 0.8 0.6 0.4 0.2 0.0."
+            "Magnetic visible fractions in [0, 1] for the nested spatial-random "
+            "ablation. Default percents: "
+            + " ".join(f"{percent:g}" for percent in DEFAULT_MAGNETIC_ABLATION_VISIBLE_PERCENTS)
+            + "."
         ),
     )
     p.add_argument(
@@ -889,16 +975,16 @@ def build_magnetic_ablation_rows(
 
     rows = []
     for visible_fraction in magnetic_visible_fractions:
-        num_visible = int(round(visible_fraction * num_sites))
+        num_visible = magnetic_ablation_visible_count(num_sites, visible_fraction)
         magnetic_plane = (rank < num_visible).reshape(1, 1, 1, size_x, size_z)
         magnetic_plane = magnetic_plane.to(device=block.device, dtype=block.dtype)
         magnetic_mask = magnetic_plane.expand(batch, 3, time, size_x, size_z)
 
         mask = torch.cat([magnetic_mask, density_mask], dim=1).contiguous()
-        magnetic_actual = float(magnetic_mask.mean().item())
+        percent_label = format_magnetic_visible_percent(visible_fraction)
         label = (
             "Magnetic information ablation\n"
-            f"B visible={100.0 * magnetic_actual:.2f}% (nested random)\n"
+            f"{percent_label} (nested random)\n"
             "Density probes=0 (fully hidden)"
         )
         rows.append((f"magnetic_ablation_{visible_fraction:g}", label, mask))
@@ -1211,7 +1297,7 @@ def validation_statistics_legend_label(
         return f"Density probes={probes}"
     if experiment_name == "magnetic_ablation":
         visible_fraction = float(name.rsplit("_", 1)[1])
-        return f"B visible={100.0 * visible_fraction:g}%"
+        return format_magnetic_visible_percent(visible_fraction)
     if experiment_name == "multifunction":
         return name.replace("_", " ")
     return name.replace("_", " ")
@@ -1258,6 +1344,7 @@ def save_validation_statistics_plot(
                 "row": row_index + 1,
                 "name": row["name"],
                 "label": row["label"],
+                "legend_label": label,
                 "density_nrmse": {
                     key: row["density"][key].tolist()
                     for key in ("median", "p16", "p84")
@@ -1278,6 +1365,30 @@ def save_validation_statistics_plot(
     axes[0].set_ylabel("Density frame NRMSE")
     axes[1].set_ylabel("Jy frame NRMSE")
     axes[1].set_xlabel(f"Local frame in {context_length}-frame context window")
+    yscales = {"density": "linear", "jy": "linear"}
+    if experiment_name == "magnetic_ablation":
+        yscales["density"] = apply_log_yscale_if_strictly_positive(
+            axes[0],
+            np.concatenate(
+                [
+                    row["density"][key]
+                    for row in row_statistics
+                    for key in ("median", "p16", "p84")
+                ]
+            ),
+            "magnetic_ablation validation Density NRMSE",
+        )
+        yscales["jy"] = apply_log_yscale_if_strictly_positive(
+            axes[1],
+            np.concatenate(
+                [
+                    row["jy"][key]
+                    for row in row_statistics
+                    for key in ("median", "p16", "p84")
+                ]
+            ),
+            "magnetic_ablation validation Jy NRMSE",
+        )
     for axis in axes:
         axis.grid(alpha=0.25)
     run_count = len(row_statistics[0]["density"]["run_names"])
@@ -1300,7 +1411,7 @@ def save_validation_statistics_plot(
         left=0.10,
         right=0.985,
         bottom=0.09,
-        top=0.86,
+        top=0.84,
         hspace=0.12,
     )
     fig.savefig(out_path, dpi=180)
@@ -1312,6 +1423,8 @@ def save_validation_statistics_plot(
         "context_length": context_length,
         "run_count": run_count,
         "window_count": total_windows,
+        "density_nrmse_yscale": yscales["density"],
+        "jy_nrmse_yscale": yscales["jy"],
         "aggregation_policy": (
             "median across windows within each run, then cross-run median and "
             "16th-84th percentiles"
@@ -1515,7 +1628,7 @@ def _make_comparison_axes(n_rows: int):
         left=0.16,
         right=0.965,
         bottom=bottom_inches / fig_h,
-        top=1.0 - title_inches / fig_h,
+        top=1.0 - title_inches / fig_h - 0.03,
     )
 
     axes = np.empty((n_rows, 4), dtype=object)
@@ -2415,6 +2528,7 @@ def main():
             frame_ids=frame_ids,
             out_path=out_dir / f"{experiment_stem}_error_vs_frame.png",
             title=f"{experiment_name}: error by frame",
+            experiment_name=experiment_name,
         )
         error_path = out_dir / f"{experiment_stem}_error_vs_frame.json"
         error_path.write_text(json.dumps(error_payload, indent=2))

@@ -11,6 +11,8 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from visualize_mask_patterns_unet3d import (  # noqa: E402
+    DEFAULT_MAGNETIC_ABLATION_VISIBLE_FRACTIONS,
+    apply_log_yscale_if_strictly_positive,
     build_density_forecast_rows,
     build_density_only_multifunction_rows,
     build_density_superres_rows,
@@ -20,10 +22,15 @@ from visualize_mask_patterns_unet3d import (  # noqa: E402
     compute_jy,
     collect_validation_statistics,
     default_density_forecast_visible_frames,
+    format_magnetic_visible_percent,
+    magnetic_ablation_visible_count,
     compute_normalized_metrics,
     normalized_residual,
+    save_information_suite_error_plot,
+    save_validation_statistics_plot,
     select_validation_statistics_indices,
     select_run_t0_index,
+    validation_statistics_legend_label,
     write_animation,
 )
 
@@ -214,21 +221,145 @@ def test_density_superres_uses_exact_requested_probe_counts():
 
 
 def test_magnetic_ablation_is_nested_and_hides_all_density():
-    targets = [1.0, 0.8, 0.6, 0.4, 0.2, 0.0]
+    targets = list(DEFAULT_MAGNETIC_ABLATION_VISIBLE_FRACTIONS)
     rows = build_magnetic_ablation_rows(
         block=make_block(),
         magnetic_visible_fractions=targets,
         generator=make_generator(),
     )
+    num_sites = SHAPE[-2] * SHAPE[-1]
 
-    assert len(rows) == 6
-    for (_, label, mask), target in zip(rows, targets):
-        assert abs(float(mask[:, :3].mean()) - target) < 1e-4
+    assert len(rows) == 8
+    expected_labels = [
+        "B visible=100%",
+        "B visible=30%",
+        "B visible=10%",
+        "B visible=3%",
+        "B visible=1%",
+        "B visible=0.3%",
+        "B visible=0.1%",
+        "B visible=0%",
+    ]
+    for (name, label, mask), target, expected_label in zip(
+        rows, targets, expected_labels
+    ):
+        visible_count = int(mask[0, 0, 0].sum())
+        assert visible_count == magnetic_ablation_visible_count(num_sites, target)
+        assert torch.all(mask[:, 0] == mask[:, 1])
+        assert torch.all(mask[:, 1] == mask[:, 2])
         assert torch.all(mask[:, 3:4] == 0)
-        assert "Density probes=0" in label
+        assert expected_label in label
+        assert validation_statistics_legend_label(
+            "magnetic_ablation", {"name": name}, context_length=24
+        ) == expected_label
+
+    assert torch.all(rows[0][2][:, :3] == 1)
+    assert torch.all(rows[-1][2][:, :3] == 0)
+    assert magnetic_ablation_visible_count(num_sites, 0.0) == 0
+    assert magnetic_ablation_visible_count(num_sites, 1.0) == num_sites
 
     for (_, _, higher), (_, _, lower) in zip(rows, rows[1:]):
         assert torch.all(lower[:, :3] <= higher[:, :3])
+
+
+def test_magnetic_ablation_nrmse_panels_use_log_scale_when_positive(tmp_path):
+    frames = np.arange(3)
+    rows = []
+    for fraction, offset in zip((1.0, 0.001, 0.0), (0.2, 0.5, 0.9)):
+        pred = np.full((4, 3, 2, 2), offset, dtype=np.float64)
+        pred_jy = np.full((3, 2, 2), offset + 0.1, dtype=np.float64)
+        rows.append(
+            {
+                "name": f"magnetic_ablation_{fraction:g}",
+                "label": f"Magnetic information ablation\n{format_magnetic_visible_percent(fraction)} (nested random)",
+                "pred_normalized": pred,
+                "pred_jy_normalized": pred_jy,
+            }
+        )
+    target = np.zeros((4, 3, 2, 2), dtype=np.float64)
+    target_jy = np.zeros((3, 2, 2), dtype=np.float64)
+    payload = save_information_suite_error_plot(
+        target_field_normalized=target,
+        target_jy_normalized=target_jy,
+        rows=rows,
+        frame_ids=frames,
+        out_path=tmp_path / "named_magnetic_ablation.png",
+        title="magnetic_ablation: error by frame",
+        experiment_name="magnetic_ablation",
+    )
+    assert payload["density_nrmse_yscale"] == "log"
+    assert payload["jy_nrmse_yscale"] == "log"
+    assert [row["legend_label"] for row in payload["rows"]] == [
+        "B visible=100%",
+        "B visible=0.1%",
+        "B visible=0%",
+    ]
+
+    statistics_rows = []
+    for fraction, value in zip((1.0, 0.0), (0.4, 0.8)):
+        curve = np.full(3, value, dtype=np.float64)
+        statistics_rows.append(
+            {
+                "name": f"magnetic_ablation_{fraction:g}",
+                "label": format_magnetic_visible_percent(fraction),
+                "density": {
+                    "run_names": ["run_a"],
+                    "window_counts": {"run_a": 1},
+                    "run_profiles": curve[None, :],
+                    "median": curve,
+                    "p16": curve * 0.9,
+                    "p84": curve * 1.1,
+                },
+                "jy": {
+                    "run_names": ["run_a"],
+                    "window_counts": {"run_a": 1},
+                    "run_profiles": (curve + 0.05)[None, :],
+                    "median": curve + 0.05,
+                    "p16": (curve + 0.05) * 0.9,
+                    "p84": (curve + 0.05) * 1.1,
+                },
+            }
+        )
+    stats_payload = save_validation_statistics_plot(
+        experiment_name="magnetic_ablation",
+        row_statistics=statistics_rows,
+        context_length=3,
+        total_windows=1,
+        out_path=tmp_path / "validation_magnetic_ablation.png",
+    )
+    assert stats_payload["density_nrmse_yscale"] == "log"
+    assert stats_payload["jy_nrmse_yscale"] == "log"
+    assert [row["legend_label"] for row in stats_payload["rows"]] == [
+        "B visible=100%",
+        "B visible=0%",
+    ]
+
+
+def test_nrmse_log_scale_is_skipped_when_a_panel_contains_zero():
+    class FakeAxis:
+        def __init__(self):
+            self.yscale = "linear"
+
+        def set_yscale(self, value):
+            self.yscale = value
+
+    axis = FakeAxis()
+    scale = apply_log_yscale_if_strictly_positive(
+        axis,
+        np.asarray([0.2, 0.0, 0.4]),
+        "unit-test Density NRMSE",
+    )
+    assert scale == "linear"
+    assert axis.yscale == "linear"
+
+    axis = FakeAxis()
+    scale = apply_log_yscale_if_strictly_positive(
+        axis,
+        np.asarray([0.2, 0.1, 0.4]),
+        "unit-test Jy NRMSE",
+    )
+    assert scale == "log"
+    assert axis.yscale == "log"
 
 
 def test_density_forecast_uses_complete_prefixes_and_full_magnetic_history():
