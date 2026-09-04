@@ -136,18 +136,19 @@ prediction = visible_normalized_fields + UNet_residual([visible_fields, masks])
 
 训练和验证的 MSE/MAE 都在这一归一化空间中计算。可视化默认反归一化到物理单位，因此图中报告的 Density/Jy 误差不能与训练日志里的四通道 normalized MSE 直接比较。
 
-### 4.2 四种 mask pattern
+### 4.2 五种 mask pattern
 
-每个 training sample 独立选择一种 pattern。当前四种 pattern 权重均为 1，即期望采样比例各约 25%。`spatial_block` 和 `temporal_random` 从 `[0,1)` 均匀采样 hidden fraction；两个 probe pattern 使用下面的 probe-count 混合分布。空间 mask 在窗口内所有 24 帧保持不变；`temporal_random` 则选择整帧可见或不可见。`temporal_random` 内部以 50% 概率沿用任意散布的可见帧，以 50% 概率生成单一时间边界；后一种情况再等概率选择可见 prefix（`VVVMMM`，正向外推）或可见 suffix（`MMMVVV`，时间反推）。
+每个 training sample 分别为磁场和 Density 独立选择一种 pattern；五种 pattern 默认等权。两种 modality 的 pattern、hidden severity 和具体 layout 均独立，只有 `Bx/By/Bz` 始终共享同一个 magnetic mask。`temporal_random` 只随机抽取 scattered visible frames；`temporal_block` 从 `[0,T]` 中抽取两个有方向的不同 boundary，自然覆盖中间缺失和中间可见/两侧缺失。
 
 | Pattern | 空间/时间含义 | 三个磁场 mask | Density 与磁场的关系 |
 |---|---|---|---|
 | `spatial_random` | 完全随机的 Density probe array，所有时间共用 | 50% 完全可见；50% 从 0–`X*Z` 抽取准确可见数，三通道共用随机位置 | 准确数量的 distinct probes，无放回均匀随机位置 |
 | `spatial_grid` | 近规则 Density probe array，所有时间共用 | 50% 完全可见；50% 从 0–`X*Z` 抽取准确可见数，三通道共用随机位置 | 准确 probe 数量，并随机化 grid phase/layout |
-| `spatial_block` | 隐藏一个随机矩形区域 | `Bx/By/Bz` 完全一致 | 四个通道完全共用 mask |
-| `temporal_random` | 50% 随机选择完整可见帧；50% 使用单一时间边界 | `Bx/By/Bz` 完全一致 | 四个通道完全共用 mask；边界 mask 等概率为 `VVVMMM` 或 `MMMVVV` |
+| `spatial_block` | 隐藏一个随机矩形区域 | `Bx/By/Bz` 完全一致 | B/Density 独立选择矩形和位置 |
+| `temporal_random` | 随机选择 scattered 完整可见帧 | `Bx/By/Bz` 完全一致 | B/Density 独立选择可见帧和数量 |
+| `temporal_block` | oriented 连续时间块：中间缺失或中间可见 | `Bx/By/Bz` 完全一致 | B/Density 独立选择 boundaries/orientation |
 
-因此当前规则是：任何情况下三个磁场通道都共享 mask；训练/验证中的 `spatial_random` 和 `spatial_grid` 独立采样磁场与 Density 的可见点数和位置，Density probe 的位置分布分别采用完全随机和近规则布局；`spatial_block/temporal_random` 则由四通道共用 mask。
+训练使用独立 B/Density sampler；controlled validation 和 visualization 保留旧 shared-pattern API，可以用同一 pattern 覆盖四个通道以维持标准 benchmark。
 
 两个 probe pattern 的 Density 都先以 50% 概率选择稀疏区间 0–30、以 50% 概率选择稠密区间 31–`X*Z`，再在所选闭区间内离散均匀抽取准确 probe 数量。磁场独立地以 50% 概率完全可见，以 50% 概率从 0–`X*Z` 均匀抽取准确可见点数；后一分支使用 `randperm(X*Z)` 无放回选址，三个磁场通道共用位置。这样两个 probe pattern 的平均磁场可见率约为 75%，且完整磁场与各种稀疏度都会出现。`spatial_grid` 的 Density 近规则阵列具有随机 phase，不能整齐分解成矩形 grid 时会从稍大的近各向同性 lattice 随机去掉多余位置；`spatial_random` 的 Density 同样使用无放回随机位置。可视化的 custom/multifunction grid 仍可使用显式固定 stride，不受训练专用 exact-count 路径影响。
 
@@ -213,7 +214,7 @@ masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine1500_
 
 ### 6.1 Multifunction：只 mask Density
 
-四行依次为 `spatial_random`、`spatial_grid`、`spatial_block`、`temporal_random`。磁场始终 100% visible，只有 Density 按各 pattern 遮挡，用于展示同一模型对多种观测几何的兼容性。其中 visualization-only 的 `spatial_block` 固定遮挡高 x 半区，以完整覆盖 plasmoid 出现范围。
+五行依次为 `spatial_random`、`spatial_grid`、`spatial_block`、`temporal_random`、`temporal_block`。磁场始终 100% visible，只有 Density 按各 pattern 遮挡，用于展示同一模型对多种观测几何的兼容性。其中 visualization-only 的 `spatial_block` 固定遮挡高 x 半区，以完整覆盖 plasmoid 出现范围。
 
 ### 6.2 Density super-resolution：probe 数量扫描
 

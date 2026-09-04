@@ -275,6 +275,22 @@ def test_spatial_pooling_keeps_parameter_and_state_dict_structure():
     spatial_pooling_model.load_state_dict(old_pooling_model.state_dict())
 
 
+def test_v12_keeps_v11_architecture_and_parameter_count():
+    model = UNet3D(
+        in_channels=8,
+        out_channels=4,
+        base_channels=24,
+        channel_mults=(1, 2, 4, 8),
+        use_attention=True,
+        spatial_only_pooling=True,
+    )
+
+    assert sum(parameter.numel() for parameter in model.parameters()) == 5_526_100
+    assert isinstance(model.attention_enc2, SpatiotemporalAttention3D)
+    assert isinstance(model.attention_mid, SpatiotemporalAttention3D)
+    assert model.enc1.pool.kernel_size == (1, 2, 2)
+
+
 def test_zero_initialized_attention_preserves_pretrained_unet_output():
     attention_off_model = UNet3D(
         base_channels=6,

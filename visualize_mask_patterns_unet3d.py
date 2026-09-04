@@ -544,6 +544,11 @@ def format_mask_label(info: Dict) -> str:
         )
     elif pattern == "temporal_random":
         detail = f"shared B/Density frames={info['visible_frames']}"
+    elif pattern == "temporal_block":
+        detail = (
+            f"shared B/Density start={info['start']}, end={info['end']}\n"
+            f"orientation={info['orientation']}"
+        )
     else:
         detail = ""
 
@@ -684,6 +689,9 @@ def build_density_only_multifunction_rows(
         "spatial_block": "Density spatial_block\nB visible=100%; Density-only hole",
         "temporal_random": (
             "Density temporal_random\nB visible=100%; Density-only hidden frames"
+        ),
+        "temporal_block": (
+            "Density temporal_block\nB visible=100%; Density-only oriented block"
         ),
     }
 

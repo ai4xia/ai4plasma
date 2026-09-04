@@ -8,20 +8,21 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 
 
-# Four basic mask topologies. Super-resolution, probe arrays, temporal
+# Five basic mask topologies. Super-resolution, probe arrays, temporal
 # interpolation and forecasting are not separate tasks here, they are just
-# particular mask geometries covered by these four.
+# particular mask geometries covered by these five.
 MASK_PATTERNS: Tuple[str, ...] = (
     "spatial_random",
     "spatial_grid",
     "spatial_block",
     "temporal_random",
+    "temporal_block",
 )
 
 # Increment this whenever the training-time meaning of a mask changes. It is
 # stored in checkpoints so auto-resume cannot silently mix incompatible mask
 # distributions in one run.
-MASKING_VERSION = "mixedB_sharedLayout_mixedTemporalBoundary_v6"
+MASKING_VERSION = "independentBD_fiveMask_orientedTemporalBlock_v7"
 
 PATTERN_TO_ID: Dict[str, int] = {name: i for i, name in enumerate(MASK_PATTERNS)}
 
@@ -29,21 +30,26 @@ PATTERN_TO_ID: Dict[str, int] = {name: i for i, name in enumerate(MASK_PATTERNS)
 # the exact-count path samples their common magnetic layout independently of
 # Density for spatial_grid and spatial_random. Density is near-regular for
 # spatial_grid and uniformly random without replacement for spatial_random. The
-# legacy fraction/fixed-stride APIs remain available to visualization callers.
-# spatial_block and temporal_random share one mask across all four channels.
-# Spatial layouts remain fixed throughout a window.
+# legacy shared-pattern API remains available to visualization and controlled
+# validation callers. Training uses sample_independent_batch_masks so B and
+# Density also choose their pattern and severity independently. Spatial layouts
+# remain fixed throughout a window.
 SPATIAL_MASK_PATTERNS: Tuple[str, ...] = (
     "spatial_random",
     "spatial_grid",
     "spatial_block",
 )
-TEMPORAL_MASK_PATTERNS: Tuple[str, ...] = ("temporal_random",)
+TEMPORAL_MASK_PATTERNS: Tuple[str, ...] = (
+    "temporal_random",
+    "temporal_block",
+)
 
 DEFAULT_PATTERN_WEIGHTS: Dict[str, float] = {
     "spatial_random": 1.0,
     "spatial_grid": 1.0,
     "spatial_block": 1.0,
     "temporal_random": 1.0,
+    "temporal_block": 1.0,
 }
 
 MAX_GRID_STRIDE = 32
@@ -85,6 +91,7 @@ def parse_pattern_weights(tokens: Sequence[str]) -> Dict[str, float]:
     Parse CLI tokens of the form:
 
         spatial_random 1 spatial_grid 1 spatial_block 1 temporal_random 1
+        temporal_block 1
 
     into a {pattern: weight} dict. Patterns that are not listed get weight 0.
     """
@@ -342,45 +349,81 @@ def _temporal_random_frames(T, p, generator):
     return tmask, info
 
 
-def _temporal_boundary_frames(T, p, generator):
-    """
-    Split the window at one temporal boundary.
+def _temporal_block_from_boundaries(T: int, start: int, end: int):
+    """Build one oriented temporal block from two distinct boundaries."""
+    if not (0 <= start <= T and 0 <= end <= T):
+        raise ValueError(
+            f"Temporal boundaries must lie in [0, {T}], got {start} and {end}."
+        )
+    if start == end:
+        raise ValueError("Temporal block boundaries must be different.")
 
-    The requested number of visible frames forms either a prefix (forward
-    prediction from the past) or a suffix (backward prediction from the
-    future), with equal probability.
-    """
-    n_visible = _round_clamp((1.0 - p) * T, 0, T)
-    visible_prefix = _rand(generator) < 0.5
-
-    tmask = torch.zeros(1, 1, T, 1, 1)
-    if visible_prefix:
-        tmask[:, :, :n_visible] = 1.0
-        visible = torch.arange(n_visible)
-        direction = "visible_prefix"
-        transition_index = n_visible
+    if end > start:
+        tmask = torch.ones(1, 1, T, 1, 1)
+        tmask[:, :, start:end] = 0.0
+        orientation = "inside_masked"
+        temporal_direction = "forward"
     else:
-        first_visible = T - n_visible
-        tmask[:, :, first_visible:] = 1.0
-        visible = torch.arange(first_visible, T)
-        direction = "visible_suffix"
-        transition_index = first_visible
+        tmask = torch.zeros(1, 1, T, 1, 1)
+        tmask[:, :, end:start] = 1.0
+        orientation = "inside_visible"
+        temporal_direction = "reverse"
 
+    visible = torch.nonzero(tmask[0, 0, :, 0, 0], as_tuple=False).flatten()
     info = {
-        "temporal_mode": "contiguous_boundary",
-        "temporal_direction": direction,
-        "transition_index": int(transition_index),
-        "num_visible_frames": int(n_visible),
+        "temporal_mode": "oriented_block",
+        "temporal_direction": temporal_direction,
+        "orientation": orientation,
+        "start": int(start),
+        "end": int(end),
+        "num_visible_frames": int(visible.numel()),
         "visible_frames": [int(t) for t in visible.tolist()],
+        "actual_mask_fraction": float(1.0 - tmask.mean().item()),
     }
     return tmask, info
 
 
-def _temporal_mixed_frames(T, p, generator):
-    """Mix scattered-frame and contiguous-boundary masks 50/50."""
-    if _rand(generator) < 0.5:
+def _temporal_block_frames(T, generator):
+    """Uniformly sample two oriented boundaries from [0, T]."""
+    boundaries = torch.randperm(T + 1, generator=generator)[:2]
+    return _temporal_block_from_boundaries(
+        T,
+        int(boundaries[0]),
+        int(boundaries[1]),
+    )
+
+
+def _sample_modality_mask(
+    *,
+    modality: str,
+    pattern: str,
+    T: int,
+    X: int,
+    Z: int,
+    mask_fraction: float,
+    generator: Optional[torch.Generator],
+    visible_count: Optional[int] = None,
+):
+    """Sample one B or Density layout without sampling the other modality."""
+    p = float(mask_fraction)
+    if pattern == "spatial_random":
+        if visible_count is None:
+            return _spatial_random_plane(1, 1, X, Z, p, generator)
+        return _random_probe_plane(1, 1, X, Z, visible_count, generator)
+    if pattern == "spatial_grid":
+        if visible_count is None:
+            return _spatial_grid_plane(1, 1, X, Z, p, generator)
+        if modality == "magnetic":
+            # Preserve the existing magnetic exact-count random layout.
+            return _random_probe_plane(1, 1, X, Z, visible_count, generator)
+        return _sparse_probe_grid_plane(1, 1, X, Z, visible_count, generator)
+    if pattern == "spatial_block":
+        return _spatial_block_plane(1, 1, X, Z, p, generator)
+    if pattern == "temporal_random":
         return _temporal_random_frames(T, p, generator)
-    return _temporal_boundary_frames(T, p, generator)
+    if pattern == "temporal_block":
+        return _temporal_block_frames(T, generator)
+    raise ValueError(f"Unhandled mask pattern {pattern!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -512,7 +555,11 @@ def sample_mask(
         density_small = magnetic_small
         density_info = dict(magnetic_info)
     elif pattern == "temporal_random":
-        magnetic_small, magnetic_info = _temporal_mixed_frames(T, p, generator)
+        magnetic_small, magnetic_info = _temporal_random_frames(T, p, generator)
+        density_small = magnetic_small
+        density_info = dict(magnetic_info)
+    elif pattern == "temporal_block":
+        magnetic_small, magnetic_info = _temporal_block_frames(T, generator)
         density_small = magnetic_small
         density_info = dict(magnetic_info)
     else:
@@ -594,6 +641,123 @@ def sample_batch_masks(
             generator=generator,
             density_probe_count=density_probe_counts[i],
             magnetic_visible_count=magnetic_visible_counts[i],
+        )
+        masks.append(mask)
+        infos.append(info)
+
+    return torch.cat(masks, dim=0), infos
+
+
+def sample_independent_batch_masks(
+    shape: Sequence[int],
+    magnetic_patterns: Sequence[str],
+    density_patterns: Sequence[str],
+    magnetic_mask_fractions: Sequence[float],
+    density_mask_fractions: Sequence[float],
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.float32,
+    generator: Optional[torch.Generator] = None,
+    density_probe_counts: Optional[Sequence[Optional[int]]] = None,
+    magnetic_visible_counts: Optional[Sequence[Optional[int]]] = None,
+) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
+    """Sample independent magnetic and Density patterns for every sample.
+
+    Bx/By/Bz share the sampled magnetic layout. Density has its own pattern,
+    severity and random layout, even when both modalities draw the same pattern
+    name. The legacy sample_mask/sample_batch_masks shared-pattern path remains
+    unchanged for visualization and controlled validation.
+    """
+    if len(shape) != 5:
+        raise ValueError(f"Expected a (B, C, T, X, Z) shape, got {tuple(shape)}")
+    B, C, T, X, Z = (int(s) for s in shape)
+    if C != 4:
+        raise ValueError(
+            "VPIC masking expects exactly four channels ordered as "
+            f"(Bx, By, Bz, Density), got C={C}."
+        )
+
+    sequences = {
+        "magnetic patterns": magnetic_patterns,
+        "density patterns": density_patterns,
+        "magnetic mask fractions": magnetic_mask_fractions,
+        "density mask fractions": density_mask_fractions,
+    }
+    for label, values in sequences.items():
+        if len(values) != B:
+            raise ValueError(f"Expected {B} {label}, got {len(values)}.")
+
+    for pattern in (*magnetic_patterns, *density_patterns):
+        if pattern not in MASK_PATTERNS:
+            raise ValueError(
+                f"Unknown mask pattern {pattern!r}. Available: {list(MASK_PATTERNS)}"
+            )
+
+    if density_probe_counts is None:
+        density_probe_counts = [None] * B
+    if magnetic_visible_counts is None:
+        magnetic_visible_counts = [None] * B
+    if len(density_probe_counts) != B or len(magnetic_visible_counts) != B:
+        raise ValueError(
+            f"Expected {B} Density and magnetic exact counts, got "
+            f"{len(density_probe_counts)} and {len(magnetic_visible_counts)}."
+        )
+
+    masks = []
+    infos = []
+    for i in range(B):
+        magnetic_pattern = magnetic_patterns[i]
+        density_pattern = density_patterns[i]
+        magnetic_fraction = float(magnetic_mask_fractions[i])
+        density_fraction = float(density_mask_fractions[i])
+
+        magnetic_small, magnetic_info = _sample_modality_mask(
+            modality="magnetic",
+            pattern=magnetic_pattern,
+            T=T,
+            X=X,
+            Z=Z,
+            mask_fraction=magnetic_fraction,
+            generator=generator,
+            visible_count=magnetic_visible_counts[i],
+        )
+        density_small, density_info = _sample_modality_mask(
+            modality="density",
+            pattern=density_pattern,
+            T=T,
+            X=X,
+            Z=Z,
+            mask_fraction=density_fraction,
+            generator=generator,
+            visible_count=density_probe_counts[i],
+        )
+
+        # Spatial masks are shaped (1, 1, 1, X, Z) and temporal masks are
+        # shaped (1, 1, T, 1, 1). Independent modalities may choose one of
+        # each, so broadcast both to the common spatiotemporal shape before
+        # concatenating channels.
+        magnetic_small = magnetic_small.expand(1, 3, T, X, Z)
+        density_small = density_small.expand(1, 1, T, X, Z)
+        small = torch.cat([magnetic_small, density_small], dim=1)
+        mask = small.to(device=device, dtype=dtype).contiguous()
+
+        magnetic_actual = float(1.0 - magnetic_small.mean().item())
+        density_actual = float(1.0 - density_small.mean().item())
+        info: Dict[str, Any] = {
+            "magnetic_pattern": magnetic_pattern,
+            "density_pattern": density_pattern,
+            "magnetic_target_mask_fraction": magnetic_fraction,
+            "density_target_mask_fraction": density_fraction,
+            "magnetic_actual_mask_fraction": magnetic_actual,
+            "density_actual_mask_fraction": density_actual,
+            "magnetic_visible_fraction": 1.0 - magnetic_actual,
+            "density_visible_fraction": 1.0 - density_actual,
+            "actual_mask_fraction": (3.0 * magnetic_actual + density_actual) / 4.0,
+        }
+        info.update(
+            {f"magnetic_{key}": value for key, value in magnetic_info.items()}
+        )
+        info.update(
+            {f"density_{key}": value for key, value in density_info.items()}
         )
         masks.append(mask)
         infos.append(info)

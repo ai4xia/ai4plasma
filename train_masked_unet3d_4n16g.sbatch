@@ -61,18 +61,18 @@ print("  CUDA availability will be checked inside the srun workers.")
 PY
 
 H5_DIR=/pscratch/sd/b/binxia/VPIC_PPPL_HDF5_by_beta_official2500_none_compat
-SOURCE_RUN_NAME=masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine1500_v9_balancedloss
-INIT_CHECKPOINT=runs/${SOURCE_RUN_NAME}/latest.pt
-RUN_NAME=masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine1500_v11_temporalboundary_attention_spatialpool
+SOURCE_RUN_NAME=masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine1500_v11_temporalboundary_attention_spatialpool
+INIT_CHECKPOINT=runs/${SOURCE_RUN_NAME}/best.pt
+RUN_NAME=masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v12_independentBD_fivemask_attention_spatialpool_b8_e4500
 
 BETAS=(0.2)
 DELTA_T=24
 STRIDE_T=2
 
-# Per-GPU batch size. With 16 GPUs this gives global batch size 64.
-BATCH_SIZE=4
+# Per-GPU batch size. With 16 GPUs this gives global batch size 128.
+BATCH_SIZE=8
 NUM_WORKERS=4
-EPOCHS=1500
+EPOCHS=4500
 LR=2e-4
 WARMUP_EPOCHS=10
 MIN_LR=2e-6
@@ -86,6 +86,7 @@ MASK_PATTERNS=(
     spatial_grid    1
     spatial_block   1
     temporal_random 1
+    temporal_block  1
 )
 
 WANDB_MODE=online

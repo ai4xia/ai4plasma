@@ -14,20 +14,33 @@ from data.masking import (  # noqa: E402
     MASK_PATTERNS,
     SPATIAL_MASK_PATTERNS,
     TEMPORAL_MASK_PATTERNS,
+    _temporal_block_from_boundaries,
     parse_pattern_weights,
     sample_batch_masks,
+    sample_independent_batch_masks,
     sample_mask,
     sample_patterns,
 )
 
 
 SHAPE = (2, 4, 8, 154, 62)
+EXPECTED_PATTERNS = (
+    "spatial_random",
+    "spatial_grid",
+    "spatial_block",
+    "temporal_random",
+    "temporal_block",
+)
 
 
 def make_generator(seed: int) -> torch.Generator:
     generator = torch.Generator()
     generator.manual_seed(seed)
     return generator
+
+
+def test_mask_patterns_are_exactly_the_five_v12_topologies():
+    assert MASK_PATTERNS == EXPECTED_PATTERNS
 
 
 def test_shape_and_binary():
@@ -82,7 +95,14 @@ def test_actual_fraction_tracks_target():
             measured = float(1.0 - mask.float().mean())
             assert abs(measured - info["actual_mask_fraction"]) < 1e-5, pattern
 
+            if pattern == "temporal_block":
+                # Its severity is determined by two random boundaries, not p.
+                continue
+
             errors.append(measured - p)
+
+        if pattern == "temporal_block":
+            continue
 
         mean_error = sum(errors) / len(errors)
         max_error = max(abs(e) for e in errors)
@@ -112,42 +132,41 @@ def test_temporal_random_masks_whole_frames():
     assert torch.equal(mask[:, 0], mask[:, 3])
 
 
-def test_temporal_random_mixes_scattered_and_bidirectional_boundary_masks():
+def test_temporal_random_is_only_scattered_random_frames():
     shape = (1, 4, 16, 3, 2)
-    mode_counts = {"random_frames": 0, "contiguous_boundary": 0}
-    direction_counts = {"visible_prefix": 0, "visible_suffix": 0}
+    mask, info = sample_mask(
+        shape,
+        "temporal_random",
+        0.375,
+        generator=make_generator(0),
+    )
 
-    for seed in range(400):
-        mask, info = sample_mask(
-            shape,
-            "temporal_random",
-            0.375,
-            generator=make_generator(seed),
-        )
-        mode_counts[info["temporal_mode"]] += 1
+    assert info["temporal_mode"] == "random_frames"
+    assert info["temporal_direction"] == "scattered"
+    assert "transition_index" not in info
+    assert len(info["visible_frames"]) == 10
+    frames = mask[0, 0, :, 0, 0]
+    transitions = torch.count_nonzero(frames[1:] != frames[:-1])
+    assert transitions > 2
 
-        if info["temporal_mode"] != "contiguous_boundary":
-            continue
 
-        direction = info["temporal_direction"]
-        direction_counts[direction] += 1
-        frames = mask[0, 0, :, 0, 0]
-        transition_index = info["transition_index"]
+def test_temporal_block_orientations_and_shape():
+    forward, forward_info = _temporal_block_from_boundaries(12, 3, 8)
+    assert tuple(forward.shape) == (1, 1, 12, 1, 1)
+    assert torch.all(forward[:, :, :3] == 1)
+    assert torch.all(forward[:, :, 3:8] == 0)
+    assert torch.all(forward[:, :, 8:] == 1)
+    assert forward_info["orientation"] == "inside_masked"
+    assert forward_info["temporal_direction"] == "forward"
+    assert forward_info["start"] == 3 and forward_info["end"] == 8
 
-        if direction == "visible_prefix":
-            assert torch.all(frames[:transition_index] == 1)
-            assert torch.all(frames[transition_index:] == 0)
-        elif direction == "visible_suffix":
-            assert torch.all(frames[:transition_index] == 0)
-            assert torch.all(frames[transition_index:] == 1)
-        else:
-            raise AssertionError(f"Unexpected temporal direction: {direction}")
-
-    assert 0.4 < mode_counts["random_frames"] / 400 < 0.6
-    assert 0.4 < mode_counts["contiguous_boundary"] / 400 < 0.6
-    boundary_count = mode_counts["contiguous_boundary"]
-    assert 0.4 < direction_counts["visible_prefix"] / boundary_count < 0.6
-    assert 0.4 < direction_counts["visible_suffix"] / boundary_count < 0.6
+    reverse, reverse_info = _temporal_block_from_boundaries(12, 9, 2)
+    assert torch.all(reverse[:, :, :2] == 0)
+    assert torch.all(reverse[:, :, 2:9] == 1)
+    assert torch.all(reverse[:, :, 9:] == 0)
+    assert reverse_info["orientation"] == "inside_visible"
+    assert reverse_info["temporal_direction"] == "reverse"
+    assert reverse_info["start"] == 9 and reverse_info["end"] == 2
 
 
 def test_spatial_grid_is_a_regular_lattice():
@@ -341,8 +360,8 @@ def test_same_seed_is_reproducible():
 
 
 def test_batch_masks_mix_patterns_per_sample():
-    patterns = ["spatial_random", "temporal_random", "spatial_grid", "spatial_block"]
-    fractions = [0.1, 0.4, 0.7, 0.9]
+    patterns = list(MASK_PATTERNS)
+    fractions = [0.1, 0.4, 0.7, 0.9, 0.5]
     shape = (len(patterns), 4, 8, 40, 30)
 
     mask, infos = sample_batch_masks(
@@ -359,6 +378,49 @@ def test_batch_masks_mix_patterns_per_sample():
     for i in range(len(patterns)):
         measured = float(1.0 - mask[i].float().mean())
         assert abs(measured - infos[i]["actual_mask_fraction"]) < 1e-5
+
+
+def test_independent_batch_masks_keep_b_shared_and_density_independent():
+    shape = (2, 4, 8, 20, 12)
+    mask, infos = sample_independent_batch_masks(
+        shape,
+        magnetic_patterns=["spatial_block", "temporal_random"],
+        density_patterns=["spatial_block", "temporal_random"],
+        magnetic_mask_fractions=[0.5, 0.5],
+        density_mask_fractions=[0.5, 0.5],
+        generator=make_generator(18),
+    )
+
+    assert tuple(mask.shape) == shape
+    assert torch.equal(mask[:, 0], mask[:, 1])
+    assert torch.equal(mask[:, 1], mask[:, 2])
+    assert not torch.equal(mask[0, 0], mask[0, 3])
+    assert not torch.equal(mask[1, 0], mask[1, 3])
+    assert infos[0]["magnetic_pattern"] == "spatial_block"
+    assert infos[0]["density_pattern"] == "spatial_block"
+    assert infos[0]["magnetic_rect_x0"] != infos[0]["density_rect_x0"] or (
+        infos[0]["magnetic_rect_z0"] != infos[0]["density_rect_z0"]
+    )
+
+
+def test_independent_batch_masks_mix_spatial_and_temporal_modalities():
+    shape = (2, 4, 8, 20, 12)
+    mask, infos = sample_independent_batch_masks(
+        shape,
+        magnetic_patterns=["spatial_random", "temporal_block"],
+        density_patterns=["temporal_block", "spatial_grid"],
+        magnetic_mask_fractions=[0.4, 0.5],
+        density_mask_fractions=[0.5, 0.6],
+        generator=make_generator(19),
+    )
+
+    assert tuple(mask.shape) == shape
+    assert torch.equal(mask[:, 0], mask[:, 1])
+    assert torch.equal(mask[:, 1], mask[:, 2])
+    assert infos[0]["magnetic_pattern"] == "spatial_random"
+    assert infos[0]["density_pattern"] == "temporal_block"
+    assert infos[1]["magnetic_pattern"] == "temporal_block"
+    assert infos[1]["density_pattern"] == "spatial_grid"
 
 
 def test_parse_pattern_weights():

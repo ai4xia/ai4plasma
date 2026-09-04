@@ -30,6 +30,7 @@ from data.masking import (
     make_visible_input,
     parse_pattern_weights,
     sample_batch_masks,
+    sample_independent_batch_masks,
     sample_patterns,
 )
 from models.unet3d import MODEL_VERSION, UNet3D
@@ -262,9 +263,9 @@ def parse_args():
         type=str,
         default=None,
         help=(
-            "Initialize model, optimizer, and channel statistics from a checkpoint, "
-            "while starting a new epoch/LR schedule. Ignored when auto-resuming from "
-            "out-dir/latest.pt."
+            "Initialize model weights and channel statistics from a checkpoint, "
+            "with a fresh optimizer and epoch/LR schedule. Ignored when "
+            "auto-resuming from out-dir/latest.pt."
         ),
     )
 
@@ -421,7 +422,7 @@ def default_run_name(args) -> str:
     ).hexdigest()[:8]
     return (
         f"masked-unet3d_beta{beta_text}_dt{args.delta_t}_"
-        f"bc{args.base_channels}_fourmask_{signature}"
+        f"bc{args.base_channels}_fivemask_{signature}"
     )
 
 
@@ -619,13 +620,13 @@ def train_one_epoch(
 
     n_patterns = len(MASK_PATTERNS)
 
-    # Accumulate on device and read back once per epoch, so per-pattern logging
-    # does not synchronize the GPU on every step.
+    # Accumulate on device and read back once per epoch. Training patterns are
+    # independent marginals, so no ambiguous 5x5 combination loss is logged.
     sum_mse = torch.zeros((), device=device)
     sum_mae = torch.zeros((), device=device)
-    sum_mse_by_pattern = torch.zeros(n_patterns, device=device)
-    sum_actual_by_pattern = torch.zeros(n_patterns, device=device)
-    count_by_pattern = torch.zeros(n_patterns, device=device)
+    magnetic_pattern_counts = torch.zeros(n_patterns, device=device)
+    density_pattern_counts = torch.zeros(n_patterns, device=device)
+    sum_actual_fraction = torch.zeros((), device=device)
 
     sum_target_fraction = 0.0
     count_samples = 0
@@ -648,17 +649,19 @@ def train_one_epoch(
 
         batch_size = y.shape[0]
 
-        patterns = sample_patterns(pattern_weights, batch_size)
-        fractions = torch.rand(batch_size).tolist()
+        magnetic_patterns = sample_patterns(pattern_weights, batch_size)
+        density_patterns = sample_patterns(pattern_weights, batch_size)
+        magnetic_fractions = torch.rand(batch_size).tolist()
+        density_fractions = torch.rand(batch_size).tolist()
         spatial_sites = int(y.shape[-2] * y.shape[-1])
         density_probe_counts = sample_mixed_density_probe_counts(
-            patterns,
+            density_patterns,
             minimum=density_probe_min,
             maximum=density_probe_max,
             spatial_sites=spatial_sites,
         )
         magnetic_visible_counts = sample_mixed_magnetic_visible_counts(
-            patterns,
+            magnetic_patterns,
             spatial_sites=spatial_sites,
         )
         probe_counts_in_batch = [
@@ -677,28 +680,24 @@ def train_one_epoch(
         fully_visible_magnetic_sample_count += sum(
             count == spatial_sites for count in magnetic_counts_in_batch
         )
-        for i, (probe_count, magnetic_count) in enumerate(
-            zip(density_probe_counts, magnetic_visible_counts)
-        ):
+        for i, probe_count in enumerate(density_probe_counts):
             if probe_count is not None:
-                if magnetic_count is None:
-                    raise RuntimeError(
-                        "Probe-pattern sample is missing its magnetic visible count."
-                    )
                 if probe_count > spatial_sites:
                     raise ValueError(
                         f"Density probe count {probe_count} exceeds the "
                         f"{spatial_sites} spatial sites."
                     )
-                # Three B channels share magnetic_count visible sites; Density
-                # independently contains probe_count sites.
-                visible_values = 3 * magnetic_count + probe_count
-                fractions[i] = 1.0 - visible_values / (4.0 * spatial_sites)
+                density_fractions[i] = 1.0 - probe_count / spatial_sites
+        for i, magnetic_count in enumerate(magnetic_visible_counts):
+            if magnetic_count is not None:
+                magnetic_fractions[i] = 1.0 - magnetic_count / spatial_sites
 
-        mask, _ = sample_batch_masks(
+        mask, mask_infos = sample_independent_batch_masks(
             y.shape,
-            patterns=patterns,
-            mask_fractions=fractions,
+            magnetic_patterns=magnetic_patterns,
+            density_patterns=density_patterns,
+            magnetic_mask_fractions=magnetic_fractions,
+            density_mask_fractions=density_fractions,
             device=device,
             dtype=y.dtype,
             density_probe_counts=density_probe_counts,
@@ -727,21 +726,40 @@ def train_one_epoch(
         scaler.update()
 
         with torch.no_grad():
-            pattern_ids = torch.tensor(
-                [PATTERN_TO_ID[name] for name in patterns],
+            magnetic_pattern_ids = torch.tensor(
+                [PATTERN_TO_ID[name] for name in magnetic_patterns],
                 device=device,
             )
-            per_sample_mse = (pred.detach().float() - y).pow(2).flatten(1).mean(1)
+            density_pattern_ids = torch.tensor(
+                [PATTERN_TO_ID[name] for name in density_patterns],
+                device=device,
+            )
             per_sample_actual = 1.0 - mask.flatten(1).mean(1)
-
-            sum_mse_by_pattern.index_add_(0, pattern_ids, per_sample_mse)
-            sum_actual_by_pattern.index_add_(0, pattern_ids, per_sample_actual)
-            count_by_pattern.index_add_(0, pattern_ids, torch.ones_like(per_sample_mse))
+            ones = torch.ones(batch_size, device=device)
+            magnetic_pattern_counts.index_add_(0, magnetic_pattern_ids, ones)
+            density_pattern_counts.index_add_(0, density_pattern_ids, ones)
+            sum_actual_fraction += per_sample_actual.sum()
 
             sum_mse += loss_mse.detach().float()
             sum_mae += loss_mae.detach().float()
 
-        sum_target_fraction += sum(fractions)
+        # temporal_block samples two boundaries directly, so its requested
+        # random fraction is intentionally ignored; use the realized fraction
+        # for that modality when reporting the effective masking target.
+        for i, info in enumerate(mask_infos):
+            magnetic_target = (
+                info["magnetic_actual_mask_fraction"]
+                if magnetic_patterns[i] == "temporal_block"
+                else magnetic_fractions[i]
+            )
+            density_target = (
+                info["density_actual_mask_fraction"]
+                if density_patterns[i] == "temporal_block"
+                else density_fractions[i]
+            )
+            sum_target_fraction += (
+                3.0 * magnetic_target + density_target
+            ) / 4.0
         count_samples += batch_size
         total_batches += 1
 
@@ -779,9 +797,9 @@ def train_one_epoch(
     )
     if distributed_is_initialized():
         dist.all_reduce(totals, op=dist.ReduceOp.SUM)
-        dist.all_reduce(sum_mse_by_pattern, op=dist.ReduceOp.SUM)
-        dist.all_reduce(sum_actual_by_pattern, op=dist.ReduceOp.SUM)
-        dist.all_reduce(count_by_pattern, op=dist.ReduceOp.SUM)
+        dist.all_reduce(magnetic_pattern_counts, op=dist.ReduceOp.SUM)
+        dist.all_reduce(density_pattern_counts, op=dist.ReduceOp.SUM)
+        dist.all_reduce(sum_actual_fraction, op=dist.ReduceOp.SUM)
 
     (
         global_mse,
@@ -796,21 +814,6 @@ def train_one_epoch(
         global_magnetic_sample_count,
         global_fully_visible_magnetic_sample_count,
     ) = totals.tolist()
-    counts = count_by_pattern.cpu()
-    mse_by_pattern = (sum_mse_by_pattern.cpu() / counts.clamp(min=1.0)).tolist()
-    actual_by_pattern = (sum_actual_by_pattern.cpu() / counts.clamp(min=1.0)).tolist()
-    counts = counts.tolist()
-
-    per_pattern = {
-        name: {
-            "mse": mse_by_pattern[i],
-            "actual_mask_fraction": actual_by_pattern[i],
-            "share": counts[i] / max(global_samples, 1),
-        }
-        for i, name in enumerate(MASK_PATTERNS)
-        if counts[i] > 0
-    }
-
     total_count = max(global_samples, 1)
     probe_count = max(global_probe_sample_count, 1)
     mean_density_probes = global_probe_sum / probe_count
@@ -821,7 +824,7 @@ def train_one_epoch(
         "mse": global_mse / max(global_batches, 1),
         "mae": global_mae / max(global_batches, 1),
         "target_mask_fraction": global_target / total_count,
-        "actual_mask_fraction": float(sum_actual_by_pattern.sum().cpu()) / total_count,
+        "actual_mask_fraction": float(sum_actual_fraction.cpu()) / total_count,
         "density_probe_count": mean_density_probes,
         "density_visible_fraction": mean_density_probes / max(spatial_sites, 1),
         "sparse_density_sample_share": global_sparse_sample_count / probe_count,
@@ -830,7 +833,14 @@ def train_one_epoch(
         "fully_visible_magnetic_sample_share": (
             global_fully_visible_magnetic_sample_count / magnetic_count
         ),
-        "per_pattern": per_pattern,
+        "magnetic_pattern_share": {
+            name: float(magnetic_pattern_counts[i].cpu()) / total_count
+            for i, name in enumerate(MASK_PATTERNS)
+        },
+        "density_pattern_share": {
+            name: float(density_pattern_counts[i].cpu()) / total_count
+            for i, name in enumerate(MASK_PATTERNS)
+        },
     }
 
 
@@ -1195,7 +1205,6 @@ def main():
         )
         if source_uses_attention == args.use_attention:
             model.load_state_dict(init_checkpoint["model"])
-            optimizer.load_state_dict(init_checkpoint["optimizer"])
         else:
             source_state = init_checkpoint["model"]
             if args.use_attention:
@@ -1227,9 +1236,9 @@ def main():
                 )
             rank_print(
                 "Attention setting differs from the initialization checkpoint; "
-                "loaded compatible convolutional weights and started a fresh "
-                "optimizer state."
+                "loaded compatible convolutional weights."
             )
+        rank_print("Initialization uses a fresh optimizer and LR schedule.")
 
     if distributed_is_initialized():
         model = DistributedDataParallel(
@@ -1278,7 +1287,6 @@ def main():
         wandb_run.define_metric("train/*", step_metric="epoch")
         wandb_run.define_metric("val/*", step_metric="epoch")
         wandb_run.define_metric("mask/*", step_metric="epoch")
-        wandb_run.define_metric("mask_pattern/*", step_metric="epoch")
         wandb_run.define_metric("optimization/*", step_metric="epoch")
 
     history = []
@@ -1380,7 +1388,12 @@ def main():
             "train_fully_visible_magnetic_sample_share": train_metrics[
                 "fully_visible_magnetic_sample_share"
             ],
-            "train_per_pattern": train_metrics["per_pattern"],
+            "train_magnetic_pattern_share": train_metrics[
+                "magnetic_pattern_share"
+            ],
+            "train_density_pattern_share": train_metrics[
+                "density_pattern_share"
+            ],
             "val_per_pattern": {
                 pattern: val_metrics[pattern] for pattern in args.val_patterns
             },
@@ -1420,12 +1433,13 @@ def main():
                 "optimization/learning_rate": row["learning_rate"],
             }
 
-            for pattern, pattern_metrics in train_metrics["per_pattern"].items():
-                log_data[f"train/{pattern}/mse"] = pattern_metrics["mse"]
-                log_data[f"mask/{pattern}/actual_fraction"] = pattern_metrics[
-                    "actual_mask_fraction"
-                ]
-                log_data[f"mask_pattern/{pattern}"] = pattern_metrics["share"]
+            for pattern in MASK_PATTERNS:
+                log_data[f"mask/magnetic_pattern_share/{pattern}"] = (
+                    train_metrics["magnetic_pattern_share"][pattern]
+                )
+                log_data[f"mask/density_pattern_share/{pattern}"] = (
+                    train_metrics["density_pattern_share"][pattern]
+                )
 
             for pattern in args.val_patterns:
                 log_data[f"val/{pattern}/mse"] = val_metrics[pattern]["mse"]
