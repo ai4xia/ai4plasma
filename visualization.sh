@@ -6,12 +6,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-readonly RUN_DIR="runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine1500_v11_temporalboundary_attention_spatialpool"
+readonly RUN_DIR="runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v12_independentBD_fivemask_attention_spatialpool_b8_e4500"
 readonly RUN_NAME="beta0.2_nu2_Bz0_dt2_tau70"
 readonly WINDOW_T0=28
 readonly PLASMOID_X_INDEX=130
 readonly INFO_OUT="${RUN_DIR}/figures_information_suite_plasmoid_merger"
+readonly INFO_OUT_NO_B="${RUN_DIR}/figures_information_suite_plasmoid_merger_no_magnetic"
 readonly SLIDING_OUT="${RUN_DIR}/figures_sliding_density_reconstruction_plasmoid_merger"
+readonly SLIDING_OUT_NO_B="${RUN_DIR}/figures_sliding_density_reconstruction_plasmoid_merger_no_magnetic"
 
 if [[ ! -f "${RUN_DIR}/best.pt" ]]; then
     echo "ERROR: checkpoint not found: ${RUN_DIR}/best.pt" >&2
@@ -20,10 +22,10 @@ fi
 
 ml load pytorch
 
-mkdir -p "$INFO_OUT" "$SLIDING_OUT"
+mkdir -p "$INFO_OUT" "$INFO_OUT_NO_B" "$SLIDING_OUT" "$SLIDING_OUT_NO_B"
 
 echo
-echo "[1/2] Rendering all 24-frame information-suite experiments"
+echo "[1/4] Rendering all 24-frame information-suite experiments"
 python visualize_mask_patterns_unet3d.py \
     --run-dir "$RUN_DIR" \
     --run-name "$RUN_NAME" \
@@ -35,7 +37,20 @@ python visualize_mask_patterns_unet3d.py \
     --out-dir "$INFO_OUT"
 
 echo
-echo "[2/2] Rendering full-run sliding and bidirectional reconstruction"
+echo "[2/4] Rendering information-suite experiments with B fully hidden"
+python visualize_mask_patterns_unet3d.py \
+    --run-dir "$RUN_DIR" \
+    --run-name "$RUN_NAME" \
+    --t0 "$WINDOW_T0" \
+    --experiment all \
+    --hide-magnetic \
+    --all-times \
+    --animation-format gif \
+    --fps 2 \
+    --out-dir "$INFO_OUT_NO_B"
+
+echo
+echo "[3/4] Rendering full-run sliding and bidirectional reconstruction"
 python visualize_sliding_density_reconstruction.py \
     --run-dir "$RUN_DIR" \
     --run-name "$RUN_NAME" \
@@ -51,6 +66,25 @@ python visualize_sliding_density_reconstruction.py \
     --out-dir "$SLIDING_OUT"
 
 echo
+echo "[4/4] Rendering sliding reconstruction with B fully hidden"
+python visualize_sliding_density_reconstruction.py \
+    --run-dir "$RUN_DIR" \
+    --run-name "$RUN_NAME" \
+    --analysis both \
+    --slide-steps 8 4 2 1 \
+    --refinement-step 8 \
+    --refinement-passes 4 \
+    --refinement-offset 12 \
+    --density-visible-fraction 0.08 \
+    --hide-magnetic \
+    --x-index "$PLASMOID_X_INDEX" \
+    --animation-format gif \
+    --fps 4 \
+    --out-dir "$SLIDING_OUT_NO_B"
+
+echo
 echo "Visualization complete."
 echo "Information suite: ${INFO_OUT}"
+echo "Information suite (no B): ${INFO_OUT_NO_B}"
 echo "Sliding analyses:  ${SLIDING_OUT}"
+echo "Sliding analyses (no B):  ${SLIDING_OUT_NO_B}"

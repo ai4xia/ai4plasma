@@ -140,6 +140,14 @@ def parse_args() -> argparse.Namespace:
         default=0.08,
         help="Target fraction of fixed Density super-resolution probes.",
     )
+    parser.add_argument(
+        "--hide-magnetic",
+        action="store_true",
+        help=(
+            "Hide all Bx/By/Bz observations so reconstruction uses only the "
+            "fixed Density probes."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument(
         "--x-index",
@@ -363,6 +371,7 @@ def reconstruct_with_slide_step(
     x_index: int | None,
     amp: bool,
     retain_state: bool = False,
+    hide_magnetic: bool = False,
 ) -> Dict:
     """Run recursive reconstruction and retain a compact projection per update."""
     channels, run_length, size_x, size_z = target_normalized.shape
@@ -392,10 +401,13 @@ def reconstruct_with_slide_step(
         )
         mask = torch.zeros_like(values)
 
-        # All physically available magnetic data are true observations. Padded
-        # slots beyond the end of the run remain zero with mask=0.
-        values[0, :3, :valid_length] = target_normalized[:3, start:valid_end]
-        mask[0, :3, :valid_length] = 1.0
+        # By default all physically available magnetic data are true
+        # observations. --hide-magnetic leaves Bx/By/Bz invisible so the
+        # reconstruction is conditioned only on Density probes. Padded slots
+        # beyond the end of the run remain zero with mask=0.
+        if not hide_magnetic:
+            values[0, :3, :valid_length] = target_normalized[:3, start:valid_end]
+            mask[0, :3, :valid_length] = 1.0
 
         density_target = target_normalized[3, start:valid_end]
         values[0, 3, :valid_length] = density_target * probe_mask
@@ -627,6 +639,7 @@ def refine_reconstruction_pass(
     snapshot_fn: Callable[[torch.Tensor], Dict] | None = None,
     include_boundary_padding: bool = False,
     max_updates: int | None = None,
+    hide_magnetic: bool = False,
 ) -> Dict:
     """Apply one full-visible repeated sweep and update the state in place."""
     if direction not in {"forward", "reverse"}:
@@ -670,13 +683,15 @@ def refine_reconstruction_pass(
         )
         mask = torch.zeros_like(values)
 
-        # Magnetic fields remain complete true observations. Every valid
-        # Density position uses the latest conditioning reconstruction and is
-        # marked visible; only padded future slots remain invisible.
-        values[0, :3, local_start:local_end] = target_normalized[
-            :3, valid_start:valid_end
-        ]
-        mask[0, :3, local_start:local_end] = 1.0
+        # Magnetic fields remain complete true observations unless
+        # --hide-magnetic is set. Every valid Density position uses the latest
+        # conditioning reconstruction and is marked visible; only padded
+        # future slots remain invisible.
+        if not hide_magnetic:
+            values[0, :3, local_start:local_end] = target_normalized[
+                :3, valid_start:valid_end
+            ]
+            mask[0, :3, local_start:local_end] = 1.0
         values[0, 3, local_start:local_end] = conditioning_state_normalized[
             valid_start:valid_end
         ]
@@ -739,6 +754,7 @@ def build_bidirectional_rows(
     x_index: int | None,
     amp: bool,
     initial_results: Dict[int, Dict] | None = None,
+    hide_magnetic: bool = False,
 ) -> List[Dict]:
     """Build the repeated-sweep rows requested for bidirectional comparison."""
     if refinement_passes < 1:
@@ -772,6 +788,7 @@ def build_bidirectional_rows(
             x_index=x_index,
             amp=amp,
             retain_state=True,
+            hide_magnetic=hide_magnetic,
         )
 
     def compact_snapshot(raw_state: torch.Tensor) -> Dict:
@@ -908,6 +925,7 @@ def build_bidirectional_rows(
             offset=0,
             amp=amp,
             snapshot_fn=compact_snapshot,
+            hide_magnetic=hide_magnetic,
         )
         small_history.append(compact_history(pass_info))
         small_animation.extend(annotate_pass_snapshots(pass_info, pass_index))
@@ -959,6 +977,7 @@ def build_bidirectional_rows(
             amp=amp,
             snapshot_fn=compact_snapshot,
             max_updates=remaining_calls,
+            hide_magnetic=hide_magnetic,
         )
         independent_directions.append(direction)
         independent_offsets.append(0)
@@ -1011,6 +1030,7 @@ def build_bidirectional_rows(
             snapshot_fn=compact_snapshot,
             include_boundary_padding=True,
             max_updates=remaining_calls,
+            hide_magnetic=hide_magnetic,
         )
         shifted_history.append(compact_history(pass_info))
         shifted_animation.extend(annotate_pass_snapshots(pass_info, pass_index))
@@ -1135,6 +1155,7 @@ def plot_progress_frame(
     out_path: Path,
     dpi: int,
     show_window_outline: bool = True,
+    magnetic_label: str = "B fully observed",
 ) -> None:
     n_rows = len(results)
     fig, axes = plt.subplots(
@@ -1244,7 +1265,7 @@ def plot_progress_frame(
     fig.suptitle(
         f"Sliding-window Density reconstruction: {run_name}\n"
         f"T={window_size}, fixed probes={100.0 * probe_actual_fraction:.2f}%, "
-        f"B fully observed, {projection_label}; progress through slice "
+        f"{magnetic_label}, {projection_label}; progress through slice "
         f"{int(frame_ids[min(covered_end, len(frame_ids)) - 1])}"
         f"{outline_text}",
         fontsize=12,
@@ -1272,6 +1293,7 @@ def plot_bidirectional_refinement_figure(
     snapshots: Sequence[Dict | None] | None = None,
     progress_label: str | None = None,
     show_window_outline: bool = True,
+    magnetic_label: str = "B fully observed",
 ) -> None:
     """Plot final states after alternating bidirectional reconstruction sweeps."""
     n_rows = len(rows)
@@ -1438,7 +1460,7 @@ def plot_bidirectional_refinement_figure(
     fig.suptitle(
         f"Bidirectional repeated Density reconstruction: {run_name}\n"
         f"T={window_size}, fixed probes={100.0 * probe_actual_fraction:.2f}%, "
-        f"B fully observed, {projection_label}; raw predictions include probes"
+        f"{magnetic_label}, {projection_label}; raw predictions include probes"
         f"{progress_text}{outline_text}",
         fontsize=12,
         y=0.985,
@@ -1511,6 +1533,7 @@ def save_bidirectional_analysis(
     animation_dpi: int,
     animation_format: str,
     fps: float,
+    hide_magnetic: bool = False,
 ) -> None:
     images_dir = out_dir / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
@@ -1530,10 +1553,12 @@ def save_bidirectional_analysis(
     else:
         residual_limits = (-float(residual_vmax), float(residual_vmax))
 
+    magnetic_label = "B fully hidden" if hide_magnetic else "B fully observed"
+    magnetic_tag = "_B-hidden" if hide_magnetic else ""
     common_stem = (
         f"{run_name}_T{window_size}_bidirectional-step{refinement_step}-"
         f"passes{refinement_passes}_step{window_size}-offset{refinement_offset}_"
-        f"density-visible-{probe_actual_fraction:.4f}_{plot_units}"
+        f"density-visible-{probe_actual_fraction:.4f}{magnetic_tag}_{plot_units}"
     )
     figure_path = images_dir / f"{common_stem}.png"
     plot_bidirectional_refinement_figure(
@@ -1551,6 +1576,7 @@ def save_bidirectional_analysis(
         out_path=figure_path,
         dpi=dpi,
         show_window_outline=False,
+        magnetic_label=magnetic_label,
     )
 
     animation_events = bidirectional_animation_events(rows)
@@ -1575,6 +1601,7 @@ def save_bidirectional_analysis(
             dpi=animation_dpi,
             snapshots=event["snapshots"],
             progress_label=event["label"],
+            magnetic_label=magnetic_label,
         )
         frame_paths.append(frame_path)
 
@@ -1599,6 +1626,7 @@ def save_bidirectional_analysis(
         snapshots=final_event["snapshots"],
         progress_label=final_event["label"],
         show_window_outline=False,
+        magnetic_label=magnetic_label,
     )
     frame_paths.append(clean_frame_path)
 
@@ -1713,6 +1741,7 @@ def save_slide_step_analysis(
     h5_path: Path,
     out_dir: Path,
     dpi: int,
+    hide_magnetic: bool = False,
 ) -> None:
     images_dir = out_dir / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
@@ -1738,6 +1767,7 @@ def save_slide_step_analysis(
         residual_vmin = -float(residual_vmax)
         residual_vmax_value = float(residual_vmax)
 
+    magnetic_label = "B fully hidden" if hide_magnetic else "B fully observed"
     progress_points = sorted(
         {
             int(snapshot["covered_end"])
@@ -1749,7 +1779,9 @@ def save_slide_step_analysis(
     common_stem = (
         f"{run_name}_T{window_size}_steps-"
         + "-".join(str(step) for step in slide_steps)
-        + f"_density-visible-{density_visible_fraction:g}_{plot_units}"
+        + f"_density-visible-{density_visible_fraction:g}"
+        + ("_B-hidden" if hide_magnetic else "")
+        + f"_{plot_units}"
     )
     frame_dir = images_dir / f"{common_stem}_frames"
     frame_dir.mkdir(parents=True, exist_ok=True)
@@ -1773,6 +1805,7 @@ def save_slide_step_analysis(
             residual_limits=(residual_vmin, residual_vmax_value),
             out_path=frame_path,
             dpi=dpi,
+            magnetic_label=magnetic_label,
         )
         frame_paths.append(frame_path)
 
@@ -1797,6 +1830,7 @@ def save_slide_step_analysis(
         out_path=clean_frame_path,
         dpi=dpi,
         show_window_outline=False,
+        magnetic_label=magnetic_label,
     )
     frame_paths.append(clean_frame_path)
 
@@ -2005,6 +2039,7 @@ def main() -> None:
     print("Slide steps:", slide_steps)
     print("Probe target fraction:", args.density_visible_fraction)
     print("Probe actual fraction:", probe_actual_fraction)
+    print("Hide magnetic:", args.hide_magnetic)
     print("Probe grid:", probe_info)
     print("Projection:", projection_label)
     print("Probe values are clamped only for recursive conditioning.")
@@ -2039,6 +2074,7 @@ def main() -> None:
                 render_bidirectional
                 and slide_step in {args.refinement_step, window_size}
             ),
+            hide_magnetic=args.hide_magnetic,
         )
         print("  starts:", result["window_starts"])
         print("  metrics:", result["metrics"])
@@ -2070,6 +2106,7 @@ def main() -> None:
             h5_path=h5_path,
             out_dir=out_dir,
             dpi=args.dpi,
+            hide_magnetic=args.hide_magnetic,
         )
 
     if render_bidirectional:
@@ -2089,6 +2126,7 @@ def main() -> None:
             x_index=args.x_index,
             amp=True,
             initial_results=results_by_step,
+            hide_magnetic=args.hide_magnetic,
         )
         for row_index, row in enumerate(bidirectional_rows, start=1):
             print(
@@ -2123,6 +2161,7 @@ def main() -> None:
             animation_dpi=args.animation_dpi,
             animation_format=args.animation_format,
             fps=args.fps,
+            hide_magnetic=args.hide_magnetic,
         )
 
 

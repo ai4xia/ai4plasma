@@ -222,7 +222,7 @@ masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine1500_
 
 ### 6.3 Magnetic ablation：磁场信息量扫描
 
-Density 在四行中均为完全不可见（0 probes），防止模型从较密的 Density probe 直接完成 reconstruction，从而掩盖磁场信息量的影响。磁场 visible fraction 仍依次为 100%、80%、60%、40%。较低比例的磁场点严格嵌套于较高比例的点集，避免每行随机位置变化干扰信息量比较。三个磁场通道始终使用完全一致的 mask。
+Density 在六行中均为完全不可见（0 probes），防止模型从较密的 Density probe 直接完成 reconstruction，从而掩盖磁场信息量的影响。磁场 visible fraction 仍依次为 100%、80%、60%、40%、20%、0%。较低比例的磁场点严格嵌套于较高比例的点集，避免每行随机位置变化干扰信息量比较。三个磁场通道始终使用完全一致的 mask。
 
 ### 6.4 Density forecast：窗口末帧条件外推
 

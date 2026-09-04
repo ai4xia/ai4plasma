@@ -127,6 +127,7 @@ def test_multifunction_masks_only_density():
             "spatial_grid",
             "spatial_block",
             "temporal_random",
+            "temporal_block",
         ],
         mask_fraction=0.8,
         block_fraction=0.5,
@@ -135,12 +136,72 @@ def test_multifunction_masks_only_density():
         generator=make_generator(),
     )
 
-    assert len(rows) == 4
+    assert len(rows) == 5
     assert all(torch.all(mask[:, :3] == 1) for _, _, mask in rows)
     block_mask = next(mask for name, _, mask in rows if name == "spatial_block")
     midpoint = SHAPE[-2] // 2
     assert torch.all(block_mask[:, 3:4, :, :midpoint] == 1)
     assert torch.all(block_mask[:, 3:4, :, midpoint:] == 0)
+
+    temporal_random = next(
+        mask for name, _, mask in rows if name == "temporal_random"
+    )
+    assert torch.all(temporal_random[:, 3:4, 0::2] == 1)
+    assert torch.all(temporal_random[:, 3:4, 1::2] == 0)
+
+    temporal_block = next(
+        mask for name, _, mask in rows if name == "temporal_block"
+    )
+    half = SHAPE[2] // 2
+    assert torch.all(temporal_block[:, 3:4, :half] == 1)
+    assert torch.all(temporal_block[:, 3:4, half:] == 0)
+
+
+def test_hide_magnetic_keeps_density_geometry():
+    patterns = [
+        "spatial_random",
+        "spatial_grid",
+        "spatial_block",
+        "temporal_random",
+        "temporal_block",
+    ]
+    kwargs = dict(
+        block=make_block(),
+        patterns=patterns,
+        mask_fraction=0.8,
+        block_fraction=0.5,
+        grid_stride=4,
+        magnetic_grid_stride=2,
+    )
+    visible_rows = build_density_only_multifunction_rows(
+        **kwargs, generator=make_generator(), magnetic_visible=True
+    )
+    hidden_rows = build_density_only_multifunction_rows(
+        **kwargs, generator=make_generator(), magnetic_visible=False
+    )
+
+    assert all(torch.all(mask[:, :3] == 0) for _, _, mask in hidden_rows)
+    for (_, visible_label, visible_mask), (_, hidden_label, hidden_mask) in zip(
+        visible_rows, hidden_rows
+    ):
+        assert torch.equal(visible_mask[:, 3:4], hidden_mask[:, 3:4])
+        assert "B visible=100%" in visible_label
+        assert "B visible=0%" in hidden_label
+
+    superres_hidden = build_density_superres_rows(
+        make_block(), [0, 10], magnetic_visible=False
+    )
+    assert all(torch.all(mask[:, :3] == 0) for _, _, mask in superres_hidden)
+    assert int(superres_hidden[1][2][0, 3, 0].sum()) == 10
+
+    forecast_hidden = build_density_forecast_rows(
+        torch.zeros(1, 4, 24, 20, 12), [12], magnetic_visible=False
+    )
+    _, forecast_label, forecast_mask = forecast_hidden[0]
+    assert torch.all(forecast_mask[:, :3] == 0)
+    assert torch.all(forecast_mask[:, 3:4, :12] == 1)
+    assert torch.all(forecast_mask[:, 3:4, 12:] == 0)
+    assert "B visible=0%" in forecast_label
 
 
 def test_density_superres_uses_exact_requested_probe_counts():
@@ -153,14 +214,14 @@ def test_density_superres_uses_exact_requested_probe_counts():
 
 
 def test_magnetic_ablation_is_nested_and_hides_all_density():
-    targets = [1.0, 0.8, 0.6, 0.4]
+    targets = [1.0, 0.8, 0.6, 0.4, 0.2, 0.0]
     rows = build_magnetic_ablation_rows(
         block=make_block(),
         magnetic_visible_fractions=targets,
         generator=make_generator(),
     )
 
-    assert len(rows) == 4
+    assert len(rows) == 6
     for (_, label, mask), target in zip(rows, targets):
         assert abs(float(mask[:, :3].mean()) - target) < 1e-4
         assert torch.all(mask[:, 3:4] == 0)
@@ -257,16 +318,16 @@ def test_named_sample_selection_rejects_training_run():
         raise AssertionError("Expected a non-validation run to be rejected.")
 
 
-def test_gif_animation_has_no_infinite_loop_extension(tmp_path):
+def test_gif_animation_loops_infinitely(tmp_path):
     frame_paths = []
     for index, color in enumerate(("red", "blue")):
         frame_path = tmp_path / f"frame-{index}.png"
         Image.new("RGB", (8, 8), color=color).save(frame_path)
         frame_paths.append(frame_path)
 
-    gif_path = tmp_path / "single-play.gif"
+    gif_path = tmp_path / "looping.gif"
     write_animation(frame_paths, gif_path, fps=2.0)
 
     with Image.open(gif_path) as animation:
         assert animation.n_frames == 2
-        assert "loop" not in animation.info
+        assert animation.info.get("loop") == 0

@@ -220,7 +220,18 @@ def parse_args():
             "Density-only versions of every mask pattern, a Density "
             "super-resolution probe-count sweep, and a magnetic-information "
             "ablation, and a Density forecast-horizon sweep. 'custom' preserves "
-            "the original --mask-patterns behavior."
+            "the original --mask-patterns behavior. With --hide-magnetic, "
+            "'all' skips magnetic_ablation and hides Bx/By/Bz in the remaining "
+            "Density experiments."
+        ),
+    )
+    p.add_argument(
+        "--hide-magnetic",
+        action="store_true",
+        help=(
+            "Hide all Bx/By/Bz observations in multifunction, "
+            "density_superres, density_forecast, and custom. Use this to see "
+            "Density-mask effects without a fully observed magnetic field."
         ),
     )
     p.add_argument(
@@ -237,9 +248,10 @@ def parse_args():
         "--magnetic-visible-fractions",
         type=float,
         nargs="+",
-        default=[1.0, 0.8, 0.6, 0.4],
+        default=[1.0, 0.8, 0.6, 0.4, 0.2, 0.0],
         help=(
-            "Magnetic visible fractions for the nested spatial-random ablation."
+            "Magnetic visible fractions for the nested spatial-random ablation. "
+            "Default: 1.0 0.8 0.6 0.4 0.2 0.0."
         ),
     )
     p.add_argument(
@@ -661,6 +673,10 @@ def _validate_visible_fractions(
     return parsed
 
 
+def _magnetic_visibility_phrase(magnetic_visible: bool) -> str:
+    return "B visible=100%" if magnetic_visible else "B visible=0%"
+
+
 def build_density_only_multifunction_rows(
     block: torch.Tensor,
     patterns: Sequence[str],
@@ -669,8 +685,9 @@ def build_density_only_multifunction_rows(
     grid_stride: int,
     magnetic_grid_stride: int,
     generator: torch.Generator,
+    magnetic_visible: bool = True,
 ) -> List[Tuple[str, str, torch.Tensor]]:
-    """Apply every requested topology to Density while keeping all B visible."""
+    """Apply every requested topology to Density, optionally hiding all B."""
     sampled_rows = build_mask_patterns(
         block=block,
         patterns=patterns,
@@ -680,30 +697,46 @@ def build_density_only_multifunction_rows(
         magnetic_grid_stride=magnetic_grid_stride,
         generator=generator,
     )
+    magnetic_phrase = _magnetic_visibility_phrase(magnetic_visible)
     labels = {
-        "spatial_random": "Density spatial_random\nB visible=100%; Density random probes",
+        "spatial_random": (
+            f"Density spatial_random\n{magnetic_phrase}; Density random probes"
+        ),
         "spatial_grid": (
-            f"Density spatial_grid\nB visible=100%; Density stride="
+            f"Density spatial_grid\n{magnetic_phrase}; Density stride="
             f"{grid_stride}x{grid_stride}"
         ),
-        "spatial_block": "Density spatial_block\nB visible=100%; Density-only hole",
+        "spatial_block": (
+            f"Density spatial_block\n{magnetic_phrase}; Density-only hole"
+        ),
         "temporal_random": (
-            "Density temporal_random\nB visible=100%; Density-only hidden frames"
+            f"Density temporal_random\n{magnetic_phrase}; "
+            "Density alternating frames VMVM..."
         ),
         "temporal_block": (
-            "Density temporal_block\nB visible=100%; Density-only oriented block"
+            f"Density temporal_block\n{magnetic_phrase}; "
+            "Density first half visible"
         ),
     }
 
     rows = []
+    magnetic_fill = 1.0 if magnetic_visible else 0.0
     for name, _old_label, mask in sampled_rows:
         mask = mask.clone()
-        mask[:, :3] = 1.0
+        mask[:, :3] = magnetic_fill
         if name == "spatial_block":
             # Pin this visualization-only Density hole to the upper half in x,
             # where the plasmoids occur in the selected merger window.
             mask[:, 3:4] = 1.0
             mask[:, 3:4, :, block.shape[-2] // 2 :, :] = 0.0
+        elif name == "temporal_random":
+            # Visualization-only: keep every other Density frame, starting visible.
+            mask[:, 3:4] = 0.0
+            mask[:, 3:4, 0::2] = 1.0
+        elif name == "temporal_block":
+            # Visualization-only: first half of the window visible, rest hidden.
+            mask[:, 3:4] = 1.0
+            mask[:, 3:4, block.shape[2] // 2 :] = 0.0
         rows.append((name, labels[name], mask))
     return rows
 
@@ -809,19 +842,23 @@ def _density_probe_count_grid(
 def build_density_superres_rows(
     block: torch.Tensor,
     probe_counts: Sequence[int],
+    magnetic_visible: bool = True,
 ) -> List[Tuple[str, str, torch.Tensor]]:
-    """Sweep exact Density probe counts while keeping the full B field visible."""
+    """Sweep exact Density probe counts, optionally hiding all B."""
     rows = []
+    magnetic_phrase = _magnetic_visibility_phrase(magnetic_visible)
     for probe_count in probe_counts:
         density_mask, info = _density_probe_count_grid(
             block=block,
             probe_count=int(probe_count),
         )
         mask = torch.ones_like(block)
+        if not magnetic_visible:
+            mask[:, :3] = 0.0
         mask[:, 3:4] = density_mask
         label = (
             "Density super-resolution\n"
-            f"B visible=100%; Density probes={probe_count}\n"
+            f"{magnetic_phrase}; Density probes={probe_count}\n"
             f"probe grid={info['count_x']}x{info['count_z']}"
         )
         rows.append((f"density_superres_{probe_count}", label, mask))
@@ -871,13 +908,14 @@ def build_magnetic_ablation_rows(
 def build_density_forecast_rows(
     block: torch.Tensor,
     visible_frame_counts: Sequence[int],
+    magnetic_visible: bool = True,
 ) -> List[Tuple[str, str, torch.Tensor]]:
     """
-    Build causal Density-prefix masks with the magnetic field always visible.
+    Build causal Density-prefix masks, optionally hiding all B.
 
     Every visible Density frame is spatially complete. Density is fully hidden
     after the prefix, so the final slice measures conditional forecast accuracy
-    at progressively longer horizons given the complete Bx/By/Bz sequence.
+    at progressively longer horizons. The default keeps Bx/By/Bz visible.
     """
     time = int(block.shape[2])
     counts = [int(count) for count in visible_frame_counts]
@@ -898,11 +936,14 @@ def build_density_forecast_rows(
             )
 
         mask = torch.ones_like(block)
+        if not magnetic_visible:
+            mask[:, :3] = 0.0
         mask[:, 3:4, count:] = 0.0
         horizon = time - count
+        magnetic_phrase = _magnetic_visibility_phrase(magnetic_visible)
         label = (
             "Conditional Density forecast\n"
-            f"B visible=100% for frames 1-{time}\n"
+            f"{magnetic_phrase} for frames 1-{time}\n"
             f"Density visible=frames 1-{count} (spatially complete)\n"
             f"target=frame {time}; forecast horizon={horizon} step"
             f"{'s' if horizon != 1 else ''}"
@@ -931,17 +972,23 @@ def build_experiment_mask_rows(
         allow_zero=True,
     )
 
-    selected = (
-        [
+    if args.experiment == "magnetic_ablation" and args.hide_magnetic:
+        raise ValueError(
+            "--hide-magnetic cannot be combined with --experiment magnetic_ablation."
+        )
+
+    if args.experiment == "all":
+        selected = [
             "multifunction",
             "density_superres",
-            "magnetic_ablation",
             "density_forecast",
         ]
-        if args.experiment == "all"
-        else [args.experiment]
-    )
+        if not args.hide_magnetic:
+            selected.insert(2, "magnetic_ablation")
+    else:
+        selected = [args.experiment]
     experiments = []
+    magnetic_visible = not args.hide_magnetic
     for experiment in selected:
         if experiment == "multifunction":
             rows = build_density_only_multifunction_rows(
@@ -952,11 +999,13 @@ def build_experiment_mask_rows(
                 grid_stride=args.grid_stride,
                 magnetic_grid_stride=args.magnetic_grid_stride,
                 generator=generator,
+                magnetic_visible=magnetic_visible,
             )
         elif experiment == "density_superres":
             rows = build_density_superres_rows(
                 block=block,
                 probe_counts=args.density_probe_counts,
+                magnetic_visible=magnetic_visible,
             )
         elif experiment == "magnetic_ablation":
             rows = build_magnetic_ablation_rows(
@@ -968,6 +1017,7 @@ def build_experiment_mask_rows(
             rows = build_density_forecast_rows(
                 block=block,
                 visible_frame_counts=args.density_forecast_visible_frames,
+                magnetic_visible=magnetic_visible,
             )
         elif experiment == "custom":
             rows = build_mask_patterns(
@@ -979,6 +1029,13 @@ def build_experiment_mask_rows(
                 magnetic_grid_stride=args.magnetic_grid_stride,
                 generator=generator,
             )
+            if args.hide_magnetic:
+                hidden_rows = []
+                for name, label, mask in rows:
+                    mask = mask.clone()
+                    mask[:, :3] = 0.0
+                    hidden_rows.append((name, f"{label}\nB visible=0%", mask))
+                rows = hidden_rows
         else:
             raise ValueError(f"Unhandled experiment: {experiment}")
         experiments.append((experiment, rows))
@@ -1596,6 +1653,7 @@ def write_animation(
             save_all=True,
             append_images=frames[1:],
             duration=max(1, int(round(1000.0 / fps))),
+            loop=0,
             optimize=False,
             disposal=2,
         )
@@ -2122,6 +2180,7 @@ def main():
     print("magnetic_grid_stride:", args.magnetic_grid_stride)
     print("mask_patterns:", args.mask_patterns)
     print("experiment:", args.experiment)
+    print("hide_magnetic:", args.hide_magnetic)
     if args.sample_index is None:
         print("sample selector: run_name/t0", args.run_name, args.t0)
     else:

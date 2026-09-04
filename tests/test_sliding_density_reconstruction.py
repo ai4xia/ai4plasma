@@ -191,6 +191,37 @@ def test_reverse_refinement_uses_full_latest_state_and_keeps_raw_probes():
     assert torch.all(conditioning_state[:, 0, 0] == 2.0)
 
 
+def test_hide_magnetic_leaves_b_channels_invisible():
+    model = RecordingDensityModel()
+    target = torch.zeros((4, 6, 2, 2), dtype=torch.float32)
+    target[:3] = 7.0
+    target[3] = 2.0
+    density_mean = torch.tensor(0.0)
+    density_std = torch.tensor(1.0)
+    probe_mask = torch.zeros((2, 2), dtype=torch.float32)
+    probe_mask[0, 0] = 1.0
+
+    reconstruct_with_slide_step(
+        model=model,
+        target_normalized=target,
+        target_density_plot=target[3].numpy(),
+        density_mean=density_mean,
+        density_std=density_std,
+        probe_mask=probe_mask,
+        window_size=4,
+        slide_step=4,
+        plot_units="normalized",
+        x_index=None,
+        amp=False,
+        hide_magnetic=True,
+    )
+
+    first_input = model.inputs[0]
+    assert torch.all(first_input[0, :3] == 0)
+    assert torch.all(first_input[0, 4:7] == 0)
+    assert torch.all(first_input[0, 7, :, 0, 0] == 1)
+
+
 def test_bidirectional_rows_match_requested_six_experiments():
     model = IncrementDensityModel()
     target = torch.zeros((4, 6, 2, 2), dtype=torch.float32)
