@@ -172,12 +172,24 @@ def test_checkpoint_plan_uses_init_when_out_dir_has_no_latest(tmp_path):
     assert plan.path == init_path.resolve()
 
 
+def test_checkpoint_plan_is_fresh_when_new_out_dir_has_no_latest(tmp_path):
+    plan = resolve_checkpoint_plan(
+        tmp_path / "v15_from_scratch",
+        auto_resume=True,
+        init_checkpoint=None,
+    )
+    assert plan.mode == "fresh"
+    assert plan.path is None
+
+
 def test_masking_version_mismatch_blocks_resume_but_not_weight_init():
     values = {key: None for key in RESUME_PARAMETER_KEYS}
     values["mask_pattern_weights"] = {"temporal_random": 1.0}
     values["use_attention"] = True
     values["spatial_only_pooling"] = True
-    values["masking_version"] = "independentBD_fiveMask_logUniformCounts_v8"
+    values["masking_version"] = (
+        "independentBD_fiveMask_logUniformCounts_orientedSpatialBlock_v9"
+    )
     args = SimpleNamespace(**values)
 
     checkpoint_args = dict(values)

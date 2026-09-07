@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -26,6 +27,11 @@ from models.unet3d import LEGACY_MODEL_VERSION, UNet3D
 
 DEFAULT_RUN_NAME = "beta0.2_nu2_Bz0_dt2_tau70"
 DEFAULT_T0 = 28
+DEFAULT_RUN_DIR = (
+    "runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v15_"
+    "orientedSpatialBlock_independentBD_logUniformCounts_"
+    "attention_spatialpool_b8_e4500"
+)
 DEFAULT_RESIDUAL_VMAX = 1.0
 RESIDUAL_CMAP = "RdBu_r"
 DEFAULT_MAGNETIC_ABLATION_VISIBLE_PERCENTS = (
@@ -41,6 +47,10 @@ DEFAULT_MAGNETIC_ABLATION_VISIBLE_PERCENTS = (
 DEFAULT_MAGNETIC_ABLATION_VISIBLE_FRACTIONS = tuple(
     percent / 100.0 for percent in DEFAULT_MAGNETIC_ABLATION_VISIBLE_PERCENTS
 )
+JY_STATS_FILENAME = "jy_stats.json"
+JY_NRMSE_YLABEL = "Jy NRMSE (normalized by training-set Jy std)"
+JY_STATS_DEFINITION = "dBx/dz - dBz/dx"
+JY_STATS_PREPROCESSING = "checkpoint channel-standardized Bx,Bz"
 
 
 def format_magnetic_visible_percent(visible_fraction: float) -> str:
@@ -93,6 +103,7 @@ def save_information_suite_error_plot(
     out_path: Path,
     title: str,
     experiment_name: str = "",
+    jy_std_train: float = 1.0,
 ) -> Dict:
     """Plot framewise RMS errors in preprocessing-standardized units."""
     fig, axes = plt.subplots(2, 1, figsize=(10.5, 7.0), sharex=True)
@@ -107,7 +118,7 @@ def save_information_suite_error_plot(
             row["pred_jy_normalized"], target_jy_normalized
         )
         density_nrmse = np.sqrt(np.mean(np.square(density_residual), axis=(1, 2)))
-        jy_nrmse = np.sqrt(np.mean(np.square(jy_residual), axis=(1, 2)))
+        jy_nrmse = jy_nrmse_from_residual(jy_residual, jy_std_train)
         if experiment_name == "magnetic_ablation":
             label = validation_statistics_legend_label(
                 experiment_name, row, context_length=0
@@ -129,7 +140,7 @@ def save_information_suite_error_plot(
             }
         )
     axes[0].set_ylabel("Density frame NRMSE")
-    axes[1].set_ylabel("Jy frame NRMSE")
+    axes[1].set_ylabel(JY_NRMSE_YLABEL)
     axes[1].set_xlabel("Global frame")
     yscales = {"density": "linear", "jy": "linear"}
     if experiment_name == "magnetic_ablation" and density_series:
@@ -155,6 +166,8 @@ def save_information_suite_error_plot(
         "frame_ids": frame_ids.tolist(),
         "density_nrmse_yscale": yscales["density"],
         "jy_nrmse_yscale": yscales["jy"],
+        "jy_nrmse_ylabel": JY_NRMSE_YLABEL,
+        "jy_std_train": float(jy_std_train),
         "rows": payload,
     }
 
@@ -165,8 +178,11 @@ def parse_args():
     p.add_argument(
         "--run-dir",
         type=str,
-        required=True,
-        help="Training run directory containing best.pt, stats.json, split.json.",
+        default=DEFAULT_RUN_DIR,
+        help=(
+            "Training run directory containing best.pt, stats.json, split.json. "
+            f"Default: {DEFAULT_RUN_DIR}."
+        ),
     )
     p.add_argument(
         "--checkpoint",
@@ -224,8 +240,8 @@ def parse_args():
         type=float,
         default=0.5,
         help=(
-            "Spatial area covered by the spatial_block rectangle. Position and "
-            "aspect ratio stay random."
+            "Unused by the visualization spatial_block rows, which now use a "
+            "fixed centered rectangle covering about half the domain."
         ),
     )
     p.add_argument(
@@ -500,6 +516,24 @@ def get_val_runs(run_dir: Path) -> set[str] | None:
     return val_runs
 
 
+def get_train_runs(run_dir: Path) -> set[str] | None:
+    split_path = run_dir / "split.json"
+    if not split_path.exists():
+        print(f"No split.json found at {split_path}. Cannot resolve training runs.")
+        return None
+
+    with open(split_path, "r") as f:
+        split = json.load(f)
+
+    if "train_runs" not in split:
+        print(f"No train_runs key in {split_path}.")
+        return None
+
+    train_runs = set(split["train_runs"])
+    print(f"Loaded {len(train_runs)} training runs from split.json")
+    return train_runs
+
+
 def select_sample_index(dataset: VPICWindowDataset, val_runs: set[str] | None, sample_index: int) -> int:
     if sample_index < 0:
         raise IndexError(f"sample_index must be non-negative, got {sample_index}")
@@ -636,8 +670,9 @@ def format_mask_label(info: Dict) -> str:
                 f"offset=({info['offset_x']}, {info['offset_z']})"
             )
     elif pattern == "spatial_block":
+        orientation = info.get("orientation", "inside_masked")
         detail = (
-            f"shared B/Density hole={info['rect_height']}×{info['rect_width']} "
+            f"{orientation} hole={info['rect_height']}×{info['rect_width']} "
             f"at ({info['rect_x0']}, {info['rect_z0']})"
         )
     elif pattern == "temporal_random":
@@ -651,6 +686,56 @@ def format_mask_label(info: Dict) -> str:
         detail = ""
 
     return f"{pattern}\n{detail}"
+
+
+VISUALIZATION_SPATIAL_BLOCK_AREA_FRACTION = 0.5
+VISUALIZATION_SPATIAL_BLOCK_ROWS = (
+    ("spatial_block_inpainting", "inside_masked", "Spatial block — inpainting"),
+    ("spatial_block_outpainting", "inside_visible", "Spatial block — outpainting"),
+)
+
+
+def make_centered_spatial_block_mask(
+    size_x: int,
+    size_z: int,
+    area_fraction: float = VISUALIZATION_SPATIAL_BLOCK_AREA_FRACTION,
+    orientation: str = "inside_masked",
+) -> Tuple[torch.Tensor, Dict]:
+    """Deterministic centered rectangle for visualization spatial_block rows."""
+    size_x = int(size_x)
+    size_z = int(size_z)
+    area_fraction = float(area_fraction)
+    if size_x < 1 or size_z < 1:
+        raise ValueError(f"Expected positive X and Z, got {size_x} and {size_z}.")
+    if not (0.0 < area_fraction <= 1.0):
+        raise ValueError(
+            f"area_fraction must lie in (0, 1], got {area_fraction}."
+        )
+
+    scale = math.sqrt(area_fraction)
+    rect_height = min(max(int(round(size_x * scale)), 0), size_x)
+    rect_width = min(max(int(round(size_z * scale)), 0), size_z)
+    x0 = (size_x - rect_height) // 2
+    z0 = (size_z - rect_width) // 2
+    info = {
+        "orientation": orientation,
+        "rect_x0": x0,
+        "rect_z0": z0,
+        "rect_height": rect_height,
+        "rect_width": rect_width,
+        "target_area_fraction": area_fraction,
+        "actual_area_fraction": float(rect_height * rect_width) / float(size_x * size_z),
+    }
+
+    if orientation == "inside_masked":
+        plane = torch.ones(size_x, size_z)
+        plane[x0 : x0 + rect_height, z0 : z0 + rect_width] = 0.0
+    elif orientation == "inside_visible":
+        plane = torch.zeros(size_x, size_z)
+        plane[x0 : x0 + rect_height, z0 : z0 + rect_width] = 1.0
+    else:
+        raise ValueError(f"Unknown spatial_block orientation {orientation!r}.")
+    return plane, info
 
 
 def share_magnetic_channel_mask(mask: torch.Tensor) -> torch.Tensor:
@@ -679,13 +764,35 @@ def build_mask_patterns(
         (short_name, display_label, visible_mask)
 
     Masks come from data.masking so that the figure shows the same mask family
-    the model was trained on. spatial_grid and spatial_block are pinned to a
-    standard, interpretable benchmark geometry instead of following the shared
-    mask fraction; their position and grid offset stay random.
+    the model was trained on. spatial_grid keeps a pinned probe lattice with a
+    random offset. spatial_block is a visualization-only centered rectangle
+    shown as complementary inpainting and outpainting rows.
     """
     rows = []
 
     for name in patterns:
+        if name == "spatial_block":
+            _, _, _, size_x, size_z = block.shape
+            for short_name, orientation, title in VISUALIZATION_SPATIAL_BLOCK_ROWS:
+                plane, info = make_centered_spatial_block_mask(
+                    size_x,
+                    size_z,
+                    area_fraction=VISUALIZATION_SPATIAL_BLOCK_AREA_FRACTION,
+                    orientation=orientation,
+                )
+                mask = (
+                    plane.to(device=block.device, dtype=block.dtype)
+                    .view(1, 1, 1, size_x, size_z)
+                    .expand(*block.shape)
+                    .contiguous()
+                )
+                mask = share_magnetic_channel_mask(mask)
+                info["pattern"] = name
+                info["target_mask_fraction"] = float(1.0 - mask.mean().item())
+                info["actual_mask_fraction"] = float(1.0 - mask.mean().item())
+                rows.append((short_name, title, mask))
+            continue
+
         if name == "spatial_grid":
             # Visualization-only benchmark geometry: magnetic diagnostics are
             # sampled more densely than Density, matching the intended probe
@@ -729,7 +836,7 @@ def build_mask_patterns(
         mask, info = sample_mask(
             block.shape,
             pattern=name,
-            mask_fraction=block_fraction if name == "spatial_block" else mask_fraction,
+            mask_fraction=mask_fraction,
             device=block.device,
             dtype=block.dtype,
             generator=generator,
@@ -792,9 +899,6 @@ def build_density_only_multifunction_rows(
             f"Density spatial_grid\n{magnetic_phrase}; Density stride="
             f"{grid_stride}x{grid_stride}"
         ),
-        "spatial_block": (
-            f"Density spatial_block\n{magnetic_phrase}; Density-only hole"
-        ),
         "temporal_random": (
             f"Density temporal_random\n{magnetic_phrase}; "
             "Density alternating frames VMVM..."
@@ -807,23 +911,28 @@ def build_density_only_multifunction_rows(
 
     rows = []
     magnetic_fill = 1.0 if magnetic_visible else 0.0
-    for name, _old_label, mask in sampled_rows:
+    for name, old_label, mask in sampled_rows:
         mask = mask.clone()
         mask[:, :3] = magnetic_fill
-        if name == "spatial_block":
-            # Pin this visualization-only Density hole to the upper half in x,
-            # where the plasmoids occur in the selected merger window.
-            mask[:, 3:4] = 1.0
-            mask[:, 3:4, :, block.shape[-2] // 2 :, :] = 0.0
+        if name in {
+            "spatial_block",
+            "spatial_block_inpainting",
+            "spatial_block_outpainting",
+        }:
+            label = f"{old_label}\n{magnetic_phrase}"
         elif name == "temporal_random":
             # Visualization-only: keep every other Density frame, starting visible.
             mask[:, 3:4] = 0.0
             mask[:, 3:4, 0::2] = 1.0
+            label = labels[name]
         elif name == "temporal_block":
             # Visualization-only: first half of the window visible, rest hidden.
             mask[:, 3:4] = 1.0
             mask[:, 3:4, block.shape[2] // 2 :] = 0.0
-        rows.append((name, labels[name], mask))
+            label = labels[name]
+        else:
+            label = labels[name]
+        rows.append((name, label, mask))
     return rows
 
 
@@ -1140,15 +1249,26 @@ def normalized_residual(
     return residual
 
 
-def compute_normalized_metrics(residual: np.ndarray) -> Tuple[float, float]:
-    """Return RMS and mean absolute values of a normalized residual array."""
+def compute_normalized_metrics(
+    residual: np.ndarray,
+    scale: float = 1.0,
+) -> Tuple[float, float]:
+    """Return RMS and mean absolute values of a residual array.
+
+    ``scale`` divides only the RMS term so Jy NRMSE can use a training-set
+    characteristic scale without changing Density or NMAE.
+    """
     residual = np.asarray(residual, dtype=np.float64)
     residual = residual[np.isfinite(residual)]
 
     if residual.size == 0:
         return float("nan"), float("nan")
 
-    nrmse = float(np.sqrt(np.mean(residual**2)))
+    scale = float(scale)
+    if scale <= 0.0:
+        raise ValueError(f"Metric scale must be positive, got {scale}.")
+
+    nrmse = float(np.sqrt(np.mean(residual**2))) / scale
     nmae = float(np.mean(np.abs(residual)))
     return nrmse, nmae
 
@@ -1217,6 +1337,197 @@ def compute_jy(field: np.ndarray, extent: Sequence[float]) -> np.ndarray:
     d_bx_dz = np.gradient(bx, z, axis=2)
     d_bz_dx = np.gradient(bz, x, axis=1)
     return d_bx_dz - d_bz_dx
+
+
+def jy_nrmse_from_residual(jy_residual: np.ndarray, jy_std_train: float) -> np.ndarray:
+    """Framewise Jy NRMSE: residual RMS divided by training-set Jy std."""
+    scale = float(jy_std_train)
+    if scale <= 0.0:
+        raise ValueError(f"jy_std_train must be positive, got {scale}.")
+    residual = np.asarray(jy_residual, dtype=np.float64)
+    return np.sqrt(np.mean(np.square(residual), axis=(1, 2))) / scale
+
+
+def _channel_stat_vectors(
+    mean: torch.Tensor | np.ndarray | Sequence[float],
+    std: torch.Tensor | np.ndarray | Sequence[float],
+) -> Tuple[np.ndarray, np.ndarray]:
+    if torch.is_tensor(mean):
+        mean_np = mean.detach().cpu().numpy()
+    else:
+        mean_np = np.asarray(mean)
+    if torch.is_tensor(std):
+        std_np = std.detach().cpu().numpy()
+    else:
+        std_np = np.asarray(std)
+    return (
+        np.asarray(mean_np, dtype=np.float64).reshape(-1)[:4],
+        np.asarray(std_np, dtype=np.float64).reshape(-1)[:4],
+    )
+
+
+def normalize_field_np(
+    field: np.ndarray,
+    mean: torch.Tensor | np.ndarray | Sequence[float],
+    std: torch.Tensor | np.ndarray | Sequence[float],
+) -> np.ndarray:
+    """Apply the same channel mean/std used by visualization preprocessing."""
+    mean_np, std_np = _channel_stat_vectors(mean, std)
+    field_np = np.asarray(field, dtype=np.float64)
+    return (field_np - mean_np[:, None, None, None]) / (std_np[:, None, None, None] + 1e-8)
+
+
+def summarize_jy_values(jy: np.ndarray) -> Dict[str, float]:
+    flat = np.asarray(jy, dtype=np.float64).ravel()
+    if flat.size == 0:
+        raise ValueError("Cannot summarize an empty Jy array.")
+    mean = float(np.mean(flat))
+    # Population std, matching estimate_channel_stats.
+    std = float(np.sqrt(max(float(np.mean(np.square(flat))) - mean * mean, 0.0)))
+    rms = float(np.sqrt(np.mean(np.square(flat))))
+    return {
+        "jy_mean_train": mean,
+        "jy_std_train": std,
+        "jy_rms_train": rms,
+        "count": int(flat.size),
+    }
+
+
+def iter_unique_run_fields(
+    dataset: VPICWindowDataset,
+    run_names: set[str],
+):
+    """Yield each requested run's full (C, T, X, Z) field once."""
+    seen: Dict[str, int] = {}
+    for file_idx, run_name, _t0 in dataset.samples:
+        if run_name in run_names and run_name not in seen:
+            seen[run_name] = int(file_idx)
+    missing = sorted(run_names - set(seen))
+    if missing:
+        preview = ", ".join(missing[:5])
+        extra = "" if len(missing) <= 5 else f" (+{len(missing) - 5} more)"
+        raise RuntimeError(
+            "Training Jy stats requested runs that are absent from the dataset: "
+            f"{preview}{extra}"
+        )
+    for run_name, file_idx in seen.items():
+        handle = dataset._get_file(file_idx)
+        fields = np.asarray(handle["runs"][run_name]["fields"], dtype=np.float32)
+        yield run_name, np.transpose(fields, (1, 0, 2, 3))
+
+
+def compute_jy_training_stats(
+    dataset: VPICWindowDataset,
+    train_runs: set[str],
+    mean: torch.Tensor | np.ndarray | Sequence[float],
+    std: torch.Tensor | np.ndarray | Sequence[float],
+    extent: Sequence[float],
+) -> Dict:
+    """Jy mean/std/rms on training runs only, matching visualization Jy."""
+    if not train_runs:
+        raise ValueError("Cannot compute Jy training stats without training runs.")
+
+    sum_j = 0.0
+    sumsq_j = 0.0
+    count = 0
+    n_runs = 0
+    for _run_name, field in iter_unique_run_fields(dataset, train_runs):
+        jy = compute_jy(normalize_field_np(field, mean, std), extent)
+        sum_j += float(jy.sum())
+        sumsq_j += float(np.square(jy).sum())
+        count += int(jy.size)
+        n_runs += 1
+        if n_runs == 1 or n_runs % 10 == 0 or n_runs == len(train_runs):
+            print(f"Jy training stats: {n_runs}/{len(train_runs)} runs")
+
+    if count == 0:
+        raise RuntimeError("Jy training stats collected no voxels.")
+
+    jy_mean = sum_j / count
+    jy_var = max(sumsq_j / count - jy_mean * jy_mean, 0.0)
+    mean_np, std_np = _channel_stat_vectors(mean, std)
+    return {
+        "jy_mean_train": float(jy_mean),
+        "jy_std_train": float(np.sqrt(jy_var)),
+        "jy_rms_train": float(np.sqrt(sumsq_j / count)),
+        "count": int(count),
+        "n_runs": int(n_runs),
+        "train_runs": sorted(train_runs),
+        "extent": [float(v) for v in extent],
+        "channel_mean": mean_np.tolist(),
+        "channel_std": std_np.tolist(),
+        "jy_definition": JY_STATS_DEFINITION,
+        "preprocessing": JY_STATS_PREPROCESSING,
+        "source": "training_runs",
+    }
+
+
+def jy_stats_cache_matches(
+    cached: Dict,
+    train_runs: set[str],
+    mean: torch.Tensor | np.ndarray | Sequence[float],
+    std: torch.Tensor | np.ndarray | Sequence[float],
+    extent: Sequence[float],
+) -> bool:
+    if set(cached.get("train_runs", [])) != set(train_runs):
+        return False
+    if str(cached.get("jy_definition", "")) != JY_STATS_DEFINITION:
+        return False
+    if str(cached.get("preprocessing", "")) != JY_STATS_PREPROCESSING:
+        return False
+    mean_np, std_np = _channel_stat_vectors(mean, std)
+    try:
+        return bool(
+            np.allclose(cached.get("extent", []), extent)
+            and np.allclose(cached.get("channel_mean", []), mean_np)
+            and np.allclose(cached.get("channel_std", []), std_np)
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def load_or_compute_jy_training_stats(
+    run_dir: Path,
+    dataset: VPICWindowDataset,
+    train_runs: set[str],
+    mean: torch.Tensor | np.ndarray | Sequence[float],
+    std: torch.Tensor | np.ndarray | Sequence[float],
+    extent: Sequence[float],
+) -> Dict:
+    """Reuse run-dir/jy_stats.json when the definition and split still match."""
+    cache_path = Path(run_dir) / JY_STATS_FILENAME
+    if cache_path.exists():
+        cached = json.loads(cache_path.read_text())
+        if jy_stats_cache_matches(cached, train_runs, mean, std, extent):
+            print(f"Loaded cached Jy training stats from {cache_path}")
+            print(
+                "Jy training stats: "
+                f"mean={cached['jy_mean_train']:.6g}, "
+                f"std={cached['jy_std_train']:.6g}, "
+                f"rms={cached['jy_rms_train']:.6g}"
+            )
+            return cached
+        print(
+            f"Cached Jy stats at {cache_path} do not match the current "
+            "training split / extent / channel stats; recomputing."
+        )
+
+    stats = compute_jy_training_stats(
+        dataset=dataset,
+        train_runs=train_runs,
+        mean=mean,
+        std=std,
+        extent=extent,
+    )
+    cache_path.write_text(json.dumps(stats, indent=2))
+    print(f"Saved Jy training stats: {cache_path}")
+    print(
+        "Jy training stats: "
+        f"mean={stats['jy_mean_train']:.6g}, "
+        f"std={stats['jy_std_train']:.6g}, "
+        f"rms={stats['jy_rms_train']:.6g}"
+    )
+    return stats
 
 
 def select_validation_statistics_indices(
@@ -1363,7 +1674,7 @@ def save_validation_statistics_plot(
             }
         )
     axes[0].set_ylabel("Density frame NRMSE")
-    axes[1].set_ylabel("Jy frame NRMSE")
+    axes[1].set_ylabel(JY_NRMSE_YLABEL)
     axes[1].set_xlabel(f"Local frame in {context_length}-frame context window")
     yscales = {"density": "linear", "jy": "linear"}
     if experiment_name == "magnetic_ablation":
@@ -1425,6 +1736,7 @@ def save_validation_statistics_plot(
         "window_count": total_windows,
         "density_nrmse_yscale": yscales["density"],
         "jy_nrmse_yscale": yscales["jy"],
+        "jy_nrmse_ylabel": JY_NRMSE_YLABEL,
         "aggregation_policy": (
             "median across windows within each run, then cross-run median and "
             "16th-84th percentiles"
@@ -1445,6 +1757,7 @@ def collect_validation_statistics(
     std: torch.Tensor,
     device: torch.device,
     canonical_rows: Dict[str, List[Dict]],
+    jy_std_train: float = 1.0,
 ) -> Dict[str, List[Dict]]:
     """Evaluate all selected validation windows and aggregate by independent run."""
     collected: Dict[str, List[Dict]] = {
@@ -1498,8 +1811,8 @@ def collect_validation_statistics(
                     np.mean(np.square(density_residual), axis=(1, 2))
                 )
                 prediction_jy = compute_jy(predictions[row_index], args.extent)
-                jy_nrmse = np.sqrt(
-                    np.mean(np.square(prediction_jy - target_jy), axis=(1, 2))
+                jy_nrmse = jy_nrmse_from_residual(
+                    prediction_jy - target_jy, jy_std_train
                 )
                 row["density_by_run"].setdefault(run_name, []).append(density_nrmse)
                 row["jy_by_run"].setdefault(run_name, []).append(jy_nrmse)
@@ -1825,6 +2138,7 @@ def plot_jy_ay_by_mask_patterns(
     quiver_scale: float,
     dpi: int,
     limit_times: Sequence[int] | None = None,
+    jy_std_train: float = 1.0,
 ) -> None:
     """
     Plot Jy with Ay contours for complete target/prediction fields.
@@ -1889,7 +2203,7 @@ def plot_jy_ay_by_mask_patterns(
         visible_jy = target.copy()
         visible_jy[joint_b_mask < 0.5] = np.nan
         visible_pct = 100.0 * float(np.mean(joint_b_mask))
-        nrmse, nmae = compute_normalized_metrics(residual)
+        nrmse, nmae = compute_normalized_metrics(residual, scale=jy_std_train)
         row_label = (
             f"{row['label']}\n"
             f"joint B visible={visible_pct:.2f}%\n"
@@ -2361,6 +2675,24 @@ def main():
 
     mean = torch.tensor(stats["mean"], dtype=torch.float32, device=device).view(1, 4, 1, 1, 1)
     std = torch.tensor(stats["std"], dtype=torch.float32, device=device).view(1, 4, 1, 1, 1)
+    train_runs = get_train_runs(run_dir)
+    if train_runs is None:
+        raise FileNotFoundError(
+            "Jy NRMSE normalization requires run-dir/split.json with train_runs."
+        )
+    jy_stats = load_or_compute_jy_training_stats(
+        run_dir=run_dir,
+        dataset=dataset,
+        train_runs=train_runs,
+        mean=mean,
+        std=std,
+        extent=args.extent,
+    )
+    jy_std_train = float(jy_stats["jy_std_train"])
+    if jy_std_train <= 0.0:
+        raise RuntimeError(
+            f"Training-set Jy std must be positive, got {jy_std_train}."
+        )
 
     y_norm = normalize(y, mean, std)
 
@@ -2464,6 +2796,7 @@ def main():
             std=std,
             device=device,
             canonical_rows=dict(experiment_rows),
+            jy_std_train=jy_std_train,
         )
         for experiment_name, row_statistics in validation_statistics.items():
             statistics_stem = (
@@ -2485,6 +2818,9 @@ def main():
                     "window_stride": statistics_window_stride,
                     "max_windows_per_run": args.statistics_max_windows_per_run,
                     "mask_seed": args.seed,
+                    "jy_mean_train": jy_stats["jy_mean_train"],
+                    "jy_std_train": jy_stats["jy_std_train"],
+                    "jy_rms_train": jy_stats["jy_rms_train"],
                 }
             )
             statistics_path = out_dir / f"{statistics_stem}.json"
@@ -2529,6 +2865,14 @@ def main():
             out_path=out_dir / f"{experiment_stem}_error_vs_frame.png",
             title=f"{experiment_name}: error by frame",
             experiment_name=experiment_name,
+            jy_std_train=jy_std_train,
+        )
+        error_payload.update(
+            {
+                "jy_mean_train": jy_stats["jy_mean_train"],
+                "jy_std_train": jy_stats["jy_std_train"],
+                "jy_rms_train": jy_stats["jy_rms_train"],
+            }
         )
         error_path = out_dir / f"{experiment_stem}_error_vs_frame.json"
         error_path.write_text(json.dumps(error_payload, indent=2))
@@ -2563,6 +2907,7 @@ def main():
                 quiver_scale=args.quiver_scale,
                 dpi=args.dpi,
                 limit_times=limit_times,
+                jy_std_train=jy_std_train,
             )
 
             plot_density_magnetic_field_by_mask_patterns(

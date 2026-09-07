@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,8 +11,12 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from data.masking import _spatial_block_plane, sample_mask  # noqa: E402
+
 from visualize_mask_patterns_unet3d import (  # noqa: E402
     DEFAULT_MAGNETIC_ABLATION_VISIBLE_FRACTIONS,
+    JY_NRMSE_YLABEL,
+    make_centered_spatial_block_mask,
     apply_log_yscale_if_strictly_positive,
     build_density_forecast_rows,
     build_density_only_multifunction_rows,
@@ -25,9 +30,13 @@ from visualize_mask_patterns_unet3d import (  # noqa: E402
     format_magnetic_visible_percent,
     magnetic_ablation_visible_count,
     compute_normalized_metrics,
+    jy_nrmse_from_residual,
+    jy_stats_cache_matches,
+    normalize_field_np,
     normalized_residual,
     save_information_suite_error_plot,
     save_validation_statistics_plot,
+    summarize_jy_values,
     select_validation_statistics_indices,
     select_run_t0_index,
     validation_statistics_legend_label,
@@ -123,6 +132,7 @@ def test_collect_validation_statistics_crops_and_combines_windows():
 
     first_row = stats["density_superres"][0]
     np.testing.assert_allclose(first_row["density"]["median"], [1.5, 1.5])
+    np.testing.assert_allclose(first_row["jy"]["median"], [0.0, 0.0])
     assert first_row["density"]["window_counts"] == {"run_a": 2}
 
 
@@ -143,12 +153,23 @@ def test_multifunction_masks_only_density():
         generator=make_generator(),
     )
 
-    assert len(rows) == 5
+    assert len(rows) == 6
     assert all(torch.all(mask[:, :3] == 1) for _, _, mask in rows)
-    block_mask = next(mask for name, _, mask in rows if name == "spatial_block")
-    midpoint = SHAPE[-2] // 2
-    assert torch.all(block_mask[:, 3:4, :, :midpoint] == 1)
-    assert torch.all(block_mask[:, 3:4, :, midpoint:] == 0)
+    inpaint = next(
+        mask for name, _, mask in rows if name == "spatial_block_inpainting"
+    )
+    outpaint = next(
+        mask for name, _, mask in rows if name == "spatial_block_outpainting"
+    )
+    assert torch.equal(outpaint[:, 3:4], 1.0 - inpaint[:, 3:4])
+    inpaint_label = next(
+        label for name, label, _ in rows if name == "spatial_block_inpainting"
+    )
+    outpaint_label = next(
+        label for name, label, _ in rows if name == "spatial_block_outpainting"
+    )
+    assert "Spatial block — inpainting" in inpaint_label
+    assert "Spatial block — outpainting" in outpaint_label
 
     temporal_random = next(
         mask for name, _, mask in rows if name == "temporal_random"
@@ -289,6 +310,20 @@ def test_magnetic_ablation_nrmse_panels_use_log_scale_when_positive(tmp_path):
     )
     assert payload["density_nrmse_yscale"] == "log"
     assert payload["jy_nrmse_yscale"] == "log"
+    assert payload["jy_nrmse_ylabel"] == JY_NRMSE_YLABEL
+    np.testing.assert_allclose(payload["rows"][0]["jy_nrmse"], [0.3, 0.3, 0.3])
+    scaled_payload = save_information_suite_error_plot(
+        target_field_normalized=target,
+        target_jy_normalized=target_jy,
+        rows=rows,
+        frame_ids=frames,
+        out_path=tmp_path / "named_magnetic_ablation_scaled.png",
+        title="magnetic_ablation: error by frame",
+        experiment_name="magnetic_ablation",
+        jy_std_train=0.1,
+    )
+    np.testing.assert_allclose(scaled_payload["rows"][0]["jy_nrmse"], [3.0, 3.0, 3.0])
+    np.testing.assert_allclose(scaled_payload["rows"][0]["density_nrmse"], [0.2, 0.2, 0.2])
     assert [row["legend_label"] for row in payload["rows"]] == [
         "B visible=100%",
         "B visible=0.1%",
@@ -329,6 +364,7 @@ def test_magnetic_ablation_nrmse_panels_use_log_scale_when_positive(tmp_path):
     )
     assert stats_payload["density_nrmse_yscale"] == "log"
     assert stats_payload["jy_nrmse_yscale"] == "log"
+    assert stats_payload["jy_nrmse_ylabel"] == JY_NRMSE_YLABEL
     assert [row["legend_label"] for row in stats_payload["rows"]] == [
         "B visible=100%",
         "B visible=0%",
@@ -462,3 +498,170 @@ def test_gif_animation_loops_infinitely(tmp_path):
     with Image.open(gif_path) as animation:
         assert animation.n_frames == 2
         assert animation.info.get("loop") == 0
+
+
+def test_jy_nrmse_divides_residual_rms_by_training_std():
+    residual = np.full((3, 4, 5), 0.2, dtype=np.float64)
+    np.testing.assert_allclose(jy_nrmse_from_residual(residual, 0.1), [2.0, 2.0, 2.0])
+    nrmse, nmae = compute_normalized_metrics(residual, scale=0.1)
+    assert np.isclose(nrmse, 2.0)
+    assert np.isclose(nmae, 0.2)
+
+
+def test_jy_training_summary_and_cache_keys_match_visualization_definition():
+    field = np.zeros((4, 2, 6, 5), dtype=np.float64)
+    z = np.linspace(-21.0, 21.0, 5)
+    field[0] = z[None, None, :]
+    mean = np.array([0.0, 0.0, 0.0, 0.0])
+    std = np.array([2.0, 1.0, 1.0, 1.0])
+    extent = [-21.0, 21.0, -50.0, 50.0]
+    jy = compute_jy(normalize_field_np(field, mean, std), extent)
+    summary = summarize_jy_values(jy)
+    # Linear Bx / std=2 has constant dBx/dz = 0.5 after channel standardization.
+    np.testing.assert_allclose(jy, 0.5, atol=1e-12)
+    assert np.isclose(summary["jy_mean_train"], 0.5)
+    assert np.isclose(summary["jy_std_train"], 0.0)
+    assert np.isclose(summary["jy_rms_train"], 0.5)
+    cached = {
+        "train_runs": ["run_a"],
+        "jy_definition": "dBx/dz - dBz/dx",
+        "preprocessing": "checkpoint channel-standardized Bx,Bz",
+        "extent": extent,
+        "channel_mean": mean.tolist(),
+        "channel_std": std.tolist(),
+    }
+    assert jy_stats_cache_matches(cached, {"run_a"}, mean, std, extent)
+    assert not jy_stats_cache_matches(cached, {"run_b"}, mean, std, extent)
+
+
+def test_collect_validation_statistics_scales_jy_nrmse_by_training_std():
+    class LinearBxDataset:
+        samples = [(0, "run_a", 0)]
+
+        def __getitem__(self, index):
+            block = torch.zeros((4, 2, 4, 5), dtype=torch.float32)
+            z = torch.linspace(-21.0, 21.0, 5)
+            block[0] = z.view(1, 1, 5)
+            return {
+                "block": block,
+                "metadata": {"run_name": "run_a", "t0": 0},
+            }
+
+    template = torch.zeros((1, 4, 2, 4, 5), dtype=torch.float32)
+    mask_rows = build_density_superres_rows(template, [0])
+    canonical_rows = {
+        "density_superres": [
+            {"name": name, "label": label, "mask": mask[0].numpy()}
+            for name, label, mask in mask_rows
+        ]
+    }
+    args = SimpleNamespace(
+        seed=1234,
+        experiment="density_superres",
+        density_probe_counts=[0],
+        magnetic_visible_fractions=[0.0],
+        extent=[-21.0, 21.0, -50.0, 50.0],
+    )
+    raw = collect_validation_statistics(
+        model=ZeroFieldModel(),
+        dataset=LinearBxDataset(),
+        sample_indices=[0],
+        args=args,
+        mean=torch.zeros((1, 4, 1, 1, 1)),
+        std=torch.ones((1, 4, 1, 1, 1)),
+        device=torch.device("cpu"),
+        canonical_rows=canonical_rows,
+        jy_std_train=1.0,
+    )
+    scaled = collect_validation_statistics(
+        model=ZeroFieldModel(),
+        dataset=LinearBxDataset(),
+        sample_indices=[0],
+        args=args,
+        mean=torch.zeros((1, 4, 1, 1, 1)),
+        std=torch.ones((1, 4, 1, 1, 1)),
+        device=torch.device("cpu"),
+        canonical_rows=canonical_rows,
+        jy_std_train=0.2,
+    )
+    raw_jy = raw["density_superres"][0]["jy"]["median"]
+    scaled_jy = scaled["density_superres"][0]["jy"]["median"]
+    assert np.all(raw_jy > 0.0)
+    np.testing.assert_allclose(scaled_jy, raw_jy / 0.2)
+    # Density is unchanged by the Jy scale.
+    np.testing.assert_allclose(
+        scaled["density_superres"][0]["density"]["median"],
+        raw["density_superres"][0]["density"]["median"],
+    )
+
+
+def test_centered_spatial_block_is_complementary_and_half_area():
+    size_x, size_z = 154, 62
+    inpaint, in_info = make_centered_spatial_block_mask(
+        size_x, size_z, orientation="inside_masked"
+    )
+    outpaint, out_info = make_centered_spatial_block_mask(
+        size_x, size_z, orientation="inside_visible"
+    )
+
+    assert in_info["rect_height"] == 109
+    assert in_info["rect_width"] == 44
+    assert in_info["rect_x0"] == (size_x - 109) // 2
+    assert in_info["rect_z0"] == (size_z - 44) // 2
+    assert in_info["rect_x0"] == out_info["rect_x0"]
+    assert in_info["rect_z0"] == out_info["rect_z0"]
+    assert abs(in_info["rect_x0"] - (size_x - in_info["rect_x0"] - in_info["rect_height"])) <= 1
+    assert abs(in_info["rect_z0"] - (size_z - in_info["rect_z0"] - in_info["rect_width"])) <= 1
+
+    aspect = in_info["rect_height"] / in_info["rect_width"]
+    domain_aspect = size_x / size_z
+    assert abs(math.log(aspect / domain_aspect)) < 0.02
+    assert abs(in_info["actual_area_fraction"] - 0.5) < 0.01
+    assert in_info["target_area_fraction"] == 0.5
+
+    x0, z0 = in_info["rect_x0"], in_info["rect_z0"]
+    hx, hz = in_info["rect_height"], in_info["rect_width"]
+    assert torch.all(inpaint[x0 : x0 + hx, z0 : z0 + hz] == 0)
+    outside = inpaint.clone()
+    outside[x0 : x0 + hx, z0 : z0 + hz] = float("nan")
+    assert torch.all(outside[torch.isfinite(outside)] == 1)
+    assert torch.all(outpaint[x0 : x0 + hx, z0 : z0 + hz] == 1)
+    outside_out = outpaint.clone()
+    outside_out[x0 : x0 + hx, z0 : z0 + hz] = float("nan")
+    assert torch.all(outside_out[torch.isfinite(outside_out)] == 0)
+    assert torch.equal(outpaint, 1.0 - inpaint)
+
+
+def test_training_and_validation_spatial_block_are_not_the_viz_rectangle():
+    size_x, size_z = 154, 62
+    _, centered = make_centered_spatial_block_mask(size_x, size_z)
+    origins = set()
+    for seed in range(20):
+        mask, info = sample_mask(
+            (1, 4, 4, size_x, size_z),
+            "spatial_block",
+            0.5,
+            generator=torch.Generator().manual_seed(seed),
+        )
+        assert info["orientation"] == "inside_masked"
+        origins.add((info["rect_x0"], info["rect_z0"], info["rect_height"], info["rect_width"]))
+        assert torch.all(mask[:, 0] == mask[:, 3])
+    assert len(origins) > 1
+    assert any(
+        origin
+        != (
+            centered["rect_x0"],
+            centered["rect_z0"],
+            centered["rect_height"],
+            centered["rect_width"],
+        )
+        for origin in origins
+    )
+
+    orientations = {
+        _spatial_block_plane(
+            1, 1, 32, 24, 0.35, torch.Generator().manual_seed(seed), orientation="random"
+        )[1]["orientation"]
+        for seed in range(40)
+    }
+    assert orientations == {"inside_masked", "inside_visible"}

@@ -26,7 +26,6 @@ from data.masking import (
     MASK_PATTERNS,
     PATTERN_TO_ID,
     PROBE_COUNT_PATTERNS,
-    full_mae_loss,
     full_mse_loss,
     make_visible_input,
     parse_pattern_weights,
@@ -742,7 +741,6 @@ def train_one_epoch(
     # Accumulate on device and read back once per epoch. Training patterns are
     # independent marginals, so no ambiguous 5x5 combination loss is logged.
     sum_mse = torch.zeros((), device=device)
-    sum_mae = torch.zeros((), device=device)
     magnetic_pattern_counts = torch.zeros(n_patterns, device=device)
     density_pattern_counts = torch.zeros(n_patterns, device=device)
     sum_actual_fraction = torch.zeros((), device=device)
@@ -841,9 +839,7 @@ def train_one_epoch(
 
         with torch.cuda.amp.autocast(enabled=(amp and device.type == "cuda")):
             pred = model(model_input)
-            loss_mse = full_mse_loss(pred, y, mask)
-            loss_mae = full_mae_loss(pred, y)
-            loss = loss_mse
+            loss = full_mse_loss(pred, y, mask)
 
         scaler.scale(loss).backward()
 
@@ -869,8 +865,7 @@ def train_one_epoch(
             density_pattern_counts.index_add_(0, density_pattern_ids, ones)
             sum_actual_fraction += per_sample_actual.sum()
 
-            sum_mse += loss_mse.detach().float()
-            sum_mae += loss_mae.detach().float()
+            sum_mse += loss.detach().float()
 
         # temporal_block samples two boundaries directly, so its requested
         # random fraction is intentionally ignored; use the realized fraction
@@ -899,7 +894,6 @@ def train_one_epoch(
             epoch_progress.set_postfix(
                 phase="train",
                 mse=float(sum_mse) / total_batches,
-                mae=float(sum_mae) / total_batches,
             )
 
     if epoch_progress is not None and epoch_number is not None:
@@ -910,7 +904,6 @@ def train_one_epoch(
     totals = torch.tensor(
         [
             float(sum_mse),
-            float(sum_mae),
             float(total_batches),
             float(sum_target_fraction),
             float(count_samples),
@@ -934,7 +927,6 @@ def train_one_epoch(
 
     (
         global_mse,
-        global_mae,
         global_batches,
         global_target,
         global_samples,
@@ -955,7 +947,6 @@ def train_one_epoch(
 
     return {
         "mse": global_mse / max(global_batches, 1),
-        "mae": global_mae / max(global_batches, 1),
         "target_mask_fraction": global_target / total_count,
         "actual_mask_fraction": float(sum_actual_fraction.cpu()) / total_count,
         "density_probe_count": mean_density_probes,
@@ -1014,7 +1005,7 @@ def validate(
     """
     model.eval()
 
-    sums = torch.zeros(len(patterns), 2, device=device)
+    sums = torch.zeros(len(patterns), device=device)
     counts = torch.zeros(len(patterns), device=device)
 
     if epoch_progress is not None:
@@ -1079,10 +1070,8 @@ def validate(
             with torch.cuda.amp.autocast(enabled=(amp and device.type == "cuda")):
                 pred = model(model_input)
                 loss_mse = full_mse_loss(pred, y, mask)
-                loss_mae = full_mae_loss(pred, y)
 
-            sums[i, 0] += loss_mse.detach().float() * batch_size
-            sums[i, 1] += loss_mae.detach().float() * batch_size
+            sums[i] += loss_mse.detach().float() * batch_size
             counts[i] += batch_size
 
     if distributed_is_initialized():
@@ -1094,18 +1083,71 @@ def validate(
 
     metrics = {
         pattern: {
-            "mse": float(sums[i, 0] / counts[i]),
-            "mae": float(sums[i, 1] / counts[i]),
+            "mse": float(sums[i] / counts[i]),
         }
         for i, pattern in enumerate(patterns)
     }
 
     metrics["mean"] = {
         "mse": sum(metrics[pattern]["mse"] for pattern in patterns) / len(patterns),
-        "mae": sum(metrics[pattern]["mae"] for pattern in patterns) / len(patterns),
     }
 
     return metrics
+
+
+def build_epoch_wandb_log(
+    row: Dict[str, Any],
+    train_metrics: Dict[str, Any],
+    val_metrics: Dict[str, Dict[str, float]],
+    val_patterns: Sequence[str],
+) -> Dict[str, Any]:
+    """Assemble the per-epoch W&B payload. MSE is the only reconstruction metric."""
+    log_data = {
+        "epoch": row["epoch"],
+        "train/mse": row["train_mse"],
+        "val/mse": row["val_mse"],
+        "val/mean/mse": row["val_mse"],
+        "mask/target_fraction": row["train_mask_target_fraction"],
+        "mask/actual_fraction": row["train_mask_actual_fraction"],
+        "mask/density_probe_patterns/probe_count": row[
+            "train_density_probe_count"
+        ],
+        "mask/density_probe_patterns/visible_fraction": row[
+            "train_density_visible_fraction"
+        ],
+        "mask/density_probe_patterns/zero_sample_share": row[
+            "train_density_zero_sample_share"
+        ],
+        "mask/density_probe_patterns/full_sample_share": row[
+            "train_density_full_sample_share"
+        ],
+        "mask/magnetic_probe_patterns/visible_count": row[
+            "train_magnetic_visible_count"
+        ],
+        "mask/magnetic_probe_patterns/visible_fraction": row[
+            "train_magnetic_visible_fraction"
+        ],
+        "mask/magnetic_probe_patterns/zero_sample_share": row[
+            "train_magnetic_zero_sample_share"
+        ],
+        "mask/magnetic_probe_patterns/full_sample_share": row[
+            "train_magnetic_full_sample_share"
+        ],
+        "optimization/learning_rate": row["learning_rate"],
+    }
+
+    for pattern in MASK_PATTERNS:
+        log_data[f"mask/magnetic_pattern_share/{pattern}"] = (
+            train_metrics["magnetic_pattern_share"][pattern]
+        )
+        log_data[f"mask/density_pattern_share/{pattern}"] = (
+            train_metrics["density_pattern_share"][pattern]
+        )
+
+    for pattern in val_patterns:
+        log_data[f"val/{pattern}/mse"] = val_metrics[pattern]["mse"]
+
+    return log_data
 
 
 def save_checkpoint(
@@ -1519,9 +1561,7 @@ def main():
             "epoch": epoch,
             "learning_rate": epoch_lr,
             "train_mse": train_metrics["mse"],
-            "train_mae": train_metrics["mae"],
             "val_mse": val_metrics["mean"]["mse"],
-            "val_mae": val_metrics["mean"]["mae"],
             "train_mask_target_fraction": train_metrics["target_mask_fraction"],
             "train_mask_actual_fraction": train_metrics["actual_mask_fraction"],
             "train_density_probe_count": train_metrics[
@@ -1562,63 +1602,19 @@ def main():
             history.append(row)
 
         if wandb_run is not None:
-            log_data = {
-                "epoch": epoch,
-                "train/mse": row["train_mse"],
-                "train/mae": row["train_mae"],
-                "val/mse": row["val_mse"],
-                "val/mae": row["val_mae"],
-                "val/mean/mse": row["val_mse"],
-                "val/mean/mae": row["val_mae"],
-                "mask/target_fraction": row["train_mask_target_fraction"],
-                "mask/actual_fraction": row["train_mask_actual_fraction"],
-                "mask/density_probe_patterns/probe_count": row[
-                    "train_density_probe_count"
-                ],
-                "mask/density_probe_patterns/visible_fraction": row[
-                    "train_density_visible_fraction"
-                ],
-                "mask/density_probe_patterns/zero_sample_share": row[
-                    "train_density_zero_sample_share"
-                ],
-                "mask/density_probe_patterns/full_sample_share": row[
-                    "train_density_full_sample_share"
-                ],
-                "mask/magnetic_probe_patterns/visible_count": row[
-                    "train_magnetic_visible_count"
-                ],
-                "mask/magnetic_probe_patterns/visible_fraction": row[
-                    "train_magnetic_visible_fraction"
-                ],
-                "mask/magnetic_probe_patterns/zero_sample_share": row[
-                    "train_magnetic_zero_sample_share"
-                ],
-                "mask/magnetic_probe_patterns/full_sample_share": row[
-                    "train_magnetic_full_sample_share"
-                ],
-                "optimization/learning_rate": row["learning_rate"],
-            }
-
-            for pattern in MASK_PATTERNS:
-                log_data[f"mask/magnetic_pattern_share/{pattern}"] = (
-                    train_metrics["magnetic_pattern_share"][pattern]
+            wandb_run.log(
+                build_epoch_wandb_log(
+                    row=row,
+                    train_metrics=train_metrics,
+                    val_metrics=val_metrics,
+                    val_patterns=args.val_patterns,
                 )
-                log_data[f"mask/density_pattern_share/{pattern}"] = (
-                    train_metrics["density_pattern_share"][pattern]
-                )
-
-            for pattern in args.val_patterns:
-                log_data[f"val/{pattern}/mse"] = val_metrics[pattern]["mse"]
-                log_data[f"val/{pattern}/mae"] = val_metrics[pattern]["mae"]
-
-            wandb_run.log(log_data)
+            )
 
         epoch_log(
             f"Epoch {epoch}/{args.epochs}  lr={epoch_lr:.8g}  "
             f"train_mse={row['train_mse']:.6f} "
-            f"train_mae={row['train_mae']:.6f} "
             f"val_mse={row['val_mse']:.6f} "
-            f"val_mae={row['val_mae']:.6f} "
             f"density_probes="
             f"{row['train_density_probe_count']:.2f} "
             f"D_zero_share="

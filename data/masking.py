@@ -22,15 +22,16 @@ MASK_PATTERNS: Tuple[str, ...] = (
 # Increment this whenever the training-time meaning of a mask changes. It is
 # stored in checkpoints so auto-resume cannot silently mix incompatible mask
 # distributions in one run.
-MASKING_VERSION = "independentBD_fiveMask_logUniformCounts_v8"
+MASKING_VERSION = "independentBD_fiveMask_logUniformCounts_orientedSpatialBlock_v9"
 
 PATTERN_TO_ID: Dict[str, int] = {name: i for i, name in enumerate(MASK_PATTERNS)}
 
 # Bx, By and Bz always share one observation layout. Training samples B and
 # Density independently: probe patterns use a 0 / log-uniform / full mixture
-# of exact visible counts, spatial_block keeps a Uniform(0, 1) area fraction,
-# and temporal patterns draw a uniform visible-frame count. The legacy shared-
-# pattern API remains available to visualization and controlled validation.
+# of exact visible counts, spatial_block keeps a Uniform(0, 1) area fraction
+# with a 50/50 inpainting/outpainting orientation, and temporal patterns draw
+# a uniform visible-frame count. The legacy shared-pattern API remains
+# available to visualization and controlled validation.
 # Spatial layouts remain fixed throughout a window.
 SPATIAL_MASK_PATTERNS: Tuple[str, ...] = (
     "spatial_random",
@@ -380,9 +381,14 @@ def _random_probe_plane(B, C, X, Z, probe_count, generator):
     }
 
 
-def _spatial_block_plane(B, C, X, Z, p, generator):
+def _spatial_block_plane(B, C, X, Z, p, generator, orientation="inside_masked"):
     """
-    Hide one randomly placed rectangle whose area is close to p * X * Z.
+    Place one rectangle whose area is close to p * X * Z.
+
+    orientation:
+        "inside_masked": inpainting; rectangle hidden, exterior visible.
+        "inside_visible": outpainting; rectangle visible, exterior hidden.
+        "random": training-only 50/50 choice between the two.
     """
     area = p * X * Z
     aspect = _log_uniform(1.0 / 3.0, 3.0, generator)
@@ -404,14 +410,27 @@ def _spatial_block_plane(B, C, X, Z, p, generator):
     x0 = _randint(X - hx + 1, generator)
     z0 = _randint(Z - hz + 1, generator)
 
-    plane = torch.ones(1, C, 1, X, Z)
-    plane[..., x0 : x0 + hx, z0 : z0 + hz] = 0.0
+    if orientation == "random":
+        orientation = (
+            "inside_visible" if _rand(generator) < 0.5 else "inside_masked"
+        )
+    if orientation == "inside_masked":
+        plane = torch.ones(1, C, 1, X, Z)
+        plane[..., x0 : x0 + hx, z0 : z0 + hz] = 0.0
+    elif orientation == "inside_visible":
+        plane = torch.zeros(1, C, 1, X, Z)
+        plane[..., x0 : x0 + hx, z0 : z0 + hz] = 1.0
+    else:
+        raise ValueError(
+            f"Unknown spatial_block orientation {orientation!r}."
+        )
 
     info = {
         "rect_x0": x0,
         "rect_z0": z0,
         "rect_height": hx,
         "rect_width": hz,
+        "orientation": orientation,
     }
     return plane, info
 
@@ -538,7 +557,9 @@ def _sample_modality_mask(
             return _random_probe_plane(1, 1, X, Z, visible_count, generator)
         return _sparse_probe_grid_plane(1, 1, X, Z, visible_count, generator)
     if pattern == "spatial_block":
-        return _spatial_block_plane(1, 1, X, Z, p, generator)
+        return _spatial_block_plane(
+            1, 1, X, Z, p, generator, orientation="random"
+        )
     if pattern == "temporal_random":
         return _temporal_random_frames(
             T, p, generator, n_visible=visible_count

@@ -9,7 +9,6 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=128
 #SBATCH --time=12:00:00
-#SBATCH --requeue
 #SBATCH --output=/pscratch/sd/b/binxia/ai4plasma/logs/slurm-%x-%j.out
 #SBATCH --error=/pscratch/sd/b/binxia/ai4plasma/logs/slurm-%x-%j.err
 
@@ -61,9 +60,7 @@ print("  CUDA availability will be checked inside the srun workers.")
 PY
 
 H5_DIR=/pscratch/sd/b/binxia/VPIC_PPPL_HDF5_by_beta_official2500_none_compat
-SOURCE_RUN_NAME=masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v12_independentBD_fivemask_attention_spatialpool_b8_e4500
-INIT_CHECKPOINT=runs/${SOURCE_RUN_NAME}/best.pt
-RUN_NAME=masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v13_independentBD_logUniformCounts_attention_spatialpool_b8_e3000
+RUN_NAME=masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v15_orientedSpatialBlock_independentBD_logUniformCounts_attention_spatialpool_b8_e4500
 
 BETAS=(0.2)
 DELTA_T=24
@@ -72,7 +69,7 @@ STRIDE_T=2
 # Per-GPU batch size. With 16 GPUs this gives global batch size 128.
 BATCH_SIZE=8
 NUM_WORKERS=4
-EPOCHS=3000
+EPOCHS=4500
 LR=2e-4
 WARMUP_EPOCHS=10
 MIN_LR=2e-6
@@ -102,10 +99,12 @@ if [[ ! -d "${H5_DIR}" ]]; then
     echo "ERROR: HDF5 directory not found: ${H5_DIR}" >&2
     exit 2
 fi
-if [[ ! -f "${INIT_CHECKPOINT}" ]]; then
-    echo "ERROR: initialization checkpoint not found: ${INIT_CHECKPOINT}" >&2
-    exit 2
-fi
+for extra_arg in "$@"; do
+    if [[ "${extra_arg}" == --init-checkpoint ]]; then
+        echo "ERROR: this official run is from-scratch; do not pass --init-checkpoint." >&2
+        exit 2
+    fi
+done
 
 TRAIN_ARGS=(
     --h5-dir "${H5_DIR}"
@@ -131,7 +130,6 @@ TRAIN_ARGS=(
     --spatial-only-pooling
     --amp
     --mask-patterns "${MASK_PATTERNS[@]}"
-    --init-checkpoint "${INIT_CHECKPOINT}"
     --out-dir "${OUT_DIR}"
     --wandb-name "${RUN_NAME}"
     --wandb-mode "${WANDB_MODE}"
@@ -147,8 +145,10 @@ echo "DDP world size: ${WORLD_SIZE}"
 echo "Per-GPU batch size: ${BATCH_SIZE}"
 echo "Global batch size: $((BATCH_SIZE * WORLD_SIZE))"
 echo "Epochs: ${EPOCHS}"
-echo "Init checkpoint (weights only): ${INIT_CHECKPOINT}"
-echo "Auto-resume latest path: ${OUT_DIR}/latest.pt"
+echo "Initialization: random weights + estimated training-set channel stats"
+echo "Init checkpoint: none"
+echo "Auto-resume latest path: ${OUT_DIR}/latest.pt (empty at first launch)"
+echo "Masking version: independentBD_fiveMask_logUniformCounts_orientedSpatialBlock_v9"
 echo "Unified spatiotemporal attention: enabled"
 echo "Spatial-only pooling: enabled"
 echo "Master: ${MASTER_ADDR}:${MASTER_PORT}"

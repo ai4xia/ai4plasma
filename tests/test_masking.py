@@ -11,9 +11,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from data.masking import (  # noqa: E402
     DEFAULT_PATTERN_WEIGHTS,
+    MASKING_VERSION,
     MASK_PATTERNS,
     SPATIAL_MASK_PATTERNS,
     TEMPORAL_MASK_PATTERNS,
+    _spatial_block_plane,
     _temporal_block_from_boundaries,
     _temporal_block_from_visible_count,
     parse_pattern_weights,
@@ -654,6 +656,104 @@ def test_endpoint_probabilities_are_validated():
         assert "p_zero + p_full" in str(exc)
     else:
         raise AssertionError("Expected invalid endpoint probabilities to fail")
+
+
+def _assert_spatial_block_orientation(plane, info, orientation):
+    x0 = info["rect_x0"]
+    z0 = info["rect_z0"]
+    hx = info["rect_height"]
+    hz = info["rect_width"]
+    inside = plane[..., x0 : x0 + hx, z0 : z0 + hz]
+    outside = plane.clone()
+    outside[..., x0 : x0 + hx, z0 : z0 + hz] = float("nan")
+    finite_outside = outside[torch.isfinite(outside)]
+    assert info["orientation"] == orientation
+    if orientation == "inside_masked":
+        assert torch.all(inside == 0)
+        assert torch.all(finite_outside == 1)
+    else:
+        assert torch.all(inside == 1)
+        assert torch.all(finite_outside == 0)
+
+
+def test_training_spatial_block_samples_both_orientations_near_half():
+    assert MASKING_VERSION == (
+        "independentBD_fiveMask_logUniformCounts_orientedSpatialBlock_v9"
+    )
+    generator = make_generator(2026)
+    n = 10000
+    counts = {"inside_masked": 0, "inside_visible": 0}
+    for _ in range(n):
+        plane, info = _spatial_block_plane(
+            1, 1, 32, 24, 0.35, generator, orientation="random"
+        )
+        orientation = info["orientation"]
+        counts[orientation] += 1
+        assert plane.shape == (1, 1, 1, 32, 24)
+        assert plane.dtype == torch.float32
+        assert plane.device.type == "cpu"
+        _assert_spatial_block_orientation(plane[0, 0, 0], info, orientation)
+
+    print(
+        "training spatial_block orientation counts "
+        f"inside_masked={counts['inside_masked']} "
+        f"inside_visible={counts['inside_visible']} "
+        f"n={n}"
+    )
+    assert counts["inside_masked"] > 0
+    assert counts["inside_visible"] > 0
+    assert abs(counts["inside_masked"] - n / 2) < 0.03 * n
+    assert abs(counts["inside_visible"] - n / 2) < 0.03 * n
+
+
+def test_validation_spatial_block_stays_inside_masked():
+    for seed in range(40):
+        mask, info = sample_mask(
+            (1, 4, 4, 32, 24),
+            "spatial_block",
+            0.35,
+            generator=make_generator(seed),
+        )
+        assert info["orientation"] == "inside_masked"
+        _assert_spatial_block_orientation(mask[0, 0, 0], info, "inside_masked")
+        assert torch.equal(mask[:, 0], mask[:, 3])
+
+
+def test_training_spatial_block_independent_b_and_density_orientations():
+    masks, infos = sample_independent_batch_masks(
+        (1, 4, 3, 16, 12),
+        magnetic_patterns=["spatial_block"],
+        density_patterns=["spatial_block"],
+        magnetic_mask_fractions=[0.4],
+        density_mask_fractions=[0.4],
+        generator=make_generator(11),
+    )
+    assert infos[0]["magnetic_orientation"] in {"inside_masked", "inside_visible"}
+    assert infos[0]["density_orientation"] in {"inside_masked", "inside_visible"}
+    assert torch.equal(masks[:, 0], masks[:, 1])
+    assert torch.equal(masks[:, 1], masks[:, 2])
+    _assert_spatial_block_orientation(
+        masks[0, 0, 0],
+        {
+            "rect_x0": infos[0]["magnetic_rect_x0"],
+            "rect_z0": infos[0]["magnetic_rect_z0"],
+            "rect_height": infos[0]["magnetic_rect_height"],
+            "rect_width": infos[0]["magnetic_rect_width"],
+            "orientation": infos[0]["magnetic_orientation"],
+        },
+        infos[0]["magnetic_orientation"],
+    )
+    _assert_spatial_block_orientation(
+        masks[0, 3, 0],
+        {
+            "rect_x0": infos[0]["density_rect_x0"],
+            "rect_z0": infos[0]["density_rect_z0"],
+            "rect_height": infos[0]["density_rect_height"],
+            "rect_width": infos[0]["density_rect_width"],
+            "orientation": infos[0]["density_orientation"],
+        },
+        infos[0]["density_orientation"],
+    )
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-readonly RUN_DIR="runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v12_independentBD_fivemask_attention_spatialpool_b8_e4500"
+readonly RUN_DIR="runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v15_orientedSpatialBlock_independentBD_logUniformCounts_attention_spatialpool_b8_e4500"
 readonly RUN_NAME="beta0.2_nu2_Bz0_dt2_tau70"
 readonly WINDOW_T0=28
 readonly PLASMOID_X_INDEX=130

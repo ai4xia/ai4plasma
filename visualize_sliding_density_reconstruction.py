@@ -32,6 +32,11 @@ from visualize_mask_patterns_unet3d import (
 
 
 DEFAULT_RUN_NAME = "beta0.2_nu2_Bz0_dt2_tau70"
+DEFAULT_RUN_DIR = (
+    "runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v15_"
+    "orientedSpatialBlock_independentBD_logUniformCounts_"
+    "attention_spatialpool_b8_e4500"
+)
 
 
 def framewise_rmse_mae(prediction: np.ndarray, target: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -82,7 +87,14 @@ def parse_args() -> argparse.Namespace:
             "sliding T-frame windows and compare several slide steps."
         )
     )
-    parser.add_argument("--run-dir", required=True)
+    parser.add_argument(
+        "--run-dir",
+        default=DEFAULT_RUN_DIR,
+        help=(
+            "Training run directory containing best.pt. "
+            f"Default: {DEFAULT_RUN_DIR}."
+        ),
+    )
     parser.add_argument("--checkpoint", default="best.pt")
     parser.add_argument("--h5-dir", default=None)
     parser.add_argument(
