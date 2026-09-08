@@ -31,7 +31,7 @@ from visualize_mask_patterns_unet3d import (
     DEFAULT_T0,
     JY_STATS_DEFINITION,
     RESIDUAL_CMAP,
-    _density_probe_grid,
+    _density_probe_count_grid,
     build_density_forecast_rows,
     build_density_only_multifunction_rows,
     build_density_superres_rows,
@@ -64,16 +64,17 @@ from visualize_sliding_density_reconstruction import (
 )
 
 
-PAPER_CACHE_VERSION = 6
-COMPATIBLE_PAPER_CACHE_VERSIONS = (1, 2, 3, 4, 5, 6)
+PAPER_CACHE_VERSION = 8
+COMPATIBLE_PAPER_CACHE_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8)
 PAPER_DIRNAME = "paper_figures_v1"
 DEFAULT_GLOBAL_FRAME = 45
-DEFAULT_SLIDE_STEPS = (8, 4, 2, 1)
+DEFAULT_SLIDE_STEPS = (1, 12, 24)
 DEFAULT_PROBE_COUNTS = (0, 10, 100, 1000)
 DEFAULT_X_INDEX = 130
 DEFAULT_DENSITY_VISIBLE_FRACTION = 0.08
 DEFAULT_SLIDING_MAX_RUNS = 16
-SLIDING_AGGREGATE_N_FRAMES = 52
+DEFAULT_SLIDING_DENSITY_PROBE_COUNT = 1000
+SLIDING_AGGREGATE_N_FRAMES = 48
 LOG_Y_FLOOR = 1e-6
 PNG_DPI = 300
 
@@ -163,6 +164,19 @@ def parse_args() -> argparse.Namespace:
         "--density-visible-fraction",
         type=float,
         default=DEFAULT_DENSITY_VISIBLE_FRACTION,
+        help=(
+            "Unused by paper sliding; kept for CLI compatibility. "
+            "Sliding Density probes use --density-probe-count."
+        ),
+    )
+    parser.add_argument(
+        "--density-probe-count",
+        type=int,
+        default=DEFAULT_SLIDING_DENSITY_PROBE_COUNT,
+        help=(
+            "Exact Density probe count for sliding appendix, using the same "
+            "exact-count grid as density super-resolution. Default: 1000."
+        ),
     )
     parser.add_argument(
         "--density-probe-counts",
@@ -182,8 +196,8 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_SLIDING_MAX_RUNS,
         help=(
             "Maximum held-out validation runs for sliding appendix left-panel "
-            "RMSE stats, taken in split.json order. Runs shorter than 52 frames "
-            "are skipped; remaining runs use only frames 0:52."
+            "RMSE stats, taken in split.json order. Runs shorter than 48 frames "
+            "are skipped; remaining runs use only the first 48 frames."
         ),
     )
     return parser.parse_args()
@@ -285,6 +299,15 @@ def select_sliding_aggregate_runs(
     if int(max_runs) <= 0:
         raise ValueError(f"sliding max runs must be positive, got {max_runs}")
     return [str(name) for name in val_run_order][: int(max_runs)]
+
+
+def sliding_density_probe_mask(
+    block: torch.Tensor,
+    probe_count: int,
+) -> Tuple[torch.Tensor, Dict]:
+    """Exact-count Density grid, same helper as density super-resolution."""
+    mask_full, info = _density_probe_count_grid(block, int(probe_count))
+    return mask_full[0, 0, 0], info
 
 
 def stack_rmse_by_global_frame(
@@ -1503,13 +1526,10 @@ def compute_sliding_aggregate_rmse(
         )
         target_normalized = (target - mean) / (std + 1e-8)
         target_density_plot = target[3].detach().cpu().numpy()
-        generator = torch.Generator().manual_seed(int(args.seed))
-        probe_mask_full, _probe_info = _density_probe_grid(
-            block=target_normalized.unsqueeze(0),
-            target_visible_fraction=float(args.density_visible_fraction),
-            generator=generator,
+        probe_mask, _probe_info = sliding_density_probe_mask(
+            target_normalized.unsqueeze(0),
+            int(args.density_probe_count),
         )
-        probe_mask = probe_mask_full[0, 0, 0]
         for hide_magnetic, b_key in ((False, "B_full"), (True, "B_hidden")):
             for step in slide_steps:
                 result = reconstruct_with_slide_step(
@@ -1554,6 +1574,67 @@ def compute_sliding_aggregate_rmse(
     return frame_index, medians, p16s, p84s, stacked_by, loaded, skipped
 
 
+def reconstruct_sliding_qualitative(
+    ctx: Dict,
+    args: argparse.Namespace,
+    slide_steps: Sequence[int],
+    n_frames: int = SLIDING_AGGREGATE_N_FRAMES,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[int, np.ndarray], Dict]:
+    """Canonical-run B-hidden reconstructions for the right-hand qualitative panel."""
+    betas = ctx["ckpt_args"].get("betas", [0.2])
+    fields, frame_ids, h5_path = find_and_load_run(
+        ctx["h5_dir"], betas, args.run_name
+    )
+    fields = np.asarray(fields)
+    frame_ids = np.asarray(frame_ids)
+    if fields.shape[0] < int(n_frames):
+        raise RuntimeError(
+            f"Qualitative run {args.run_name} has {fields.shape[0]} frames < "
+            f"{n_frames}; no padding."
+        )
+    fields = fields[: int(n_frames)]
+    frame_ids = frame_ids[: int(n_frames)]
+    print(
+        f"Sliding qualitative: {args.run_name} "
+        f"(first {n_frames} frames) from {h5_path}"
+    )
+    mean = ctx["mean"].reshape(4, 1, 1, 1)
+    std = ctx["std"].reshape(4, 1, 1, 1)
+    target = torch.from_numpy(np.transpose(fields, (1, 0, 2, 3))).to(
+        device=ctx["device"], dtype=torch.float32
+    )
+    target_normalized = (target - mean) / (std + 1e-8)
+    target_density_plot = target[3].detach().cpu().numpy()
+    probe_mask, probe_info = sliding_density_probe_mask(
+        target_normalized.unsqueeze(0),
+        int(args.density_probe_count),
+    )
+    predictions = {}
+    for step in slide_steps:
+        result = reconstruct_with_slide_step(
+            model=ctx["model"],
+            target_normalized=target_normalized,
+            target_density_plot=target_density_plot,
+            density_mean=mean[3],
+            density_std=std[3],
+            probe_mask=probe_mask,
+            window_size=int(ctx["delta_t"]),
+            slide_step=int(step),
+            plot_units="physical",
+            x_index=int(args.x_index),
+            amp=True,
+            hide_magnetic=True,
+        )
+        predictions[int(step)] = np.asarray(result["final_reconstruction"])
+    return (
+        np.asarray(frame_ids),
+        target_density_plot,
+        probe_mask.detach().cpu().numpy(),
+        predictions,
+        dict(probe_info),
+    )
+
+
 def build_sliding_appendix_cache(
     args: argparse.Namespace,
     run_dir: Path,
@@ -1561,32 +1642,9 @@ def build_sliding_appendix_cache(
     checkpoint_path: Path,
     checkpoint_epoch: int,
 ) -> Tuple[Dict, Dict]:
-    found = find_sliding_step_files(run_dir)
-    if found is None:
-        raise FileNotFoundError(
-            f"No B-hidden sliding arrays in {run_dir / SLIDING_DIR_NO_B}. "
-            "Run visualization.sh sliding analysis first, or place "
-            "*_final_reconstructions.npz and *_metrics.json there."
-        )
     if ctx is None:
         raise RuntimeError("Sliding multi-run RMSE needs inference context.")
-    npz_path, json_path = found
-    metrics = json.loads(json_path.read_text())
-    provenance_error = sliding_provenance_error(
-        metrics, checkpoint_path, checkpoint_epoch
-    )
-    if provenance_error is not None:
-        raise RuntimeError(f"Sliding provenance mismatch: {provenance_error}")
-    with np.load(npz_path) as handle:
-        target = np.asarray(handle["target_density"])
-        frame_ids = np.asarray(handle["frame_ids"])
-        probe_mask = np.asarray(handle["probe_mask"])
-        predictions = {
-            int(step): np.asarray(handle[f"prediction_step_{step}"])
-            for step in metrics["slide_steps"]
-        }
-    std_density = float(ctx["std"].detach().cpu().numpy().reshape(-1)[3])
-    slide_steps = [int(step) for step in metrics["slide_steps"]]
+    slide_steps = [int(step) for step in args.slide_steps]
     candidate_runs = validation_run_order(run_dir)
     if not candidate_runs:
         raise RuntimeError(f"No validation runs in {run_dir / 'split.json'}")
@@ -1609,6 +1667,21 @@ def build_sliding_appendix_cache(
         slide_steps,
         n_frames=SLIDING_AGGREGATE_N_FRAMES,
     )
+    representative_step = int(min(slide_steps))
+    (
+        frame_ids,
+        target,
+        probe_mask,
+        predictions,
+        probe_info,
+    ) = reconstruct_sliding_qualitative(
+        ctx, args, [representative_step], n_frames=SLIDING_AGGREGATE_N_FRAMES
+    )
+    std_density = float(ctx["std"].detach().cpu().numpy().reshape(-1)[3])
+    size_x = int(target.shape[-2])
+    size_z = int(target.shape[-1])
+    probe_count = int(args.density_probe_count)
+    visible_ratio = density_visible_ratio(probe_count, size_x, size_z)
     arrays = {
         "frame_ids": frame_ids.astype(np.int32),
         "aggregate_frame_ids": np.asarray(aggregate_frames, dtype=np.int32),
@@ -1629,6 +1702,7 @@ def build_sliding_appendix_cache(
             arrays[f"step_{step}_tz_residual"] = (
                 arrays[f"step_{step}_tz"] - arrays["target_tz"]
             ).astype(np.float32)
+    for step in slide_steps:
         for b_key in ("B_full", "B_hidden"):
             arrays[f"{b_key}_step_{step}_rmse_median"] = np.asarray(
                 medians[b_key][int(step)], dtype=np.float32
@@ -1642,42 +1716,44 @@ def build_sliding_appendix_cache(
             arrays[f"{b_key}_step_{step}_rmse_per_run"] = np.asarray(
                 stacked_by[b_key][int(step)], dtype=np.float32
             )
-    representative_step = int(min(metrics["slide_steps"]))
+    visible_ratio_percent = 100.0 * visible_ratio
     meta = {
         "figure": "sliding_window_appendix",
-        "source": {"npz": str(npz_path), "metrics": str(json_path)},
+        "source": "sliding reconstruction",
         "b_condition": "B fully hidden",
-        "slide_steps": list(metrics["slide_steps"]),
+        "slide_steps": list(slide_steps),
         "representative_step": representative_step,
         "x_index": int(args.x_index),
-        "run_name": metrics.get("run_name"),
-        "plot_units": metrics.get("plot_units"),
+        "run_name": args.run_name,
+        "plot_units": "physical",
         "left_panel": "multi_run_framewise_rmse",
         "right_panel": "single_run_qualitative",
-        "qualitative_run": metrics.get("run_name") or args.run_name,
+        "qualitative_run": args.run_name,
         "b_conditions": ["B_full", "B_hidden"],
         "aggregate_n_runs": len(loaded_runs),
         "aggregate_runs": loaded_runs,
         "aggregate_skipped_runs": skipped_runs,
         "statistical_unit": "run",
+        "frame_selection": f"first {SLIDING_AGGREGATE_N_FRAMES} frames",
         "frame_range": [0, SLIDING_AGGREGATE_N_FRAMES],
         "n_frames": SLIDING_AGGREGATE_N_FRAMES,
         "context_length": int(ctx["delta_t"]),
         "hide_magnetic": True,
-        "density_visible_fraction": float(args.density_visible_fraction),
-        "density_visible_fraction_actual": metrics.get("density_visible_fraction_actual"),
+        "density_probe_count": probe_count,
+        "density_visible_ratio": visible_ratio,
+        "density_visible_ratio_percent": visible_ratio_percent,
+        "probe_layout_semantics": "same as density_superres",
+        "probe_grid": probe_info,
+        "size_x": size_x,
+        "size_z": size_z,
         "aggregation": (
             f"{len(loaded_runs)} validation runs; one framewise RMSE series per run "
-            "from frames 0:52, B condition, and slide step; then median and "
-            "16th-84th percentiles across runs"
+            f"from the first {SLIDING_AGGREGATE_N_FRAMES} frames, B condition, "
+            "and slide step; then median and 16th-84th percentiles across runs"
         ),
-        "source_files": [str(npz_path), str(json_path)],
-        "source_checkpoint": str(metrics.get("checkpoint") or checkpoint_path),
-        "source_checkpoint_epoch": int(
-            metrics["checkpoint_epoch"]
-            if metrics.get("checkpoint_epoch") is not None
-            else checkpoint_epoch
-        ),
+        "source_files": [],
+        "source_checkpoint": str(checkpoint_path),
+        "source_checkpoint_epoch": int(checkpoint_epoch),
     }
     return arrays, meta
 
@@ -1753,8 +1829,23 @@ def plot_sliding_window_appendix(
     ax_err.add_artist(color_legend)
     ax_err.legend(handles=style_handles, frameon=False, fontsize=7, loc="upper right")
     n_runs = metadata.get("aggregate_n_runs")
-    title = f"{int(n_runs)} validation runs" if n_runs else "Validation runs"
-    ax_err.set_title(title, fontsize=10)
+    n_frames = metadata.get("n_frames")
+    probe_count = metadata.get("density_probe_count")
+    ratio_percent = metadata.get("density_visible_ratio_percent")
+    run_phrase = (
+        f"{int(n_runs)} validation runs, first {int(n_frames)} frames"
+        if n_runs and n_frames
+        else (f"{int(n_runs)} validation runs" if n_runs else "Validation runs")
+    )
+    if probe_count is not None and ratio_percent is not None:
+        title = (
+            f"{run_phrase}\n"
+            f"{int(probe_count)} fixed Density probes "
+            f"({format_visible_ratio_percent(float(ratio_percent))}% spatial visibility)"
+        )
+    else:
+        title = run_phrase
+    ax_err.set_title(title, fontsize=9)
 
     step = int(metadata["representative_step"])
     panels = [
@@ -1903,8 +1994,8 @@ def main() -> None:
             **sig_base,
             "figure": "sliding",
             "slide_steps": [int(step) for step in args.slide_steps],
-            "b_visible": 0.0,
-            "density_visible_fraction": float(args.density_visible_fraction),
+            "density_probe_count": int(args.density_probe_count),
+            "probe_layout_semantics": "same as density_superres",
             "x_index": int(args.x_index),
             "left_panel": "multi_run_framewise_rmse",
             "right_panel": "single_run_qualitative",
@@ -1916,23 +2007,11 @@ def main() -> None:
             ),
             "b_conditions": ["B_full", "B_hidden"],
             "min_run_frames": SLIDING_AGGREGATE_N_FRAMES,
+            "frame_selection": f"first {SLIDING_AGGREGATE_N_FRAMES} frames",
             "frame_range": [0, SLIDING_AGGREGATE_N_FRAMES],
             "val_run_order": validation_run_order(run_dir),
             "context_length": 24,
         }
-        found = find_sliding_step_files(run_dir)
-        if found is not None:
-            npz_path, json_path = found
-            signature["source_npz"] = {
-                "path": str(npz_path),
-                "mtime_ns": int(npz_path.stat().st_mtime_ns),
-                "size": int(npz_path.stat().st_size),
-            }
-            signature["source_metrics"] = {
-                "path": str(json_path),
-                "mtime_ns": int(json_path.stat().st_mtime_ns),
-                "size": int(json_path.stat().st_size),
-            }
         return signature
 
     if "spatial" in figures:

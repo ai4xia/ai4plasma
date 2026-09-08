@@ -11,11 +11,16 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from make_paper_figures import (  # noqa: E402
+    COMPATIBLE_PAPER_CACHE_VERSIONS,
     DEFAULT_MAGNETIC_ABLATION_VISIBLE_PERCENTS,
+    DEFAULT_SLIDING_DENSITY_PROBE_COUNT,
+    DEFAULT_SLIDE_STEPS,
     EXPECTED_FORECAST_ROW_NAMES,
     EXPECTED_MAGNETIC_ROW_NAMES,
     EXPECTED_SUPERRES_ROW_NAMES,
     FIGURE_STEMS,
+    PAPER_CACHE_VERSION,
+    SLIDING_AGGREGATE_N_FRAMES,
     SPATIAL_ROW_ORDER,
     _val_json_path,
     base_signature,
@@ -36,6 +41,7 @@ from make_paper_figures import (  # noqa: E402
     plot_sliding_window_appendix,
     plot_spatial_qualitative,
     select_sliding_aggregate_runs,
+    sliding_density_probe_mask,
     sliding_provenance_error,
     stack_rmse_by_global_frame,
     try_load_validation_json,
@@ -489,16 +495,22 @@ def test_select_sliding_aggregate_runs_uses_split_order():
     assert select_sliding_aggregate_runs(["b", "a", "c"], max_runs=2) == ["b", "a"]
 
 
-def test_sliding_first_52_frames_skips_short_and_drops_later_frames():
-    def first_52_or_skip(n_frames: int) -> tuple[int, int] | None:
-        if n_frames < 52:
+def test_sliding_first_48_frames_skips_short_and_drops_later_frames():
+    def first_48_or_skip(n_frames: int) -> tuple[int, int] | None:
+        if n_frames < SLIDING_AGGREGATE_N_FRAMES:
             return None
-        return (0, 52)
+        return (0, SLIDING_AGGREGATE_N_FRAMES)
 
-    assert first_52_or_skip(51) is None
-    assert first_52_or_skip(52) == (0, 52)
-    assert first_52_or_skip(104) == (0, 52)
-    assert first_52_or_skip(130) == (0, 52)
+    assert SLIDING_AGGREGATE_N_FRAMES == 48
+    assert first_48_or_skip(47) is None
+    assert first_48_or_skip(48) == (0, 48)
+    assert first_48_or_skip(52) == (0, 48)
+    assert first_48_or_skip(104) == (0, 48)
+    assert first_48_or_skip(130) == (0, 48)
+
+
+def test_sliding_default_steps_are_1_12_24():
+    assert tuple(DEFAULT_SLIDE_STEPS) == (1, 12, 24)
 
 
 def test_validation_run_order_preserves_split_json(tmp_path):
@@ -518,6 +530,32 @@ def test_stack_rmse_aligns_global_frames():
     assert stacked[1, 1] == 30.0
 
 
+def test_sliding_density_probes_match_superres_1000_count_grid():
+    import torch
+    from visualize_mask_patterns_unet3d import (  # noqa: E402
+        _density_probe_count_grid,
+        _density_probe_grid,
+    )
+
+    size_x, size_z = 154, 62
+    block = torch.zeros(1, 4, 3, size_x, size_z)
+    assert DEFAULT_SLIDING_DENSITY_PROBE_COUNT == 1000
+    mask, info = sliding_density_probe_mask(block, DEFAULT_SLIDING_DENSITY_PROBE_COUNT)
+    superres_mask, superres_info = _density_probe_count_grid(block, 1000)
+    assert int(mask.sum().item()) == 1000
+    assert torch.equal(mask, superres_mask[0, 0, 0])
+    assert info == superres_info == {"count_x": 50, "count_z": 20}
+    assert mask.shape == (size_x, size_z)
+    assert torch.equal(superres_mask[0, 0, 0], superres_mask[0, 0, 1])
+    ratio = density_visible_ratio(1000, size_x, size_z)
+    assert ratio == 1000 / (154 * 62)
+    assert abs(100.0 * ratio - 10.47) < 0.005
+    fraction_mask, _info = _density_probe_grid(
+        block, 0.08, torch.Generator().manual_seed(1234)
+    )
+    assert int(fraction_mask[0, 0, 0].sum().item()) != 1000
+
+
 def test_sliding_signature_change_invalidates_old_single_run_cache():
     old = {
         "cache_version": 2,
@@ -526,7 +564,24 @@ def test_sliding_signature_change_invalidates_old_single_run_cache():
     }
     new = {
         **old,
+        "cache_version": PAPER_CACHE_VERSION,
+        "left_panel": "multi_run_framewise_rmse",
+        "right_panel": "single_run_qualitative",
+        "statistical_unit": "run",
+        "sliding_max_runs": 16,
+        "b_conditions": ["B_full", "B_hidden"],
+        "frame_range": [0, 48],
+        "slide_steps": [1, 12, 24],
+    }
+    assert not paper_signatures_match(old, new)
+
+
+def test_sliding_probe_count_signature_invalidates_old_fraction_cache():
+    old = {
         "cache_version": 6,
+        "figure": "sliding",
+        "slide_steps": [8, 4, 2, 1],
+        "density_visible_fraction": 0.08,
         "left_panel": "multi_run_framewise_rmse",
         "right_panel": "single_run_qualitative",
         "statistical_unit": "run",
@@ -534,26 +589,41 @@ def test_sliding_signature_change_invalidates_old_single_run_cache():
         "b_conditions": ["B_full", "B_hidden"],
         "frame_range": [0, 52],
     }
+    new = {
+        **{key: value for key, value in old.items() if key != "density_visible_fraction"},
+        "cache_version": PAPER_CACHE_VERSION,
+        "density_probe_count": 1000,
+        "probe_layout_semantics": "same as density_superres",
+        "slide_steps": [1, 12, 24],
+        "frame_range": [0, 48],
+        "frame_selection": "first 48 frames",
+    }
     assert not paper_signatures_match(old, new)
 
 
 def test_compatible_cache_versions_reuse_unchanged_signatures():
+    assert PAPER_CACHE_VERSION == 8
+    assert 7 in COMPATIBLE_PAPER_CACHE_VERSIONS
+    for figure in ("spatial", "magnetic_ablation", "forecast", "superres"):
+        stored = {"cache_version": 7, "figure": figure, "payload": 1}
+        current = {"cache_version": 8, "figure": figure, "payload": 1}
+        assert paper_signatures_match(stored, current)
     stored = {"cache_version": 2, "figure": "forecast", "histories": [23]}
-    current = {"cache_version": 6, "figure": "forecast", "histories": [23]}
+    current = {"cache_version": 8, "figure": "forecast", "histories": [23]}
     assert paper_signatures_match(stored, current)
 
 
-def test_sliding_plot_uses_segment_rmse_and_both_b_conditions(tmp_path):
-    frames = np.arange(52)
+def test_sliding_plot_uses_framewise_rmse_and_both_b_conditions(tmp_path):
+    frames = np.arange(48)
     arrays = {
         "frame_ids": frames,
         "aggregate_frame_ids": frames,
-        "target_tz": np.zeros((52, 6), dtype=np.float32),
-        "step_1_tz": np.zeros((52, 6), dtype=np.float32),
-        "step_1_tz_residual": np.zeros((52, 6), dtype=np.float32),
+        "target_tz": np.zeros((48, 6), dtype=np.float32),
+        "step_1_tz": np.zeros((48, 6), dtype=np.float32),
+        "step_1_tz_residual": np.zeros((48, 6), dtype=np.float32),
     }
-    for step in (8, 4, 2, 1):
-        median = np.linspace(0.1, 0.2, 52)
+    for step in (1, 12, 24):
+        median = np.linspace(0.1, 0.2, 48)
         for b_key in ("B_full", "B_hidden"):
             arrays[f"{b_key}_step_{step}_rmse_median"] = median
             arrays[f"{b_key}_step_{step}_rmse_p16"] = median * 0.8
@@ -561,10 +631,13 @@ def test_sliding_plot_uses_segment_rmse_and_both_b_conditions(tmp_path):
     plot_sliding_window_appendix(
         arrays,
         {
-            "slide_steps": [8, 4, 2, 1],
+            "slide_steps": [1, 12, 24],
             "representative_step": 1,
             "aggregate_n_runs": 16,
-            "frame_range": [0, 52],
+            "n_frames": 48,
+            "density_probe_count": 1000,
+            "density_visible_ratio_percent": 100.0 * density_visible_ratio(1000, 154, 62),
+            "frame_range": [0, 48],
             "b_conditions": ["B_full", "B_hidden"],
             "statistical_unit": "run",
         },
