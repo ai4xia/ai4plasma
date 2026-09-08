@@ -174,6 +174,45 @@ def test_multifunction_masks_only_density():
     assert "Spatial block — inpainting" in inpaint_label
     assert "Spatial block — outpainting" in outpaint_label
 
+
+def test_multifunction_density_rows_are_approximately_half_masked():
+    block = torch.zeros(1, 4, 24, 154, 62)
+    rows = build_density_only_multifunction_rows(
+        block=block,
+        patterns=[
+            "spatial_random",
+            "spatial_grid",
+            "spatial_block",
+            "temporal_random",
+            "temporal_block",
+        ],
+        mask_fraction=0.8,
+        block_fraction=0.5,
+        grid_stride=4,
+        magnetic_grid_stride=2,
+        generator=make_generator(),
+    )
+
+    assert [name for name, _, _ in rows] == [
+        "spatial_random",
+        "spatial_grid",
+        "spatial_block_inpainting",
+        "spatial_block_outpainting",
+        "temporal_random",
+        "temporal_block",
+    ]
+    fractions = {}
+    for name, _, mask in rows:
+        assert torch.all(mask[:, :3] == 1)
+        fractions[name] = float(1.0 - mask[:, 3:4].mean().item())
+        assert abs(fractions[name] - 0.5) < 0.01, (name, fractions[name])
+
+    inpaint = next(mask for name, _, mask in rows if name == "spatial_block_inpainting")
+    outpaint = next(
+        mask for name, _, mask in rows if name == "spatial_block_outpainting"
+    )
+    assert torch.equal(outpaint[:, 3:4], 1.0 - inpaint[:, 3:4])
+
     temporal_random = next(
         mask for name, _, mask in rows if name == "temporal_random"
     )
@@ -183,7 +222,7 @@ def test_multifunction_masks_only_density():
     temporal_block = next(
         mask for name, _, mask in rows if name == "temporal_block"
     )
-    half = SHAPE[2] // 2
+    half = block.shape[2] // 2
     assert torch.all(temporal_block[:, 3:4, :half] == 1)
     assert torch.all(temporal_block[:, 3:4, half:] == 0)
 

@@ -22,7 +22,7 @@ import numpy as np
 import torch
 
 from data.vpic_hdf5_dataset import VPICWindowDataset
-from data.masking import MASK_PATTERNS, make_visible_input, sample_mask
+from data.masking import MASK_PATTERNS, make_fixed_validation_mask, make_visible_input, sample_mask
 from models.unet3d import LEGACY_MODEL_VERSION, UNet3D
 
 
@@ -324,9 +324,9 @@ def parse_args():
         type=float,
         default=0.8,
         help=(
-            "Target fraction of hidden voxels for the spatial_random and "
-            "temporal_random rows. Visible fraction is about 1 - this value. "
-            "spatial_grid and spatial_block use their own settings below."
+            "Target fraction of hidden voxels for custom spatial_random and "
+            "temporal_random rows. Multifunction uses standardized ~50% "
+            "Density masks instead of this value."
         ),
     )
     p.add_argument(
@@ -343,8 +343,9 @@ def parse_args():
         type=int,
         default=4,
         help=(
-            "Density stride for the spatial_grid row. The grid offset stays "
-            "random. Default: 4 (one Density observation per 4x4 cell)."
+            "Density stride for the custom spatial_grid row. Multifunction "
+            "uses a 50% checkerboard instead of this stride. The grid offset "
+            "stays random for custom. Default: 4."
         ),
     )
     p.add_argument(
@@ -982,24 +983,22 @@ def build_density_only_multifunction_rows(
     generator: torch.Generator,
     magnetic_visible: bool = True,
 ) -> List[Tuple[str, str, torch.Tensor]]:
-    """Apply every requested topology to Density, optionally hiding all B."""
-    sampled_rows = build_mask_patterns(
-        block=block,
-        patterns=patterns,
-        mask_fraction=mask_fraction,
-        block_fraction=block_fraction,
-        grid_stride=grid_stride,
-        magnetic_grid_stride=magnetic_grid_stride,
-        generator=generator,
-    )
+    """Apply every requested topology to Density, optionally hiding all B.
+
+    Density uses standardized ~50% geometries so the six rows compare mask
+    topology rather than observation severity. Magnetic channels stay fully
+    visible or fully hidden and are not copied from the Density layout.
+    """
     magnetic_phrase = _magnetic_visibility_phrase(magnetic_visible)
+    magnetic_fill = 1.0 if magnetic_visible else 0.0
     labels = {
         "spatial_random": (
-            f"Density spatial_random\n{magnetic_phrase}; Density random probes"
+            f"Density spatial_random\n{magnetic_phrase}; "
+            "Density 50% random spatial sites"
         ),
         "spatial_grid": (
-            f"Density spatial_grid\n{magnetic_phrase}; Density stride="
-            f"{grid_stride}x{grid_stride}"
+            f"Density spatial_grid\n{magnetic_phrase}; "
+            "Density 50% checkerboard"
         ),
         "temporal_random": (
             f"Density temporal_random\n{magnetic_phrase}; "
@@ -1012,29 +1011,34 @@ def build_density_only_multifunction_rows(
     }
 
     rows = []
-    magnetic_fill = 1.0 if magnetic_visible else 0.0
-    for name, old_label, mask in sampled_rows:
-        mask = mask.clone()
+    for name in patterns:
+        if name == "spatial_block":
+            sampled_rows = build_mask_patterns(
+                block=block,
+                patterns=["spatial_block"],
+                mask_fraction=mask_fraction,
+                block_fraction=block_fraction,
+                grid_stride=grid_stride,
+                magnetic_grid_stride=magnetic_grid_stride,
+                generator=generator,
+            )
+            for short_name, old_label, mask in sampled_rows:
+                mask = mask.clone()
+                mask[:, :3] = magnetic_fill
+                rows.append(
+                    (short_name, f"{old_label}\n{magnetic_phrase}", mask)
+                )
+            continue
+
+        val_mask, _ = make_fixed_validation_mask(
+            name,
+            block.shape,
+            device=block.device,
+            dtype=block.dtype,
+        )
+        mask = val_mask.clone()
         mask[:, :3] = magnetic_fill
-        if name in {
-            "spatial_block",
-            "spatial_block_inpainting",
-            "spatial_block_outpainting",
-        }:
-            label = f"{old_label}\n{magnetic_phrase}"
-        elif name == "temporal_random":
-            # Visualization-only: keep every other Density frame, starting visible.
-            mask[:, 3:4] = 0.0
-            mask[:, 3:4, 0::2] = 1.0
-            label = labels[name]
-        elif name == "temporal_block":
-            # Visualization-only: first half of the window visible, rest hidden.
-            mask[:, 3:4] = 1.0
-            mask[:, 3:4, block.shape[2] // 2 :] = 0.0
-            label = labels[name]
-        else:
-            label = labels[name]
-        rows.append((name, label, mask))
+        rows.append((name, labels[name], mask))
     return rows
 
 

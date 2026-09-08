@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from data.masking import (  # noqa: E402
     DEFAULT_PATTERN_WEIGHTS,
+    FIXED_VALIDATION_PATTERNS,
     MASKING_VERSION,
     MASK_PATTERNS,
     SPATIAL_MASK_PATTERNS,
@@ -757,11 +758,48 @@ def test_training_spatial_block_independent_b_and_density_orientations():
     )
 
 
+def _assert_identical_bd_channels(mask: torch.Tensor) -> None:
+    for channel in range(1, mask.shape[1]):
+        assert torch.equal(mask[:, 0], mask[:, channel])
+
+
+def test_fixed_validation_spatial_random_is_exact_half_and_shared():
+    mask, info = make_fixed_validation_mask("spatial_random", (2, 4, 24, 154, 62))
+    plane = mask[0, 0, 0]
+    n_visible = int(plane.sum().item())
+    n_masked = int((1.0 - plane).sum().item())
+    assert n_visible == 4774
+    assert n_masked == 4774
+    assert info["num_visible_sites"] == 4774
+    assert torch.equal(mask[:, :, 0], mask[:, :, -1])
+    _assert_identical_bd_channels(mask)
+    again, _ = make_fixed_validation_mask("spatial_random", (2, 4, 24, 154, 62))
+    assert torch.equal(mask, again)
+
+
+def test_fixed_validation_spatial_grid_is_checkerboard_half():
+    mask, info = make_fixed_validation_mask("spatial_grid", (2, 4, 24, 154, 62))
+    plane = mask[0, 0, 0]
+    x = torch.arange(154).view(154, 1)
+    z = torch.arange(62).view(1, 62)
+    expected = ((x + z) % 2 == 0).float()
+    assert torch.equal(plane, expected)
+    assert int(plane.sum().item()) == 4774
+    assert int((1.0 - plane).sum().item()) == 4774
+    assert info["validation_benchmark"] == "checkerboard_even_parity_visible"
+    assert torch.equal(mask[:, :, 0], mask[:, :, -1])
+    _assert_identical_bd_channels(mask)
+    again, _ = make_fixed_validation_mask("spatial_grid", (1, 4, 8, 154, 62))
+    assert torch.equal(again[0, 0, 0], expected)
+
+
 def test_fixed_validation_temporal_random_is_even_visible_odd_masked():
     mask, info = make_fixed_validation_mask("temporal_random", (2, 4, 24, 8, 6))
     frames = mask[0, 0, :, 0, 0]
     assert torch.all(frames[0::2] == 1)
     assert torch.all(frames[1::2] == 0)
+    assert int((frames == 1).sum()) == 12
+    assert int((frames == 0).sum()) == 12
     assert info["validation_benchmark"] == "alternating_even_visible"
     assert torch.equal(mask[0, 0], mask[0, 3])
     odd_t, info_odd = make_fixed_validation_mask("temporal_random", (1, 4, 5, 4, 4))
@@ -774,6 +812,8 @@ def test_fixed_validation_temporal_block_is_first_half_visible():
     frames = mask[0, 0, :, 0, 0]
     assert torch.all(frames[:12] == 1)
     assert torch.all(frames[12:] == 0)
+    assert int((frames == 1).sum()) == 12
+    assert int((frames == 0).sum()) == 12
     assert info["validation_benchmark"] == "first_half_visible"
     assert torch.equal(mask[0, 0], mask[0, 3])
 
@@ -784,19 +824,22 @@ def test_fixed_validation_spatial_block_hides_upper_x():
     x_mid = 154 // 2
     assert torch.all(plane[:x_mid] == 1)
     assert torch.all(plane[x_mid:] == 0)
+    assert int(plane[:x_mid].numel()) == int(plane[x_mid:].numel()) == 77 * 62
     assert info["validation_benchmark"] == "lower_x_visible_upper_x_masked"
-    assert torch.equal(mask[0, 0], mask[0, 1])
-    assert torch.equal(mask[0, 1], mask[0, 2])
-    assert torch.equal(mask[0, 2], mask[0, 3])
+    _assert_identical_bd_channels(mask)
     assert torch.equal(mask[:, :, 0], mask[:, :, -1])
 
 
 def test_fixed_validation_masks_are_deterministic():
     shape = (1, 4, 24, 154, 62)
-    for pattern in ("temporal_random", "temporal_block", "spatial_block"):
+    assert tuple(FIXED_VALIDATION_PATTERNS) == MASK_PATTERNS
+    for pattern in MASK_PATTERNS:
         a, _ = make_fixed_validation_mask(pattern, shape)
         b, _ = make_fixed_validation_mask(pattern, shape)
         assert torch.equal(a, b), pattern
+        _assert_identical_bd_channels(a)
+        visible = float(a.mean().item())
+        assert abs(visible - 0.5) < 1e-6, (pattern, visible)
 
 
 def test_training_and_probe_validation_samplers_are_unchanged():

@@ -43,11 +43,10 @@ TEMPORAL_MASK_PATTERNS: Tuple[str, ...] = (
     "temporal_block",
 )
 # Paper-style controlled validation only. Training samplers stay random.
-FIXED_VALIDATION_PATTERNS: Tuple[str, ...] = (
-    "spatial_block",
-    "temporal_random",
-    "temporal_block",
-)
+# All five patterns use a deterministic ~50% visible / ~50% masked layout
+# shared by Bx, By, Bz and Density.
+FIXED_VALIDATION_PATTERNS: Tuple[str, ...] = MASK_PATTERNS
+FIXED_VALIDATION_SPATIAL_RANDOM_SEED = 4321
 
 DEFAULT_PATTERN_WEIGHTS: Dict[str, float] = {
     "spatial_random": 1.0,
@@ -744,17 +743,40 @@ def sample_mask(
     return mask, info
 
 
+def _exact_half_spatial_random_plane(
+    size_x: int,
+    size_z: int,
+    generator: torch.Generator,
+) -> Tuple[torch.Tensor, int]:
+    """Select exactly floor(X*Z/2) distinct spatial sites, shared across time."""
+    spatial_sites = int(size_x) * int(size_z)
+    n_visible = spatial_sites // 2
+    indices = torch.randperm(spatial_sites, generator=generator)[:n_visible]
+    flat = torch.zeros(spatial_sites)
+    flat[indices] = 1.0
+    plane = flat.view(1, 1, 1, int(size_x), int(size_z))
+    return plane, n_visible
+
+
+def _checkerboard_spatial_plane(size_x: int, size_z: int) -> torch.Tensor:
+    """Visible where (x + z) is even; a regular 50% spatial lattice."""
+    x = torch.arange(int(size_x)).view(int(size_x), 1)
+    z = torch.arange(int(size_z)).view(1, int(size_z))
+    return ((x + z) % 2 == 0).float().view(1, 1, 1, int(size_x), int(size_z))
+
+
 def make_fixed_validation_mask(
     pattern: str,
     shape: Sequence[int],
     device: Optional[torch.device] = None,
     dtype: torch.dtype = torch.float32,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-    """Deterministic paper-style masks for controlled validation.
+    """Deterministic ~50% paper-style masks for controlled validation.
 
-    Training samplers are unchanged. These layouts are a new standardized
-    validation benchmark; old val/spatial_block, val/temporal_random and
-    val/temporal_block numbers are not directly comparable.
+    Training samplers are unchanged. All five patterns share one observation
+    layout across Bx, By, Bz and Density. These standardized metrics are not
+    directly comparable with earlier validation numbers that used different
+    mask severities or modality-specific layouts.
     """
     if pattern not in FIXED_VALIDATION_PATTERNS:
         raise ValueError(
@@ -765,7 +787,36 @@ def make_fixed_validation_mask(
         raise ValueError(f"Expected a (B, C, T, X, Z) shape, got {tuple(shape)}")
 
     B, C, T, X, Z = (int(s) for s in shape)
-    if pattern == "temporal_random":
+    if pattern == "spatial_random":
+        generator = torch.Generator()
+        generator.manual_seed(FIXED_VALIDATION_SPATIAL_RANDOM_SEED)
+        plane, n_visible = _exact_half_spatial_random_plane(X, Z, generator)
+        small = plane.expand(1, C, 1, X, Z)
+        info = {
+            "validation_benchmark": "exact_half_spatial_random",
+            "num_visible_sites": int(n_visible),
+            "num_masked_sites": int(X * Z - n_visible),
+        }
+    elif pattern == "spatial_grid":
+        plane = _checkerboard_spatial_plane(X, Z)
+        small = plane.expand(1, C, 1, X, Z)
+        info = {
+            "validation_benchmark": "checkerboard_even_parity_visible",
+            "rule": "(x + z) % 2 == 0",
+        }
+    elif pattern == "spatial_block":
+        # Lower x visible, upper x hidden. imshow origin=lower puts x=0 at
+        # the bottom of the panel, matching the paper spatial-extrapolation
+        # diagram. All four channels share this plane.
+        x_mid = X // 2
+        plane = torch.ones(1, 1, 1, X, Z)
+        plane[..., x_mid:, :] = 0.0
+        small = plane.expand(1, C, 1, X, Z)
+        info = {
+            "validation_benchmark": "lower_x_visible_upper_x_masked",
+            "x_mid": int(x_mid),
+        }
+    elif pattern == "temporal_random":
         # Even frames visible, odd frames hidden: V M V M ...
         tmask = torch.zeros(1, 1, T, 1, 1)
         tmask[0, 0, 0::2, 0, 0] = 1.0
@@ -786,17 +837,7 @@ def make_fixed_validation_mask(
             "end": int(T // 2),
         }
     else:
-        # Lower x visible, upper x hidden. imshow origin=lower puts x=0 at
-        # the bottom of the panel, matching the paper spatial-extrapolation
-        # diagram. All four channels share this plane.
-        x_mid = X // 2
-        plane = torch.ones(1, 1, 1, X, Z)
-        plane[..., x_mid:, :] = 0.0
-        small = plane.expand(1, C, 1, X, Z)
-        info = {
-            "validation_benchmark": "lower_x_visible_upper_x_masked",
-            "x_mid": int(x_mid),
-        }
+        raise ValueError(f"No fixed validation mask for {pattern!r}.")
 
     info["pattern"] = pattern
     info["actual_mask_fraction"] = float(1.0 - small.mean().item())
