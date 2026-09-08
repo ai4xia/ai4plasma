@@ -277,6 +277,33 @@ srun -n 1 -c 32 -G 1 --gpu-bind=none \
 
 `quicktime` 生成 Motion-JPEG 编码的 `.mov`，可直接用 macOS QuickTime 查看；视频格式不是 MP3。需要同时生成 `.mov` 和 GIF 时改为 `--animation-format both`。生成的 GIF 不写无限循环扩展，因此默认播放一轮后停在最后一帧。动画保存在 `--out-dir` 顶层，所有 PNG 统一放在 `--out-dir/images/<experiment>/`，便于直接找到视频。一条命令结束后再运行下一条，不要把两个完整的 `srun ... python ...` 无分隔地粘到同一行，否则第二个 `srun` 会被 argparse 当成第一个 Python 命令的参数。
 
+### 6.7 Paper figures
+
+`make_paper_figures.py` 从现有 validation JSON / sliding arrays（必要时才做 inference）写出论文主图，数据和 PNG/PDF 都放在独立目录 `<run-dir>/paper_figures_v1/`。cache signature 匹配时只 redraw，不重新跑模型。
+
+```bash
+python make_paper_figures.py \
+  --run-dir runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v15_orientedSpatialBlock_independentBD_logUniformCounts_attention_spatialpool_b8_e4500 \
+  --checkpoint latest.pt
+```
+
+同样的命令在 cache 已存在且 signature 匹配时只重绘。强制重新 inference / 聚合：
+
+```bash
+python make_paper_figures.py \
+  --run-dir runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v15_orientedSpatialBlock_independentBD_logUniformCounts_attention_spatialpool_b8_e4500 \
+  --checkpoint latest.pt \
+  --force-recompute
+```
+
+输出：
+
+```text
+<run-dir>/paper_figures_v1/
+```
+
+可用 `--figure spatial magnetic_ablation forecast superres sliding` 只画其中一部分；默认 `all`。
+
 ## 7. 整 run sliding Density reconstruction
 
 `visualize_sliding_density_reconstruction.py` 用完整磁场和固定 Density probe grid 重建一个完整 run。默认选择双 plasmoid 融合的 validation run：
@@ -480,6 +507,7 @@ W&B run：<https://wandb.ai/xiabin-georgia-institute-of-technology/ai4plasma/run
 | `visualization.ipynb` | 原始物理可视化及 Ay integration 参考 |
 | `visualize_mask_patterns_unet3d.py` | 四套单窗口 information/forecast experiments |
 | `visualize_sliding_density_reconstruction.py` | 长 run sliding、bidirectional 与 equal-call 分析 |
+| `make_paper_figures.py` | 论文主图 / appendix 静态图与独立 plotting cache |
 | `tests/` | 模型、mask、DDP 和 visualization/sliding 单元测试 |
 
 ## 11. 已知限制
