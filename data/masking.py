@@ -42,6 +42,12 @@ TEMPORAL_MASK_PATTERNS: Tuple[str, ...] = (
     "temporal_random",
     "temporal_block",
 )
+# Paper-style controlled validation only. Training samplers stay random.
+FIXED_VALIDATION_PATTERNS: Tuple[str, ...] = (
+    "spatial_block",
+    "temporal_random",
+    "temporal_block",
+)
 
 DEFAULT_PATTERN_WEIGHTS: Dict[str, float] = {
     "spatial_random": 1.0,
@@ -734,6 +740,66 @@ def sample_mask(
         1.0 - density_small.mean().item()
     )
 
+    mask = small.to(device=device, dtype=dtype).expand(B, C, T, X, Z).contiguous()
+    return mask, info
+
+
+def make_fixed_validation_mask(
+    pattern: str,
+    shape: Sequence[int],
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.float32,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """Deterministic paper-style masks for controlled validation.
+
+    Training samplers are unchanged. These layouts are a new standardized
+    validation benchmark; old val/spatial_block, val/temporal_random and
+    val/temporal_block numbers are not directly comparable.
+    """
+    if pattern not in FIXED_VALIDATION_PATTERNS:
+        raise ValueError(
+            f"No fixed validation mask for {pattern!r}. "
+            f"Available: {list(FIXED_VALIDATION_PATTERNS)}"
+        )
+    if len(shape) != 5:
+        raise ValueError(f"Expected a (B, C, T, X, Z) shape, got {tuple(shape)}")
+
+    B, C, T, X, Z = (int(s) for s in shape)
+    if pattern == "temporal_random":
+        # Even frames visible, odd frames hidden: V M V M ...
+        tmask = torch.zeros(1, 1, T, 1, 1)
+        tmask[0, 0, 0::2, 0, 0] = 1.0
+        small = tmask.expand(1, C, T, 1, 1)
+        info = {
+            "validation_benchmark": "alternating_even_visible",
+            "visible_frames": list(range(0, T, 2)),
+        }
+    elif pattern == "temporal_block":
+        # First half visible, second half hidden.
+        tmask = torch.ones(1, 1, T, 1, 1)
+        tmask[0, 0, T // 2 :, 0, 0] = 0.0
+        small = tmask.expand(1, C, T, 1, 1)
+        info = {
+            "validation_benchmark": "first_half_visible",
+            "num_visible_frames": int(T // 2),
+            "start": 0,
+            "end": int(T // 2),
+        }
+    else:
+        # Lower x visible, upper x hidden. imshow origin=lower puts x=0 at
+        # the bottom of the panel, matching the paper spatial-extrapolation
+        # diagram. All four channels share this plane.
+        x_mid = X // 2
+        plane = torch.ones(1, 1, 1, X, Z)
+        plane[..., x_mid:, :] = 0.0
+        small = plane.expand(1, C, 1, X, Z)
+        info = {
+            "validation_benchmark": "lower_x_visible_upper_x_masked",
+            "x_mid": int(x_mid),
+        }
+
+    info["pattern"] = pattern
+    info["actual_mask_fraction"] = float(1.0 - small.mean().item())
     mask = small.to(device=device, dtype=dtype).expand(B, C, T, X, Z).contiguous()
     return mask, info
 

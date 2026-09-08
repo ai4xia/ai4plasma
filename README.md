@@ -138,7 +138,7 @@ prediction = visible_normalized_fields + UNet_residual([visible_fields, masks])
 
 ### 4.2 五种 mask pattern
 
-每个 training sample 分别为磁场和 Density 独立选择一种 pattern；五种 pattern 默认等权。两种 modality 的 pattern、hidden severity 和具体 layout 均独立，只有 `Bx/By/Bz` 始终共享同一个 magnetic mask。`temporal_random` 只随机抽取 scattered visible frames；`temporal_block` 保持 oriented contiguous block（中间缺失或中间可见）。训练时这两种 temporal pattern 都先在 `[0, T]` 上均匀抽取可见帧数，再按各自几何放置；controlled validation 仍使用旧的两边界 `temporal_block` sampler。
+每个 training sample 分别为磁场和 Density 独立选择一种 pattern；五种 pattern 默认等权。两种 modality 的 pattern、hidden severity 和具体 layout 均独立，只有 `Bx/By/Bz` 始终共享同一个 magnetic mask。`temporal_random` 只随机抽取 scattered visible frames；`temporal_block` 保持 oriented contiguous block（中间缺失或中间可见）。训练时这两种 temporal pattern 都先在 `[0, T]` 上均匀抽取可见帧数，再按各自几何放置。controlled validation 对 `temporal_random`、`temporal_block`、`spatial_block` 使用固定 paper-style layout（见 4.3），与训练时的随机几何不同；旧的这三项 `val/*` 数值不可与新版本直接横比。
 
 | Pattern | 空间/时间含义 | 三个磁场 mask | Density 与磁场的关系 |
 |---|---|---|---|
@@ -148,9 +148,9 @@ prediction = visible_normalized_fields + UNet_residual([visible_fields, masks])
 | `temporal_random` | 随机选择 scattered 完整可见帧 | `Bx/By/Bz` 完全一致 | B/Density 独立选择可见帧和数量 |
 | `temporal_block` | oriented 连续时间块：中间缺失或中间可见 | `Bx/By/Bz` 完全一致 | B/Density 独立选择可见帧数、位置和 orientation |
 
-训练使用独立 B/Density sampler；controlled validation 和 visualization 保留旧 shared-pattern API，可以用同一 pattern 覆盖四个通道以维持标准 benchmark。
+训练使用独立 B/Density sampler；controlled validation 对 `spatial_random` / `spatial_grid` 仍走 shared-pattern probe sampler，对 `spatial_block` / `temporal_random` / `temporal_block` 使用下面的固定 benchmark。visualization 的 spatial-block 诊断图仍是居中矩形 inpainting/outpainting，与 validation 的半平面切分不是同一套几何。
 
-训练时两个 probe pattern 对 B 和 Density 都使用同一套三部分 mixture：以 `p_zero` 取 `N_visible=0`，以 `p_full` 取 `N_visible=X*Z`，其余在 `[1, X*Z-1]` 上 log-uniform 抽取准确可见点数。默认 Density 为 `p_zero=0.15`、`p_full=0.10`，磁场为 `p_zero=0.10`、`p_full=0.30`，两者独立可配。磁场三个通道仍共用一次 `randperm` 选址。`spatial_block` 继续按 `mask_fraction ~ Uniform(0,1)` 采样矩形面积，并随机位置和长宽比。`spatial_grid` 的 Density 近规则阵列具有随机 phase，不能整齐分解成矩形 grid 时会从稍大的近各向同性 lattice 随机去掉多余位置。可视化的 custom/multifunction grid 仍可使用显式固定 stride。controlled validation 仍使用旧的 Density 0–30 / 31–`X*Z` 两段均匀和磁场 50% full + 50% uniform count，以便历史 benchmark 可比。
+训练时两个 probe pattern 对 B 和 Density 都使用同一套三部分 mixture：以 `p_zero` 取 `N_visible=0`，以 `p_full` 取 `N_visible=X*Z`，其余在 `[1, X*Z-1]` 上 log-uniform 抽取准确可见点数。默认 Density 为 `p_zero=0.15`、`p_full=0.10`，磁场为 `p_zero=0.10`、`p_full=0.30`，两者独立可配。磁场三个通道仍共用一次 `randperm` 选址。`spatial_block` 继续按 `mask_fraction ~ Uniform(0,1)` 采样矩形面积，并随机位置和长宽比。`spatial_grid` 的 Density 近规则阵列具有随机 phase，不能整齐分解成矩形 grid 时会从稍大的近各向同性 lattice 随机去掉多余位置。可视化的 custom/multifunction grid 仍可使用显式固定 stride。`spatial_random` / `spatial_grid` 的 controlled validation 仍使用旧的 Density 0–30 / 31–`X*Z` 两段均匀和磁场 50% full + 50% uniform count。`spatial_block` / `temporal_random` / `temporal_block` 改为固定 layout（见 4.3），因此这三项旧 validation 分数不能与新 run 直接比较。
 
 ### 4.3 损失、优化和验证
 
@@ -175,7 +175,7 @@ loss = mean((prediction - target)^2)
 - batch size 4/GPU，global batch size 64；
 - PyTorch DDP/NCCL。
 
-validation 对四个 pattern 分别推理，并在每个 epoch 对相同 validation batch 使用确定性的 mask（seed 4321），使曲线变化主要来自模型而非重新随机出的验证 mask。DDP 验证 sampler 不补重复样本，确保每个 validation window 恰好统计一次。
+validation 对五个 pattern 分别推理。`spatial_random` / `spatial_grid` 仍对相同 validation batch 使用确定性 seed（4321）的 probe sampler。`temporal_random` 固定偶数帧可见、奇数帧 masked；`temporal_block` 固定前一半时间可见、后一半 masked；`spatial_block` 固定下半 `x` 可见、上半 `x` masked，四通道共用。这三项是新的 standardized paper benchmark，旧 `val/temporal_random`、`val/temporal_block`、`val/spatial_block` 不能与新版本直接横比。DDP 验证 sampler 不补重复样本，确保每个 validation window 恰好统计一次。
 
 `latest.pt` 每轮覆盖保存，`best.pt` 只在平均 validation MSE 改善时保存。checkpoint 包含模型、optimizer、epoch、best score、训练参数、normalization stats 和 W&B run ID。自动 resume 会检查关键参数与 masking version，避免在同一 run 中静默混用不兼容架构或 mask 语义。
 

@@ -18,6 +18,7 @@ from data.masking import (  # noqa: E402
     _spatial_block_plane,
     _temporal_block_from_boundaries,
     _temporal_block_from_visible_count,
+    make_fixed_validation_mask,
     parse_pattern_weights,
     sample_batch_masks,
     sample_endpoint_log_uniform_count,
@@ -754,6 +755,78 @@ def test_training_spatial_block_independent_b_and_density_orientations():
         },
         infos[0]["density_orientation"],
     )
+
+
+def test_fixed_validation_temporal_random_is_even_visible_odd_masked():
+    mask, info = make_fixed_validation_mask("temporal_random", (2, 4, 24, 8, 6))
+    frames = mask[0, 0, :, 0, 0]
+    assert torch.all(frames[0::2] == 1)
+    assert torch.all(frames[1::2] == 0)
+    assert info["validation_benchmark"] == "alternating_even_visible"
+    assert torch.equal(mask[0, 0], mask[0, 3])
+    odd_t, info_odd = make_fixed_validation_mask("temporal_random", (1, 4, 5, 4, 4))
+    odd_frames = odd_t[0, 0, :, 0, 0]
+    assert torch.equal(odd_frames, torch.tensor([1.0, 0.0, 1.0, 0.0, 1.0]))
+
+
+def test_fixed_validation_temporal_block_is_first_half_visible():
+    mask, info = make_fixed_validation_mask("temporal_block", (2, 4, 24, 8, 6))
+    frames = mask[0, 0, :, 0, 0]
+    assert torch.all(frames[:12] == 1)
+    assert torch.all(frames[12:] == 0)
+    assert info["validation_benchmark"] == "first_half_visible"
+    assert torch.equal(mask[0, 0], mask[0, 3])
+
+
+def test_fixed_validation_spatial_block_hides_upper_x():
+    mask, info = make_fixed_validation_mask("spatial_block", (2, 4, 3, 154, 62))
+    plane = mask[0, 0, 0]
+    x_mid = 154 // 2
+    assert torch.all(plane[:x_mid] == 1)
+    assert torch.all(plane[x_mid:] == 0)
+    assert info["validation_benchmark"] == "lower_x_visible_upper_x_masked"
+    assert torch.equal(mask[0, 0], mask[0, 1])
+    assert torch.equal(mask[0, 1], mask[0, 2])
+    assert torch.equal(mask[0, 2], mask[0, 3])
+    assert torch.equal(mask[:, :, 0], mask[:, :, -1])
+
+
+def test_fixed_validation_masks_are_deterministic():
+    shape = (1, 4, 24, 154, 62)
+    for pattern in ("temporal_random", "temporal_block", "spatial_block"):
+        a, _ = make_fixed_validation_mask(pattern, shape)
+        b, _ = make_fixed_validation_mask(pattern, shape)
+        assert torch.equal(a, b), pattern
+
+
+def test_training_and_probe_validation_samplers_are_unchanged():
+    assert MASKING_VERSION == (
+        "independentBD_fiveMask_logUniformCounts_orientedSpatialBlock_v9"
+    )
+    random_a, _ = sample_mask(
+        (1, 4, 8, 32, 16), "spatial_random", 0.5, generator=make_generator(3)
+    )
+    random_b, _ = sample_mask(
+        (1, 4, 8, 32, 16), "spatial_random", 0.5, generator=make_generator(4)
+    )
+    assert not torch.equal(random_a, random_b)
+
+    grid_a, info_a = sample_mask(
+        (1, 4, 8, 32, 16), "spatial_grid", 0.75, generator=make_generator(8)
+    )
+    grid_b, info_b = sample_mask(
+        (1, 4, 8, 32, 16), "spatial_grid", 0.75, generator=make_generator(8)
+    )
+    assert torch.equal(grid_a, grid_b)
+    assert info_a["stride"] == info_b["stride"]
+
+    origins = {
+        _spatial_block_plane(
+            1, 1, 32, 24, 0.4, make_generator(seed), orientation="random"
+        )[1]["orientation"]
+        for seed in range(30)
+    }
+    assert origins == {"inside_masked", "inside_visible"}
 
 
 if __name__ == "__main__":

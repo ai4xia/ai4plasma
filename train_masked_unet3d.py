@@ -33,6 +33,8 @@ from data.masking import (
     sample_independent_batch_masks,
     sample_patterns,
     sample_training_severity_counts,
+    FIXED_VALIDATION_PATTERNS,
+    make_fixed_validation_mask,
 )
 from models.unet3d import MODEL_VERSION, UNet3D
 
@@ -1000,8 +1002,9 @@ def validate(
     """
     Evaluate every mask pattern on the same validation blocks.
 
-    The loader is iterated once and each block is reused for all patterns, so
-    the extra cost is forward passes rather than repeated HDF5 reads.
+    spatial_block, temporal_random and temporal_block use fixed paper-style
+    layouts. Probe patterns still use the seeded shared-pattern sampler.
+    The loader is iterated once and each block is reused for all patterns.
     """
     model.eval()
 
@@ -1018,52 +1021,60 @@ def validate(
         batch_size = y.shape[0]
 
         for i, pattern in enumerate(patterns):
-            generator = torch.Generator()
-            generator.manual_seed(val_mask_seed(mask_seed, pattern, batch_index))
+            if pattern in FIXED_VALIDATION_PATTERNS:
+                mask, _ = make_fixed_validation_mask(
+                    pattern,
+                    y.shape,
+                    device=device,
+                    dtype=y.dtype,
+                )
+            else:
+                generator = torch.Generator()
+                generator.manual_seed(val_mask_seed(mask_seed, pattern, batch_index))
 
-            fractions = torch.rand(batch_size, generator=generator).tolist()
-            spatial_sites = int(y.shape[-2] * y.shape[-1])
-            density_probe_counts = sample_mixed_density_probe_counts(
-                [pattern] * batch_size,
-                minimum=density_probe_min,
-                maximum=density_probe_max,
-                spatial_sites=spatial_sites,
-                generator=generator,
-            )
-            magnetic_visible_counts = sample_mixed_magnetic_visible_counts(
-                [pattern] * batch_size,
-                spatial_sites=spatial_sites,
-                generator=generator,
-            )
-            for sample_index, (probe_count, magnetic_count) in enumerate(
-                zip(density_probe_counts, magnetic_visible_counts)
-            ):
-                if probe_count is not None:
-                    if magnetic_count is None:
-                        raise RuntimeError(
-                            "Probe-pattern validation sample is missing its "
-                            "magnetic visible count."
+                fractions = torch.rand(batch_size, generator=generator).tolist()
+                spatial_sites = int(y.shape[-2] * y.shape[-1])
+                density_probe_counts = sample_mixed_density_probe_counts(
+                    [pattern] * batch_size,
+                    minimum=density_probe_min,
+                    maximum=density_probe_max,
+                    spatial_sites=spatial_sites,
+                    generator=generator,
+                )
+                magnetic_visible_counts = sample_mixed_magnetic_visible_counts(
+                    [pattern] * batch_size,
+                    spatial_sites=spatial_sites,
+                    generator=generator,
+                )
+                for sample_index, (probe_count, magnetic_count) in enumerate(
+                    zip(density_probe_counts, magnetic_visible_counts)
+                ):
+                    if probe_count is not None:
+                        if magnetic_count is None:
+                            raise RuntimeError(
+                                "Probe-pattern validation sample is missing its "
+                                "magnetic visible count."
+                            )
+                        if probe_count > spatial_sites:
+                            raise ValueError(
+                                f"Density probe count {probe_count} exceeds the "
+                                f"{spatial_sites} spatial sites."
+                            )
+                        visible_values = 3 * magnetic_count + probe_count
+                        fractions[sample_index] = 1.0 - (
+                            visible_values / (4.0 * spatial_sites)
                         )
-                    if probe_count > spatial_sites:
-                        raise ValueError(
-                            f"Density probe count {probe_count} exceeds the "
-                            f"{spatial_sites} spatial sites."
-                        )
-                    visible_values = 3 * magnetic_count + probe_count
-                    fractions[sample_index] = 1.0 - (
-                        visible_values / (4.0 * spatial_sites)
-                    )
 
-            mask, _ = sample_batch_masks(
-                y.shape,
-                patterns=[pattern] * batch_size,
-                mask_fractions=fractions,
-                device=device,
-                dtype=y.dtype,
-                generator=generator,
-                density_probe_counts=density_probe_counts,
-                magnetic_visible_counts=magnetic_visible_counts,
-            )
+                mask, _ = sample_batch_masks(
+                    y.shape,
+                    patterns=[pattern] * batch_size,
+                    mask_fractions=fractions,
+                    device=device,
+                    dtype=y.dtype,
+                    generator=generator,
+                    density_probe_counts=density_probe_counts,
+                    magnetic_visible_counts=magnetic_visible_counts,
+                )
 
             model_input = torch.cat([make_visible_input(y, mask), mask], dim=1)
 
@@ -1199,7 +1210,10 @@ def main():
         f"B p_zero={args.magnetic_visible_p_zero:g}, "
         f"p_full={args.magnetic_visible_p_full:g}). "
         "spatial_block keeps Uniform(0, 1) area; temporal patterns draw a "
-        "uniform visible-frame count in [0, T]. Validation still uses the "
+        "uniform visible-frame count in [0, T]. Controlled validation uses "
+        "fixed paper-style layouts for spatial_block (lower-x visible), "
+        "temporal_random (even frames visible) and temporal_block (first "
+        "half visible). Probe-pattern validation still uses the "
         f"legacy Density 50/50 mixture of [{args.density_probe_min}, "
         f"{args.density_probe_max}] and "
         f"[{args.density_probe_max + 1}, X*Z] plus the legacy 50/50 full/"

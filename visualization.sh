@@ -15,8 +15,8 @@ readonly INFO_OUT_NO_B="${RUN_DIR}/figures_information_suite_plasmoid_merger_no_
 readonly SLIDING_OUT="${RUN_DIR}/figures_sliding_density_reconstruction_plasmoid_merger"
 readonly SLIDING_OUT_NO_B="${RUN_DIR}/figures_sliding_density_reconstruction_plasmoid_merger_no_magnetic"
 
-if [[ ! -f "${RUN_DIR}/best.pt" ]]; then
-    echo "ERROR: checkpoint not found: ${RUN_DIR}/best.pt" >&2
+if [[ ! -f "${RUN_DIR}/latest.pt" ]]; then
+    echo "ERROR: checkpoint not found: ${RUN_DIR}/latest.pt" >&2
     exit 1
 fi
 
@@ -28,6 +28,7 @@ echo
 echo "[1/4] Rendering all 24-frame information-suite experiments"
 python visualize_mask_patterns_unet3d.py \
     --run-dir "$RUN_DIR" \
+    --checkpoint latest.pt \
     --run-name "$RUN_NAME" \
     --t0 "$WINDOW_T0" \
     --experiment all \
@@ -40,6 +41,7 @@ echo
 echo "[2/4] Rendering information-suite experiments with B fully hidden"
 python visualize_mask_patterns_unet3d.py \
     --run-dir "$RUN_DIR" \
+    --checkpoint latest.pt \
     --run-name "$RUN_NAME" \
     --t0 "$WINDOW_T0" \
     --experiment all \
@@ -53,6 +55,7 @@ echo
 echo "[3/4] Rendering full-run sliding and bidirectional reconstruction"
 python visualize_sliding_density_reconstruction.py \
     --run-dir "$RUN_DIR" \
+    --checkpoint latest.pt \
     --run-name "$RUN_NAME" \
     --analysis both \
     --slide-steps 8 4 2 1 \
@@ -69,6 +72,7 @@ echo
 echo "[4/4] Rendering sliding reconstruction with B fully hidden"
 python visualize_sliding_density_reconstruction.py \
     --run-dir "$RUN_DIR" \
+    --checkpoint latest.pt \
     --run-name "$RUN_NAME" \
     --analysis both \
     --slide-steps 8 4 2 1 \
