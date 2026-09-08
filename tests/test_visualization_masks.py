@@ -30,15 +30,18 @@ from visualize_mask_patterns_unet3d import (  # noqa: E402
     format_magnetic_visible_percent,
     magnetic_ablation_visible_count,
     compute_normalized_metrics,
+    information_suite_plot_cache_signature,
     jy_nrmse_from_residual,
     jy_stats_cache_matches,
     normalize_field_np,
     normalized_residual,
     save_information_suite_error_plot,
+    save_plot_cache,
     save_validation_statistics_plot,
     summarize_jy_values,
     select_validation_statistics_indices,
     select_run_t0_index,
+    try_reuse_plot_cache,
     validation_statistics_legend_label,
     write_animation,
 )
@@ -665,3 +668,64 @@ def test_training_and_validation_spatial_block_are_not_the_viz_rectangle():
         for seed in range(40)
     }
     assert orientations == {"inside_masked", "inside_visible"}
+
+
+def _information_suite_cache_args(run_dir: Path, **overrides) -> SimpleNamespace:
+    checkpoint = run_dir / "latest.pt"
+    if not checkpoint.exists():
+        checkpoint.write_bytes(b"ckpt")
+    fields = {
+        "checkpoint": "latest.pt",
+        "run_name": "beta0.2_nu2_Bz0_dt2_tau70",
+        "t0": 28,
+        "sample_index": None,
+        "seed": 1234,
+        "mask_fraction": 0.8,
+        "block_fraction": 0.5,
+        "grid_stride": 4,
+        "magnetic_grid_stride": 2,
+        "mask_patterns": ["spatial_random"],
+        "experiment": "all",
+        "hide_magnetic": False,
+        "density_probe_counts": [0, 10, 100, 1000],
+        "magnetic_visible_fractions": [1.0, 0.0],
+        "density_forecast_visible_frames": None,
+        "skip_validation_statistics": False,
+        "statistics_window_stride": None,
+        "statistics_max_windows_per_run": None,
+        "plot_units": "physical",
+        "extent": [-21.0, 21.0, -50.0, 50.0],
+        "h5_dir": None,
+    }
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def test_information_suite_plot_cache_signature_tracks_inference_settings(tmp_path):
+    args = _information_suite_cache_args(tmp_path)
+    signature = information_suite_plot_cache_signature(args, tmp_path)
+    again = information_suite_plot_cache_signature(
+        _information_suite_cache_args(tmp_path), tmp_path
+    )
+    assert signature == again
+    hidden = information_suite_plot_cache_signature(
+        _information_suite_cache_args(tmp_path, hide_magnetic=True),
+        tmp_path,
+    )
+    assert hidden != signature
+
+
+def test_plot_cache_roundtrip_and_signature_mismatch(tmp_path):
+    args = _information_suite_cache_args(tmp_path)
+    signature = information_suite_plot_cache_signature(args, tmp_path)
+    cache_path = tmp_path / "plot_cache.pkl"
+    save_plot_cache(cache_path, {"signature": signature, "delta_t": 24})
+
+    reused = try_reuse_plot_cache(cache_path, signature, enabled=True)
+    assert reused is not None
+    assert reused["delta_t"] == 24
+    assert try_reuse_plot_cache(cache_path, signature, enabled=False) is None
+    mismatched = dict(signature)
+    mismatched["t0"] = 0
+    assert try_reuse_plot_cache(cache_path, mismatched, enabled=True) is None
+

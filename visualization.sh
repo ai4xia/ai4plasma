@@ -24,6 +24,23 @@ ml load pytorch
 
 mkdir -p "$INFO_OUT" "$INFO_OUT_NO_B" "$SLIDING_OUT" "$SLIDING_OUT_NO_B"
 
+# Reuse out-dir/plot_cache.pkl when present so figure tweaks skip model inference.
+# Force a fresh compute with: FORCE_RECOMPUTE=1 ./visualization.sh
+reuse_plot_data_args() {
+    local out_dir="$1"
+    local cache="${out_dir}/plot_cache.pkl"
+    if [[ -n "${FORCE_RECOMPUTE:-}" ]]; then
+        echo "FORCE_RECOMPUTE is set; running model inference for ${out_dir}" >&2
+        return 0
+    fi
+    if [[ -f "$cache" ]]; then
+        echo "Found plot cache ${cache}; skipping model inference if args match" >&2
+        echo --reuse-plot-data
+        return 0
+    fi
+    echo "No plot cache at ${cache}; running model inference" >&2
+}
+
 echo
 echo "[1/4] Rendering all 24-frame information-suite experiments"
 python visualize_mask_patterns_unet3d.py \
@@ -35,7 +52,8 @@ python visualize_mask_patterns_unet3d.py \
     --all-times \
     --animation-format gif \
     --fps 2 \
-    --out-dir "$INFO_OUT"
+    --out-dir "$INFO_OUT" \
+    $(reuse_plot_data_args "$INFO_OUT")
 
 echo
 echo "[2/4] Rendering information-suite experiments with B fully hidden"
@@ -49,7 +67,8 @@ python visualize_mask_patterns_unet3d.py \
     --all-times \
     --animation-format gif \
     --fps 2 \
-    --out-dir "$INFO_OUT_NO_B"
+    --out-dir "$INFO_OUT_NO_B" \
+    $(reuse_plot_data_args "$INFO_OUT_NO_B")
 
 echo
 echo "[3/4] Rendering full-run sliding and bidirectional reconstruction"
@@ -66,7 +85,8 @@ python visualize_sliding_density_reconstruction.py \
     --x-index "$PLASMOID_X_INDEX" \
     --animation-format gif \
     --fps 4 \
-    --out-dir "$SLIDING_OUT"
+    --out-dir "$SLIDING_OUT" \
+    $(reuse_plot_data_args "$SLIDING_OUT")
 
 echo
 echo "[4/4] Rendering sliding reconstruction with B fully hidden"
@@ -84,7 +104,8 @@ python visualize_sliding_density_reconstruction.py \
     --x-index "$PLASMOID_X_INDEX" \
     --animation-format gif \
     --fps 4 \
-    --out-dir "$SLIDING_OUT_NO_B"
+    --out-dir "$SLIDING_OUT_NO_B" \
+    $(reuse_plot_data_args "$SLIDING_OUT_NO_B")
 
 echo
 echo "Visualization complete."

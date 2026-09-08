@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pickle
 import shutil
 from pathlib import Path
 from typing import Callable, Dict, List, Sequence, Tuple
@@ -37,6 +38,8 @@ DEFAULT_RUN_DIR = (
     "orientedSpatialBlock_independentBD_logUniformCounts_"
     "attention_spatialpool_b8_e4500"
 )
+PLOT_CACHE_FILENAME = "plot_cache.pkl"
+PLOT_CACHE_VERSION = 1
 
 
 def framewise_rmse_mae(prediction: np.ndarray, target: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -77,6 +80,92 @@ def save_framewise_error_plot(
     fig.savefig(out_path, dpi=180)
     plt.close(fig)
     print(f"Saved framewise error plot: {out_path}")
+    return payload
+
+
+def resolve_checkpoint_path(run_dir: Path, checkpoint: str) -> Path:
+    path = Path(checkpoint)
+    if not path.is_absolute():
+        path = run_dir / path
+    return path.expanduser().resolve()
+
+
+def checkpoint_cache_signature(checkpoint_path: Path) -> Dict:
+    stat = checkpoint_path.stat()
+    return {
+        "path": str(checkpoint_path),
+        "mtime_ns": int(stat.st_mtime_ns),
+        "size": int(stat.st_size),
+    }
+
+
+def sliding_plot_cache_signature(
+    args: argparse.Namespace,
+    run_dir: Path,
+) -> Dict:
+    """Identity of the arrays needed to redraw, excluding figure-style options."""
+    return {
+        "version": PLOT_CACHE_VERSION,
+        "kind": "sliding_density_reconstruction",
+        "checkpoint": checkpoint_cache_signature(
+            resolve_checkpoint_path(run_dir, args.checkpoint)
+        ),
+        "run_name": args.run_name,
+        "allow_non_validation_run": bool(args.allow_non_validation_run),
+        "slide_steps": [int(step) for step in args.slide_steps],
+        "analysis": args.analysis,
+        "refinement_step": int(args.refinement_step),
+        "refinement_passes": int(args.refinement_passes),
+        "refinement_offset": int(args.refinement_offset),
+        "density_visible_fraction": float(args.density_visible_fraction),
+        "hide_magnetic": bool(args.hide_magnetic),
+        "seed": int(args.seed),
+        "x_index": args.x_index,
+        "plot_units": args.plot_units,
+        "extent": [float(value) for value in args.extent],
+        "h5_dir": args.h5_dir,
+    }
+
+
+def plottable_slide_result(result: Dict) -> Dict:
+    ignored = {"raw_state_normalized", "conditioning_state_normalized"}
+    return {key: value for key, value in result.items() if key not in ignored}
+
+
+def load_plot_cache(path: Path) -> Dict | None:
+    try:
+        with path.open("rb") as handle:
+            return pickle.load(handle)
+    except Exception as exc:
+        print(f"Could not load plot cache {path}: {exc}")
+        return None
+
+
+def save_plot_cache(path: Path, payload: Dict) -> None:
+    tmp_path = path.with_name(path.name + ".tmp")
+    with tmp_path.open("wb") as handle:
+        pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp_path.replace(path)
+    print(f"Saved plot cache: {path}")
+
+
+def try_reuse_plot_cache(
+    path: Path,
+    signature: Dict,
+    enabled: bool,
+) -> Dict | None:
+    if not enabled:
+        return None
+    if not path.exists():
+        print(f"No plot cache at {path}; running model inference")
+        return None
+    payload = load_plot_cache(path)
+    if payload is None:
+        return None
+    if payload.get("signature") != signature:
+        print(f"Plot cache at {path} does not match this command; recomputing")
+        return None
+    print(f"Reusing plot cache: {path}")
     return payload
 
 
@@ -221,6 +310,14 @@ def parse_args() -> argparse.Namespace:
         metavar=("ZMIN", "ZMAX", "XMIN", "XMAX"),
     )
     parser.add_argument("--out-dir", default=None)
+    parser.add_argument(
+        "--reuse-plot-data",
+        action="store_true",
+        help=(
+            "If out-dir/plot_cache.pkl exists and matches this command's "
+            "inference settings, skip reconstruction and only redraw figures."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1955,9 +2052,7 @@ def main() -> None:
     if args.residual_vmax is not None and args.residual_vmax <= 0:
         raise ValueError("--residual-vmax must be positive.")
     run_dir = expand_path(args.run_dir)
-    checkpoint_path = Path(args.checkpoint)
-    if not checkpoint_path.is_absolute():
-        checkpoint_path = run_dir / checkpoint_path
+    checkpoint_path = resolve_checkpoint_path(run_dir, args.checkpoint)
     out_dir = (
         expand_path(args.out_dir)
         if args.out_dir is not None
@@ -1965,32 +2060,6 @@ def main() -> None:
     )
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device(
-        args.device if args.device == "cuda" and torch.cuda.is_available() else "cpu"
-    )
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    checkpoint_args = checkpoint["args"]
-    stats = checkpoint["stats"]
-    window_size = int(checkpoint_args.get("delta_t", 24))
-    base_channels = int(checkpoint_args.get("base_channels", 16))
-    channel_mults = checkpoint_args.get("channel_mults", [1, 2, 4])
-    h5_dir = expand_path(args.h5_dir or checkpoint_args["h5_dir"])
-    betas = checkpoint_args.get("betas", [parse_run_name(args.run_name)["beta"]])
-
-    validate_test_run(
-        run_dir=run_dir,
-        run_name=args.run_name,
-        allow_non_validation=args.allow_non_validation_run,
-    )
-    fields_time_first, frame_ids, h5_path = find_and_load_run(
-        h5_dir=h5_dir,
-        betas=betas,
-        run_name=args.run_name,
-    )
-    if fields_time_first.shape[0] < window_size:
-        raise ValueError(
-            f"Run T={fields_time_first.shape[0]} is shorter than model T={window_size}."
-        )
     if not (0.0 < args.density_visible_fraction <= 1.0):
         raise ValueError("--density-visible-fraction must lie in (0, 1].")
     slide_steps = [int(step) for step in args.slide_steps]
@@ -2000,103 +2069,225 @@ def main() -> None:
         raise ValueError(f"--fps must be positive, got {args.fps}.")
     if args.dpi <= 0 or args.animation_dpi <= 0:
         raise ValueError("--dpi and --animation-dpi must both be positive.")
-    target = torch.from_numpy(
-        np.transpose(fields_time_first, (1, 0, 2, 3))
-    ).to(device=device, dtype=torch.float32)
-    mean = torch.tensor(stats["mean"], device=device).view(4, 1, 1, 1)
-    std = torch.tensor(stats["std"], device=device).view(4, 1, 1, 1)
-    target_normalized = (target - mean) / (std + 1e-8)
-    if args.plot_units == "normalized":
-        target_density_plot = target_normalized[3].detach().cpu().numpy()
-    else:
-        target_density_plot = target[3].detach().cpu().numpy()
-
-    generator = torch.Generator().manual_seed(args.seed)
-    probe_mask_full, probe_info = _density_probe_grid(
-        block=target_normalized.unsqueeze(0),
-        target_visible_fraction=args.density_visible_fraction,
-        generator=generator,
-    )
-    probe_mask = probe_mask_full[0, 0, 0]
-    probe_actual_fraction = float(probe_info["actual_visible_fraction"])
-
-    model = UNet3D(
-        in_channels=8,
-        out_channels=4,
-        base_channels=base_channels,
-        channel_mults=channel_mults,
-        architecture=checkpoint_args.get("model_version", LEGACY_MODEL_VERSION),
-        use_attention=bool(checkpoint_args.get("use_attention", False)),
-        spatial_only_pooling=bool(
-            checkpoint_args.get("spatial_only_pooling", False)
-        ),
-    ).to(device)
-    model.load_state_dict(checkpoint["model"])
-    model.eval()
-
-    if args.x_index is None:
-        projection_label = "x-averaged Density(time,z)"
-    else:
-        if not (0 <= args.x_index < target.shape[2]):
-            raise ValueError(
-                f"--x-index must be in [0, {target.shape[2] - 1}], got {args.x_index}."
-            )
-        projection_label = f"Density(time,z) at x index {args.x_index}"
-    target_projection = project_time_z(
-        target_density_plot,
-        x_index=args.x_index,
-    )
-
-    print("Checkpoint:", checkpoint_path)
-    print("Checkpoint epoch:", checkpoint.get("epoch"))
-    print("Device:", device)
-    print("HDF5:", h5_path)
-    print("Run:", args.run_name)
-    print("Run field shape (T,C,X,Z):", fields_time_first.shape)
-    print("Model window size:", window_size)
-    print("Slide steps:", slide_steps)
-    print("Probe target fraction:", args.density_visible_fraction)
-    print("Probe actual fraction:", probe_actual_fraction)
-    print("Hide magnetic:", args.hide_magnetic)
-    print("Probe grid:", probe_info)
-    print("Projection:", projection_label)
-    print("Probe values are clamped only for recursive conditioning.")
-    print("Figures and metrics retain raw model predictions at probe positions.")
-    print("Normalized residuals use checkpoint preprocessing mean/std.")
-
     render_slide_steps = args.analysis in {"both", "slide_steps"}
     render_bidirectional = args.analysis in {"both", "bidirectional"}
-    steps_to_compute = []
-    if render_slide_steps:
-        steps_to_compute.extend(slide_steps)
-    if render_bidirectional:
-        steps_to_compute.extend([args.refinement_step, window_size])
-    steps_to_compute = list(dict.fromkeys(steps_to_compute))
 
+    cache_path = out_dir / PLOT_CACHE_FILENAME
+    cache_signature = sliding_plot_cache_signature(args, run_dir)
+    cached = try_reuse_plot_cache(
+        cache_path, cache_signature, args.reuse_plot_data
+    )
+
+    bidirectional_rows = None
     results_by_step = {}
-    for slide_step in steps_to_compute:
-        print(f"Reconstructing slide step={slide_step}")
-        result = reconstruct_with_slide_step(
-            model=model,
-            target_normalized=target_normalized,
-            target_density_plot=target_density_plot,
-            density_mean=mean[3],
-            density_std=std[3],
-            probe_mask=probe_mask,
-            window_size=window_size,
-            slide_step=slide_step,
-            plot_units=args.plot_units,
-            x_index=args.x_index,
-            amp=True,
-            retain_state=(
-                render_bidirectional
-                and slide_step in {args.refinement_step, window_size}
-            ),
-            hide_magnetic=args.hide_magnetic,
+    if cached is not None:
+        window_size = int(cached["window_size"])
+        target_density_plot = cached["target_density_plot"]
+        target_projection = cached["target_projection"]
+        probe_mask = torch.from_numpy(np.asarray(cached["probe_mask"]))
+        frame_ids = cached["frame_ids"]
+        probe_info = cached["probe_info"]
+        probe_actual_fraction = float(cached["probe_actual_fraction"])
+        projection_label = cached["projection_label"]
+        checkpoint_epoch = cached.get("checkpoint_epoch")
+        h5_path = Path(cached["h5_path"])
+        results_by_step = {
+            int(step): result
+            for step, result in cached["results_by_step"].items()
+        }
+        bidirectional_rows = cached.get("bidirectional_rows")
+        print("Redrawing figures from cached arrays")
+        print("Checkpoint:", checkpoint_path)
+        print("Checkpoint epoch:", checkpoint_epoch)
+        print("HDF5:", h5_path)
+        print("Run:", args.run_name)
+        print("Model window size:", window_size)
+        print("Slide steps:", slide_steps)
+        print("Hide magnetic:", args.hide_magnetic)
+        print("Projection:", projection_label)
+    else:
+        device = torch.device(
+            args.device if args.device == "cuda" and torch.cuda.is_available() else "cpu"
         )
-        print("  starts:", result["window_starts"])
-        print("  metrics:", result["metrics"])
-        results_by_step[slide_step] = result
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        checkpoint_args = checkpoint["args"]
+        checkpoint_epoch = checkpoint.get("epoch")
+        stats = checkpoint["stats"]
+        window_size = int(checkpoint_args.get("delta_t", 24))
+        base_channels = int(checkpoint_args.get("base_channels", 16))
+        channel_mults = checkpoint_args.get("channel_mults", [1, 2, 4])
+        h5_dir = expand_path(args.h5_dir or checkpoint_args["h5_dir"])
+        betas = checkpoint_args.get("betas", [parse_run_name(args.run_name)["beta"]])
+
+        validate_test_run(
+            run_dir=run_dir,
+            run_name=args.run_name,
+            allow_non_validation=args.allow_non_validation_run,
+        )
+        fields_time_first, frame_ids, h5_path = find_and_load_run(
+            h5_dir=h5_dir,
+            betas=betas,
+            run_name=args.run_name,
+        )
+        if fields_time_first.shape[0] < window_size:
+            raise ValueError(
+                f"Run T={fields_time_first.shape[0]} is shorter than model T={window_size}."
+            )
+        if not (0.0 < args.density_visible_fraction <= 1.0):
+            raise ValueError("--density-visible-fraction must lie in (0, 1].")
+        slide_steps = [int(step) for step in args.slide_steps]
+        if len(set(slide_steps)) != len(slide_steps):
+            raise ValueError(f"--slide-steps values must be unique, got {slide_steps}.")
+        if args.fps <= 0:
+            raise ValueError(f"--fps must be positive, got {args.fps}.")
+        if args.dpi <= 0 or args.animation_dpi <= 0:
+            raise ValueError("--dpi and --animation-dpi must both be positive.")
+        target = torch.from_numpy(
+            np.transpose(fields_time_first, (1, 0, 2, 3))
+        ).to(device=device, dtype=torch.float32)
+        mean = torch.tensor(stats["mean"], device=device).view(4, 1, 1, 1)
+        std = torch.tensor(stats["std"], device=device).view(4, 1, 1, 1)
+        target_normalized = (target - mean) / (std + 1e-8)
+        if args.plot_units == "normalized":
+            target_density_plot = target_normalized[3].detach().cpu().numpy()
+        else:
+            target_density_plot = target[3].detach().cpu().numpy()
+
+        generator = torch.Generator().manual_seed(args.seed)
+        probe_mask_full, probe_info = _density_probe_grid(
+            block=target_normalized.unsqueeze(0),
+            target_visible_fraction=args.density_visible_fraction,
+            generator=generator,
+        )
+        probe_mask = probe_mask_full[0, 0, 0]
+        probe_actual_fraction = float(probe_info["actual_visible_fraction"])
+
+        model = UNet3D(
+            in_channels=8,
+            out_channels=4,
+            base_channels=base_channels,
+            channel_mults=channel_mults,
+            architecture=checkpoint_args.get("model_version", LEGACY_MODEL_VERSION),
+            use_attention=bool(checkpoint_args.get("use_attention", False)),
+            spatial_only_pooling=bool(
+                checkpoint_args.get("spatial_only_pooling", False)
+            ),
+        ).to(device)
+        model.load_state_dict(checkpoint["model"])
+        model.eval()
+
+        if args.x_index is None:
+            projection_label = "x-averaged Density(time,z)"
+        else:
+            if not (0 <= args.x_index < target.shape[2]):
+                raise ValueError(
+                    f"--x-index must be in [0, {target.shape[2] - 1}], got {args.x_index}."
+                )
+            projection_label = f"Density(time,z) at x index {args.x_index}"
+        target_projection = project_time_z(
+            target_density_plot,
+            x_index=args.x_index,
+        )
+
+        print("Checkpoint:", checkpoint_path)
+        print("Checkpoint epoch:", checkpoint.get("epoch"))
+        print("Device:", device)
+        print("HDF5:", h5_path)
+        print("Run:", args.run_name)
+        print("Run field shape (T,C,X,Z):", fields_time_first.shape)
+        print("Model window size:", window_size)
+        print("Slide steps:", slide_steps)
+        print("Probe target fraction:", args.density_visible_fraction)
+        print("Probe actual fraction:", probe_actual_fraction)
+        print("Hide magnetic:", args.hide_magnetic)
+        print("Probe grid:", probe_info)
+        print("Projection:", projection_label)
+        print("Probe values are clamped only for recursive conditioning.")
+        print("Figures and metrics retain raw model predictions at probe positions.")
+        print("Normalized residuals use checkpoint preprocessing mean/std.")
+
+        render_slide_steps = args.analysis in {"both", "slide_steps"}
+        render_bidirectional = args.analysis in {"both", "bidirectional"}
+        steps_to_compute = []
+        if render_slide_steps:
+            steps_to_compute.extend(slide_steps)
+        if render_bidirectional:
+            steps_to_compute.extend([args.refinement_step, window_size])
+        steps_to_compute = list(dict.fromkeys(steps_to_compute))
+
+        results_by_step = {}
+        for slide_step in steps_to_compute:
+            print(f"Reconstructing slide step={slide_step}")
+            result = reconstruct_with_slide_step(
+                model=model,
+                target_normalized=target_normalized,
+                target_density_plot=target_density_plot,
+                density_mean=mean[3],
+                density_std=std[3],
+                probe_mask=probe_mask,
+                window_size=window_size,
+                slide_step=slide_step,
+                plot_units=args.plot_units,
+                x_index=args.x_index,
+                amp=True,
+                retain_state=(
+                    render_bidirectional
+                    and slide_step in {args.refinement_step, window_size}
+                ),
+                hide_magnetic=args.hide_magnetic,
+            )
+            print("  starts:", result["window_starts"])
+            print("  metrics:", result["metrics"])
+            results_by_step[slide_step] = result
+
+        bidirectional_rows = None
+        if render_bidirectional:
+            print("Building bidirectional repeated-sweep comparison")
+            bidirectional_rows = build_bidirectional_rows(
+                model=model,
+                target_normalized=target_normalized,
+                target_density_plot=target_density_plot,
+                density_mean=mean[3],
+                density_std=std[3],
+                probe_mask=probe_mask,
+                window_size=window_size,
+                refinement_step=args.refinement_step,
+                refinement_passes=args.refinement_passes,
+                refinement_offset=args.refinement_offset,
+                plot_units=args.plot_units,
+                x_index=args.x_index,
+                amp=True,
+                initial_results=results_by_step,
+                hide_magnetic=args.hide_magnetic,
+            )
+            for row_index, row in enumerate(bidirectional_rows, start=1):
+                print(
+                    f"  row={row_index} step={row['slide_step']} "
+                    f"passes={row['pass_count']} offsets={row['offsets']} "
+                    f"metrics={row['metrics']}"
+                )
+
+        save_plot_cache(
+            cache_path,
+            {
+                "signature": cache_signature,
+                "window_size": window_size,
+                "target_density_plot": target_density_plot,
+                "target_projection": target_projection,
+                "probe_mask": np.asarray(probe_mask.detach().cpu().numpy()),
+                "frame_ids": np.asarray(frame_ids),
+                "probe_info": probe_info,
+                "probe_actual_fraction": probe_actual_fraction,
+                "projection_label": projection_label,
+                "checkpoint_epoch": checkpoint_epoch,
+                "h5_path": str(h5_path),
+                "results_by_step": {
+                    int(step): plottable_slide_result(result)
+                    for step, result in results_by_step.items()
+                },
+                "bidirectional_rows": bidirectional_rows,
+            },
+        )
 
     if render_slide_steps:
         save_slide_step_analysis(
@@ -2120,7 +2311,7 @@ def main() -> None:
             animation_format=args.animation_format,
             fps=args.fps,
             checkpoint_path=checkpoint_path,
-            checkpoint_epoch=checkpoint.get("epoch"),
+            checkpoint_epoch=checkpoint_epoch,
             h5_path=h5_path,
             out_dir=out_dir,
             dpi=args.dpi,
@@ -2128,30 +2319,6 @@ def main() -> None:
         )
 
     if render_bidirectional:
-        print("Building bidirectional repeated-sweep comparison")
-        bidirectional_rows = build_bidirectional_rows(
-            model=model,
-            target_normalized=target_normalized,
-            target_density_plot=target_density_plot,
-            density_mean=mean[3],
-            density_std=std[3],
-            probe_mask=probe_mask,
-            window_size=window_size,
-            refinement_step=args.refinement_step,
-            refinement_passes=args.refinement_passes,
-            refinement_offset=args.refinement_offset,
-            plot_units=args.plot_units,
-            x_index=args.x_index,
-            amp=True,
-            initial_results=results_by_step,
-            hide_magnetic=args.hide_magnetic,
-        )
-        for row_index, row in enumerate(bidirectional_rows, start=1):
-            print(
-                f"  row={row_index} step={row['slide_step']} "
-                f"passes={row['pass_count']} offsets={row['offsets']} "
-                f"metrics={row['metrics']}"
-            )
         save_bidirectional_analysis(
             rows=bidirectional_rows,
             target_density_plot=target_density_plot,
@@ -2172,7 +2339,7 @@ def main() -> None:
             residual_q=args.residual_q,
             residual_vmax=args.residual_vmax,
             checkpoint_path=checkpoint_path,
-            checkpoint_epoch=checkpoint.get("epoch"),
+            checkpoint_epoch=checkpoint_epoch,
             h5_path=h5_path,
             out_dir=out_dir,
             dpi=args.dpi,

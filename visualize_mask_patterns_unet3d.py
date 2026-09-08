@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import os
+import pickle
 import shutil
 import subprocess
 import tempfile
@@ -51,6 +52,8 @@ JY_STATS_FILENAME = "jy_stats.json"
 JY_NRMSE_YLABEL = "Jy NRMSE (normalized by training-set Jy std)"
 JY_STATS_DEFINITION = "dBx/dz - dBz/dx"
 JY_STATS_PREPROCESSING = "checkpoint channel-standardized Bx,Bz"
+PLOT_CACHE_FILENAME = "plot_cache.pkl"
+PLOT_CACHE_VERSION = 1
 
 
 def format_magnetic_visible_percent(visible_fraction: float) -> str:
@@ -170,6 +173,97 @@ def save_information_suite_error_plot(
         "jy_std_train": float(jy_std_train),
         "rows": payload,
     }
+
+
+def resolve_checkpoint_path(run_dir: Path, checkpoint: str) -> Path:
+    path = Path(checkpoint)
+    if not path.is_absolute():
+        path = run_dir / path
+    return path.expanduser().resolve()
+
+
+def checkpoint_cache_signature(checkpoint_path: Path) -> Dict:
+    stat = checkpoint_path.stat()
+    return {
+        "path": str(checkpoint_path),
+        "mtime_ns": int(stat.st_mtime_ns),
+        "size": int(stat.st_size),
+    }
+
+
+def information_suite_plot_cache_signature(
+    args: argparse.Namespace,
+    run_dir: Path,
+) -> Dict:
+    """Identity of the arrays needed to redraw, excluding figure-style options."""
+    return {
+        "version": PLOT_CACHE_VERSION,
+        "kind": "information_suite",
+        "checkpoint": checkpoint_cache_signature(
+            resolve_checkpoint_path(run_dir, args.checkpoint)
+        ),
+        "run_name": args.run_name,
+        "t0": args.t0,
+        "sample_index": args.sample_index,
+        "seed": args.seed,
+        "mask_fraction": args.mask_fraction,
+        "block_fraction": args.block_fraction,
+        "grid_stride": args.grid_stride,
+        "magnetic_grid_stride": args.magnetic_grid_stride,
+        "mask_patterns": list(args.mask_patterns),
+        "experiment": args.experiment,
+        "hide_magnetic": bool(args.hide_magnetic),
+        "density_probe_counts": list(args.density_probe_counts),
+        "magnetic_visible_fractions": [float(value) for value in args.magnetic_visible_fractions],
+        "density_forecast_visible_frames": (
+            None
+            if args.density_forecast_visible_frames is None
+            else [int(value) for value in args.density_forecast_visible_frames]
+        ),
+        "skip_validation_statistics": bool(args.skip_validation_statistics),
+        "statistics_window_stride": args.statistics_window_stride,
+        "statistics_max_windows_per_run": args.statistics_max_windows_per_run,
+        "plot_units": args.plot_units,
+        "extent": [float(value) for value in args.extent],
+        "h5_dir": args.h5_dir,
+    }
+
+
+def load_plot_cache(path: Path) -> Dict | None:
+    try:
+        with path.open("rb") as handle:
+            return pickle.load(handle)
+    except Exception as exc:
+        print(f"Could not load plot cache {path}: {exc}")
+        return None
+
+
+def save_plot_cache(path: Path, payload: Dict) -> None:
+    tmp_path = path.with_name(path.name + ".tmp")
+    with tmp_path.open("wb") as handle:
+        pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp_path.replace(path)
+    print(f"Saved plot cache: {path}")
+
+
+def try_reuse_plot_cache(
+    path: Path,
+    signature: Dict,
+    enabled: bool,
+) -> Dict | None:
+    if not enabled:
+        return None
+    if not path.exists():
+        print(f"No plot cache at {path}; running model inference")
+        return None
+    payload = load_plot_cache(path)
+    if payload is None:
+        return None
+    if payload.get("signature") != signature:
+        print(f"Plot cache at {path} does not match this command; recomputing")
+        return None
+    print(f"Reusing plot cache: {path}")
+    return payload
 
 
 def parse_args():
@@ -462,6 +556,14 @@ def parse_args():
         type=str,
         default=None,
         help="Output directory for figures. If None, use run-dir/figures_mask_patterns.",
+    )
+    p.add_argument(
+        "--reuse-plot-data",
+        action="store_true",
+        help=(
+            "If out-dir/plot_cache.pkl exists and matches this command's "
+            "inference settings, skip model inference and only redraw figures."
+        ),
     )
 
     p.add_argument("--device", type=str, default="cuda")
@@ -2561,243 +2663,319 @@ def main():
     images_dir = out_dir / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device(
-        args.device if torch.cuda.is_available() and args.device == "cuda" else "cpu"
+    cache_path = out_dir / PLOT_CACHE_FILENAME
+    cache_signature = information_suite_plot_cache_signature(args, run_dir)
+    cached = try_reuse_plot_cache(
+        cache_path, cache_signature, args.reuse_plot_data
     )
-    print("Device:", device)
 
-    ckpt, ckpt_path = load_checkpoint(run_dir, args.checkpoint, device=device)
-    ckpt_args = ckpt["args"]
-    stats = ckpt["stats"]
+    if cached is not None:
+        selection_stem = cached["selection_stem"]
+        metadata = cached["metadata"]
+        delta_t = int(cached["delta_t"])
+        y_plot_np = cached["y_plot_np"]
+        y_norm_np = cached["y_norm_np"]
+        target_ay = cached["target_ay"]
+        target_jy = cached["target_jy"]
+        target_jy_normalized = cached["target_jy_normalized"]
+        experiment_rows = cached["experiment_rows"]
+        jy_stats = cached["jy_stats"]
+        jy_std_train = float(cached["jy_std_train"])
+        validation_statistics = cached.get("validation_statistics")
+        statistics_window_stride = cached["statistics_window_stride"]
+        statistics_index_count = cached.get("statistics_index_count")
+        selected_statistics_runs = cached.get("selected_statistics_runs")
+        ckpt_path = Path(cached["ckpt_path"])
+        ckpt_epoch = cached.get("ckpt_epoch")
+        if not (0 <= args.local_time < delta_t):
+            raise ValueError(
+                f"--local-time must be in [0, {delta_t - 1}], got {args.local_time}"
+            )
+        if args.all_times and args.fps <= 0:
+            raise ValueError(f"--fps must be positive, got {args.fps}")
+        print("Redrawing figures from cached arrays")
+        print("delta_t:", delta_t)
+        print("local_time:", args.local_time)
+        print("all_times:", args.all_times)
+        if args.all_times:
+            print("animation_format:", args.animation_format)
+            print("fps:", args.fps)
+        print("plot_units:", args.plot_units)
+    else:
+        device = torch.device(
+            args.device if torch.cuda.is_available() and args.device == "cuda" else "cpu"
+        )
+        print("Device:", device)
 
-    h5_dir = args.h5_dir if args.h5_dir is not None else ckpt_args["h5_dir"]
-    h5_dir = expand_path(h5_dir)
+        ckpt, ckpt_path = load_checkpoint(run_dir, args.checkpoint, device=device)
+        ckpt_args = ckpt["args"]
+        ckpt_epoch = ckpt.get("epoch")
+        stats = ckpt["stats"]
 
-    betas = ckpt_args.get("betas", [0.2])
-    delta_t = int(ckpt_args.get("delta_t", ckpt_args.get("delta-t", 8)))
-    stride_t = int(ckpt_args.get("stride_t", ckpt_args.get("stride-t", 2)))
-    base_channels = int(ckpt_args.get("base_channels", ckpt_args.get("base-channels", 16)))
-    # Checkpoints created before the depth option used the original three-level
-    # architecture. Keep that fallback so their figures remain reproducible.
-    channel_mults = ckpt_args.get("channel_mults", [1, 2, 4])
-    if args.density_forecast_visible_frames is None:
-        args.density_forecast_visible_frames = default_density_forecast_visible_frames(
+        h5_dir = args.h5_dir if args.h5_dir is not None else ckpt_args["h5_dir"]
+        h5_dir = expand_path(h5_dir)
+
+        betas = ckpt_args.get("betas", [0.2])
+        delta_t = int(ckpt_args.get("delta_t", ckpt_args.get("delta-t", 8)))
+        stride_t = int(ckpt_args.get("stride_t", ckpt_args.get("stride-t", 2)))
+        base_channels = int(ckpt_args.get("base_channels", ckpt_args.get("base-channels", 16)))
+        # Checkpoints created before the depth option used the original three-level
+        # architecture. Keep that fallback so their figures remain reproducible.
+        channel_mults = ckpt_args.get("channel_mults", [1, 2, 4])
+        if args.density_forecast_visible_frames is None:
+            args.density_forecast_visible_frames = default_density_forecast_visible_frames(
+                delta_t
+            )
+
+        if not (0 <= args.local_time < delta_t):
+            raise ValueError(f"--local-time must be in [0, {delta_t - 1}], got {args.local_time}")
+        if args.all_times and args.fps <= 0:
+            raise ValueError(f"--fps must be positive, got {args.fps}")
+        statistics_window_stride = (
             delta_t
+            if args.statistics_window_stride is None
+            else int(args.statistics_window_stride)
         )
-
-    if not (0 <= args.local_time < delta_t):
-        raise ValueError(f"--local-time must be in [0, {delta_t - 1}], got {args.local_time}")
-    if args.all_times and args.fps <= 0:
-        raise ValueError(f"--fps must be positive, got {args.fps}")
-    statistics_window_stride = (
-        delta_t
-        if args.statistics_window_stride is None
-        else int(args.statistics_window_stride)
-    )
-    if statistics_window_stride < 1:
-        raise ValueError("--statistics-window-stride must be positive.")
-    if (
-        args.statistics_max_windows_per_run is not None
-        and args.statistics_max_windows_per_run < 1
-    ):
-        raise ValueError("--statistics-max-windows-per-run must be positive.")
-    print("HDF5 dir:", h5_dir)
-    print("Betas:", betas)
-    print("delta_t:", delta_t)
-    print("stride_t:", stride_t)
-    print("base_channels:", base_channels)
-    print("channel_mults:", channel_mults)
-    print("mask_fraction:", args.mask_fraction)
-    print("block_fraction:", args.block_fraction)
-    print("density_grid_stride:", args.grid_stride)
-    print("magnetic_grid_stride:", args.magnetic_grid_stride)
-    print("mask_patterns:", args.mask_patterns)
-    print("experiment:", args.experiment)
-    print("hide_magnetic:", args.hide_magnetic)
-    if args.sample_index is None:
-        print("sample selector: run_name/t0", args.run_name, args.t0)
-    else:
-        print("sample selector: legacy validation sample_index", args.sample_index)
-    print("density_probe_counts:", args.density_probe_counts)
-    print("magnetic_visible_fractions:", args.magnetic_visible_fractions)
-    print(
-        "density_forecast_visible_frames:",
-        args.density_forecast_visible_frames,
-    )
-    print("local_time:", args.local_time)
-    print("all_times:", args.all_times)
-    if args.all_times:
-        print("animation_format:", args.animation_format)
-        print("fps:", args.fps)
-    print("plot_units:", args.plot_units)
-    print("validation_statistics:", not args.skip_validation_statistics)
-    if not args.skip_validation_statistics:
-        print("statistics_window_stride:", statistics_window_stride)
+        if statistics_window_stride < 1:
+            raise ValueError("--statistics-window-stride must be positive.")
+        if (
+            args.statistics_max_windows_per_run is not None
+            and args.statistics_max_windows_per_run < 1
+        ):
+            raise ValueError("--statistics-max-windows-per-run must be positive.")
+        print("HDF5 dir:", h5_dir)
+        print("Betas:", betas)
+        print("delta_t:", delta_t)
+        print("stride_t:", stride_t)
+        print("base_channels:", base_channels)
+        print("channel_mults:", channel_mults)
+        print("mask_fraction:", args.mask_fraction)
+        print("block_fraction:", args.block_fraction)
+        print("density_grid_stride:", args.grid_stride)
+        print("magnetic_grid_stride:", args.magnetic_grid_stride)
+        print("mask_patterns:", args.mask_patterns)
+        print("experiment:", args.experiment)
+        print("hide_magnetic:", args.hide_magnetic)
+        if args.sample_index is None:
+            print("sample selector: run_name/t0", args.run_name, args.t0)
+        else:
+            print("sample selector: legacy validation sample_index", args.sample_index)
+        print("density_probe_counts:", args.density_probe_counts)
+        print("magnetic_visible_fractions:", args.magnetic_visible_fractions)
         print(
-            "statistics_max_windows_per_run:",
-            args.statistics_max_windows_per_run,
+            "density_forecast_visible_frames:",
+            args.density_forecast_visible_frames,
         )
-
-    dataset = VPICWindowDataset(
-        h5_dir=h5_dir,
-        betas=betas,
-        delta_t=delta_t,
-        stride_t=stride_t,
-        layout="C T X Z",
-        return_metadata=True,
-    )
-
-    val_runs = get_val_runs(run_dir)
-    if not args.skip_validation_statistics and val_runs is None:
-        raise FileNotFoundError(
-            "Cross-run validation statistics require run-dir/split.json. "
-            "Use --skip-validation-statistics only if aggregate plots are not needed."
-        )
-    if args.sample_index is None:
-        dataset_idx = select_run_t0_index(
-            dataset=dataset,
-            val_runs=val_runs,
-            run_name=args.run_name,
-            t0=args.t0,
-        )
-        selection_stem = "named"
-    else:
-        dataset_idx = select_sample_index(dataset, val_runs, args.sample_index)
-        selection_stem = f"sample{args.sample_index:04d}"
-
-    sample = dataset[dataset_idx]
-    y = sample["block"].unsqueeze(0).to(device)  # (1, C, T, X, Z)
-    metadata = sample["metadata"]
-
-    print("Selected dataset index:", dataset_idx)
-    print("Sample metadata:", metadata)
-    print("Block shape:", tuple(y.shape))
-
-    mean = torch.tensor(stats["mean"], dtype=torch.float32, device=device).view(1, 4, 1, 1, 1)
-    std = torch.tensor(stats["std"], dtype=torch.float32, device=device).view(1, 4, 1, 1, 1)
-    train_runs = get_train_runs(run_dir)
-    if train_runs is None:
-        raise FileNotFoundError(
-            "Jy NRMSE normalization requires run-dir/split.json with train_runs."
-        )
-    jy_stats = load_or_compute_jy_training_stats(
-        run_dir=run_dir,
-        dataset=dataset,
-        train_runs=train_runs,
-        mean=mean,
-        std=std,
-        extent=args.extent,
-    )
-    jy_std_train = float(jy_stats["jy_std_train"])
-    if jy_std_train <= 0.0:
-        raise RuntimeError(
-            f"Training-set Jy std must be positive, got {jy_std_train}."
-        )
-
-    y_norm = normalize(y, mean, std)
-
-    model = UNet3D(
-        in_channels=8,
-        out_channels=4,
-        base_channels=base_channels,
-        channel_mults=channel_mults,
-        architecture=ckpt_args.get("model_version", LEGACY_MODEL_VERSION),
-        use_attention=bool(ckpt_args.get("use_attention", False)),
-        spatial_only_pooling=bool(ckpt_args.get("spatial_only_pooling", False)),
-    ).to(device)
-
-    model.load_state_dict(ckpt["model"])
-    model.eval()
-
-    generator = torch.Generator()
-    generator.manual_seed(args.seed)
-
-    if args.plot_units == "normalized":
-        y_plot_np = y_norm[0].detach().cpu().numpy()
-    elif args.plot_units == "physical":
-        y_plot_np = y[0].detach().cpu().numpy()
-    else:
-        raise ValueError(f"Unknown plot_units: {args.plot_units}")
-
-    # Derived magnetic quantities are computed only from complete fields.
-    # In particular, no gradients or path integrations are applied to the
-    # masked Visible input arrays.
-    target_ay, target_jy = compute_ay_jy(y_plot_np, args.extent)
-    y_norm_np = y_norm[0].detach().cpu().numpy()
-    _, target_jy_normalized = compute_ay_jy(y_norm_np, args.extent)
-    experiment_mask_groups = build_experiment_mask_rows(
-        args=args,
-        block=y_norm,
-        generator=generator,
-    )
-    experiment_rows = []
-    for experiment_name, mask_rows in experiment_mask_groups:
-        rows_for_plot = []
-        print(f"Running experiment: {experiment_name} ({len(mask_rows)} rows)")
-        for short_name, label, mask in mask_rows:
-            x_visible_norm = make_visible_input(y_norm, mask)
-            model_input = torch.cat([x_visible_norm, mask], dim=1)
-            pred_norm = model(model_input)
-
-            if args.plot_units == "normalized":
-                pred_plot_tensor = pred_norm.detach()
-                visible_plot_tensor = y_norm.detach().clone()
-            else:
-                pred_plot_tensor = denormalize(pred_norm, mean, std).detach()
-                visible_plot_tensor = y.detach().clone()
-            visible_plot_tensor[mask < 0.5] = float("nan")
-
-            row = {
-                "name": short_name,
-                "label": label,
-                "mask": mask[0].detach().cpu().numpy(),
-                "visible_plot": visible_plot_tensor[0].detach().cpu().numpy(),
-                "pred_plot": pred_plot_tensor[0].detach().cpu().numpy(),
-                "pred_normalized": pred_norm[0].detach().cpu().numpy(),
-            }
-            row["pred_ay"], row["pred_jy"] = compute_ay_jy(
-                row["pred_plot"], args.extent
+        print("local_time:", args.local_time)
+        print("all_times:", args.all_times)
+        if args.all_times:
+            print("animation_format:", args.animation_format)
+            print("fps:", args.fps)
+        print("plot_units:", args.plot_units)
+        print("validation_statistics:", not args.skip_validation_statistics)
+        if not args.skip_validation_statistics:
+            print("statistics_window_stride:", statistics_window_stride)
+            print(
+                "statistics_max_windows_per_run:",
+                args.statistics_max_windows_per_run,
             )
-            _, row["pred_jy_normalized"] = compute_ay_jy(
-                row["pred_normalized"], args.extent
-            )
-            rows_for_plot.append(row)
-        experiment_rows.append((experiment_name, rows_for_plot))
 
-    if not args.skip_validation_statistics:
-        statistics_dataset = VPICWindowDataset(
+        dataset = VPICWindowDataset(
             h5_dir=h5_dir,
             betas=betas,
             delta_t=delta_t,
-            stride_t=1,
+            stride_t=stride_t,
             layout="C T X Z",
             return_metadata=True,
         )
-        statistics_indices = select_validation_statistics_indices(
-            dataset=statistics_dataset,
-            val_runs=val_runs,
-            window_stride=statistics_window_stride,
-            max_windows_per_run=args.statistics_max_windows_per_run,
-        )
-        selected_statistics_runs = {
-            statistics_dataset.samples[index][1] for index in statistics_indices
-        }
-        print(
-            "Collecting validation statistics from "
-            f"{len(selected_statistics_runs)} runs and "
-            f"{len(statistics_indices)} windows."
-        )
-        validation_statistics = collect_validation_statistics(
-            model=model,
-            dataset=statistics_dataset,
-            sample_indices=statistics_indices,
-            args=args,
+
+        val_runs = get_val_runs(run_dir)
+        if not args.skip_validation_statistics and val_runs is None:
+            raise FileNotFoundError(
+                "Cross-run validation statistics require run-dir/split.json. "
+                "Use --skip-validation-statistics only if aggregate plots are not needed."
+            )
+        if args.sample_index is None:
+            dataset_idx = select_run_t0_index(
+                dataset=dataset,
+                val_runs=val_runs,
+                run_name=args.run_name,
+                t0=args.t0,
+            )
+            selection_stem = "named"
+        else:
+            dataset_idx = select_sample_index(dataset, val_runs, args.sample_index)
+            selection_stem = f"sample{args.sample_index:04d}"
+
+        sample = dataset[dataset_idx]
+        y = sample["block"].unsqueeze(0).to(device)  # (1, C, T, X, Z)
+        metadata = sample["metadata"]
+
+        print("Selected dataset index:", dataset_idx)
+        print("Sample metadata:", metadata)
+        print("Block shape:", tuple(y.shape))
+
+        mean = torch.tensor(stats["mean"], dtype=torch.float32, device=device).view(1, 4, 1, 1, 1)
+        std = torch.tensor(stats["std"], dtype=torch.float32, device=device).view(1, 4, 1, 1, 1)
+        train_runs = get_train_runs(run_dir)
+        if train_runs is None:
+            raise FileNotFoundError(
+                "Jy NRMSE normalization requires run-dir/split.json with train_runs."
+            )
+        jy_stats = load_or_compute_jy_training_stats(
+            run_dir=run_dir,
+            dataset=dataset,
+            train_runs=train_runs,
             mean=mean,
             std=std,
-            device=device,
-            canonical_rows=dict(experiment_rows),
-            jy_std_train=jy_std_train,
+            extent=args.extent,
         )
+        jy_std_train = float(jy_stats["jy_std_train"])
+        if jy_std_train <= 0.0:
+            raise RuntimeError(
+                f"Training-set Jy std must be positive, got {jy_std_train}."
+            )
+
+        y_norm = normalize(y, mean, std)
+
+        model = UNet3D(
+            in_channels=8,
+            out_channels=4,
+            base_channels=base_channels,
+            channel_mults=channel_mults,
+            architecture=ckpt_args.get("model_version", LEGACY_MODEL_VERSION),
+            use_attention=bool(ckpt_args.get("use_attention", False)),
+            spatial_only_pooling=bool(ckpt_args.get("spatial_only_pooling", False)),
+        ).to(device)
+
+        model.load_state_dict(ckpt["model"])
+        model.eval()
+
+        generator = torch.Generator()
+        generator.manual_seed(args.seed)
+
+        if args.plot_units == "normalized":
+            y_plot_np = y_norm[0].detach().cpu().numpy()
+        elif args.plot_units == "physical":
+            y_plot_np = y[0].detach().cpu().numpy()
+        else:
+            raise ValueError(f"Unknown plot_units: {args.plot_units}")
+
+        # Derived magnetic quantities are computed only from complete fields.
+        # In particular, no gradients or path integrations are applied to the
+        # masked Visible input arrays.
+        target_ay, target_jy = compute_ay_jy(y_plot_np, args.extent)
+        y_norm_np = y_norm[0].detach().cpu().numpy()
+        _, target_jy_normalized = compute_ay_jy(y_norm_np, args.extent)
+        experiment_mask_groups = build_experiment_mask_rows(
+            args=args,
+            block=y_norm,
+            generator=generator,
+        )
+        experiment_rows = []
+        for experiment_name, mask_rows in experiment_mask_groups:
+            rows_for_plot = []
+            print(f"Running experiment: {experiment_name} ({len(mask_rows)} rows)")
+            for short_name, label, mask in mask_rows:
+                x_visible_norm = make_visible_input(y_norm, mask)
+                model_input = torch.cat([x_visible_norm, mask], dim=1)
+                pred_norm = model(model_input)
+
+                if args.plot_units == "normalized":
+                    pred_plot_tensor = pred_norm.detach()
+                    visible_plot_tensor = y_norm.detach().clone()
+                else:
+                    pred_plot_tensor = denormalize(pred_norm, mean, std).detach()
+                    visible_plot_tensor = y.detach().clone()
+                visible_plot_tensor[mask < 0.5] = float("nan")
+
+                row = {
+                    "name": short_name,
+                    "label": label,
+                    "mask": mask[0].detach().cpu().numpy(),
+                    "visible_plot": visible_plot_tensor[0].detach().cpu().numpy(),
+                    "pred_plot": pred_plot_tensor[0].detach().cpu().numpy(),
+                    "pred_normalized": pred_norm[0].detach().cpu().numpy(),
+                }
+                row["pred_ay"], row["pred_jy"] = compute_ay_jy(
+                    row["pred_plot"], args.extent
+                )
+                _, row["pred_jy_normalized"] = compute_ay_jy(
+                    row["pred_normalized"], args.extent
+                )
+                rows_for_plot.append(row)
+            experiment_rows.append((experiment_name, rows_for_plot))
+
+        validation_statistics = None
+        statistics_index_count = None
+        selected_statistics_runs = None
+        if not args.skip_validation_statistics:
+            statistics_dataset = VPICWindowDataset(
+                h5_dir=h5_dir,
+                betas=betas,
+                delta_t=delta_t,
+                stride_t=1,
+                layout="C T X Z",
+                return_metadata=True,
+            )
+            statistics_indices = select_validation_statistics_indices(
+                dataset=statistics_dataset,
+                val_runs=val_runs,
+                window_stride=statistics_window_stride,
+                max_windows_per_run=args.statistics_max_windows_per_run,
+            )
+            selected_statistics_runs = {
+                statistics_dataset.samples[index][1] for index in statistics_indices
+            }
+            print(
+                "Collecting validation statistics from "
+                f"{len(selected_statistics_runs)} runs and "
+                f"{len(statistics_indices)} windows."
+            )
+            validation_statistics = collect_validation_statistics(
+                model=model,
+                dataset=statistics_dataset,
+                sample_indices=statistics_indices,
+                args=args,
+                mean=mean,
+                std=std,
+                device=device,
+                canonical_rows=dict(experiment_rows),
+                jy_std_train=jy_std_train,
+            )
+            statistics_index_count = len(statistics_indices)
+            statistics_dataset.close()
+
+        save_plot_cache(
+            cache_path,
+            {
+                "signature": cache_signature,
+                "selection_stem": selection_stem,
+                "metadata": metadata,
+                "delta_t": delta_t,
+                "y_plot_np": y_plot_np,
+                "y_norm_np": y_norm_np,
+                "target_ay": target_ay,
+                "target_jy": target_jy,
+                "target_jy_normalized": target_jy_normalized,
+                "experiment_rows": experiment_rows,
+                "jy_stats": jy_stats,
+                "jy_std_train": jy_std_train,
+                "validation_statistics": validation_statistics,
+                "statistics_window_stride": statistics_window_stride,
+                "statistics_index_count": statistics_index_count,
+                "selected_statistics_runs": (
+                    None
+                    if selected_statistics_runs is None
+                    else sorted(selected_statistics_runs)
+                ),
+                "ckpt_path": str(ckpt_path),
+                "ckpt_epoch": ckpt_epoch,
+            },
+        )
+
+
+    if validation_statistics is not None:
         for experiment_name, row_statistics in validation_statistics.items():
             statistics_stem = (
                 f"validation-runs_stride-{statistics_window_stride}_"
@@ -2807,13 +2985,13 @@ def main():
                 experiment_name=experiment_name,
                 row_statistics=row_statistics,
                 context_length=delta_t,
-                total_windows=len(statistics_indices),
+                total_windows=statistics_index_count,
                 out_path=out_dir / f"{statistics_stem}.png",
             )
             statistics_payload.update(
                 {
                     "checkpoint": str(ckpt_path),
-                    "checkpoint_epoch": ckpt.get("epoch"),
+                    "checkpoint_epoch": ckpt_epoch,
                     "validation_runs": sorted(selected_statistics_runs),
                     "window_stride": statistics_window_stride,
                     "max_windows_per_run": args.statistics_max_windows_per_run,
@@ -2826,7 +3004,6 @@ def main():
             statistics_path = out_dir / f"{statistics_stem}.json"
             statistics_path.write_text(json.dumps(statistics_payload, indent=2))
             print(f"Saved validation statistics data: {statistics_path}")
-        statistics_dataset.close()
 
     sample_stem = (
         f"{selection_stem}_"
