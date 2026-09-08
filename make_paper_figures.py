@@ -15,11 +15,12 @@ matplotlib.use("Agg")
 
 import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
+import h5py
 import numpy as np
 import torch
 from matplotlib.lines import Line2D
 
-from data.vpic_hdf5_dataset import VPICWindowDataset
+from data.vpic_hdf5_dataset import VPICWindowDataset, find_h5_files
 from models.unet3d import LEGACY_MODEL_VERSION, UNet3D
 from visualize_mask_patterns_unet3d import (
     DEFAULT_MAGNETIC_ABLATION_VISIBLE_FRACTIONS,
@@ -30,12 +31,14 @@ from visualize_mask_patterns_unet3d import (
     DEFAULT_T0,
     JY_STATS_DEFINITION,
     RESIDUAL_CMAP,
+    _density_probe_grid,
     build_density_forecast_rows,
     build_density_only_multifunction_rows,
     build_density_superres_rows,
     build_magnetic_ablation_rows,
     checkpoint_cache_signature,
     collect_validation_statistics,
+    compute_normalized_metrics,
     default_density_forecast_visible_frames,
     denormalize,
     expand_path,
@@ -54,19 +57,24 @@ from visualize_mask_patterns_unet3d import (
     select_validation_statistics_indices,
 )
 from visualize_sliding_density_reconstruction import (
+    find_and_load_run,
     framewise_rmse_mae,
     project_time_z,
+    reconstruct_with_slide_step,
 )
 
 
-PAPER_CACHE_VERSION = 2
-COMPATIBLE_PAPER_CACHE_VERSIONS = (1, 2)
+PAPER_CACHE_VERSION = 6
+COMPATIBLE_PAPER_CACHE_VERSIONS = (1, 2, 3, 4, 5, 6)
 PAPER_DIRNAME = "paper_figures_v1"
 DEFAULT_GLOBAL_FRAME = 45
 DEFAULT_SLIDE_STEPS = (8, 4, 2, 1)
 DEFAULT_PROBE_COUNTS = (0, 10, 100, 1000)
 DEFAULT_X_INDEX = 130
 DEFAULT_DENSITY_VISIBLE_FRACTION = 0.08
+DEFAULT_SLIDING_MAX_RUNS = 16
+SLIDING_AGGREGATE_N_FRAMES = 52
+LOG_Y_FLOOR = 1e-6
 PNG_DPI = 300
 
 SPATIAL_ROW_ORDER = (
@@ -168,6 +176,16 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=list(DEFAULT_SLIDE_STEPS),
     )
+    parser.add_argument(
+        "--sliding-max-runs",
+        type=int,
+        default=DEFAULT_SLIDING_MAX_RUNS,
+        help=(
+            "Maximum held-out validation runs for sliding appendix left-panel "
+            "RMSE stats, taken in split.json order. Runs shorter than 52 frames "
+            "are skipped; remaining runs use only frames 0:52."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -200,6 +218,95 @@ def format_visible_ratio_percent(ratio_percent: float) -> str:
     if ratio_percent < 0.2:
         return f"{ratio_percent:.3f}".rstrip("0").rstrip(".")
     return f"{ratio_percent:.2f}".rstrip("0").rstrip(".")
+
+
+def clip_positive_for_log(
+    values: np.ndarray,
+    floor: float = LOG_Y_FLOOR,
+) -> np.ndarray:
+    """Clip non-positive values at plot time so a log axis stays defined."""
+    return np.maximum(np.asarray(values, dtype=np.float64), float(floor))
+
+
+def density_nrmse_from_residual(residual: np.ndarray) -> float:
+    nrmse, _nmae = compute_normalized_metrics(residual)
+    return float(nrmse)
+
+
+def format_density_nrmse_label(nrmse: float) -> str:
+    return f"NRMSE = {nrmse:.3g}"
+
+
+def annotate_density_nrmse(ax, nrmse: float) -> None:
+    ax.text(
+        0.03,
+        0.97,
+        format_density_nrmse_label(nrmse),
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=7,
+        bbox={
+            "boxstyle": "round,pad=0.18",
+            "facecolor": "white",
+            "edgecolor": "0.75",
+            "linewidth": 0.4,
+            "alpha": 0.88,
+        },
+    )
+
+
+def validation_run_order(run_dir: Path) -> List[str]:
+    split_path = run_dir / "split.json"
+    if not split_path.exists():
+        return []
+    return [str(name) for name in json.loads(split_path.read_text()).get("val_runs", [])]
+
+
+def peek_run_n_frames(
+    h5_dir: Path,
+    betas: Sequence[float],
+    run_name: str,
+) -> int | None:
+    for h5_path in find_h5_files(h5_dir, betas=betas):
+        with h5py.File(h5_path, "r") as h5_file:
+            runs = h5_file.get("runs")
+            if runs is None or run_name not in runs:
+                continue
+            return int(runs[run_name]["fields"].shape[0])
+    return None
+
+
+def select_sliding_aggregate_runs(
+    val_run_order: Sequence[str],
+    max_runs: int,
+) -> List[str]:
+    """Take the first ``max_runs`` validation runs in ``split.json`` order."""
+    if int(max_runs) <= 0:
+        raise ValueError(f"sliding max runs must be positive, got {max_runs}")
+    return [str(name) for name in val_run_order][: int(max_runs)]
+
+
+def stack_rmse_by_global_frame(
+    per_run_frame_ids: Sequence[np.ndarray],
+    per_run_rmse: Sequence[np.ndarray],
+) -> Tuple[np.ndarray, np.ndarray]:
+    frames = np.array(
+        sorted(
+            {
+                int(value)
+                for ids in per_run_frame_ids
+                for value in np.asarray(ids).ravel()
+            }
+        ),
+        dtype=np.int32,
+    )
+    stacked = np.full((len(per_run_rmse), len(frames)), np.nan, dtype=np.float64)
+    index = {int(frame): col for col, frame in enumerate(frames)}
+    for row, (ids, rmse) in enumerate(zip(per_run_frame_ids, per_run_rmse)):
+        for frame_id, value in zip(np.asarray(ids).ravel(), np.asarray(rmse).ravel()):
+            stacked[row, index[int(frame_id)]] = float(value)
+    return frames, stacked
 
 
 def density_std_from_run_dir(run_dir: Path) -> float | None:
@@ -749,6 +856,7 @@ def build_spatial_qualitative_cache(ctx: Dict, args: argparse.Namespace) -> Tupl
         density_mask = mask[0, 3].detach().cpu().numpy()
         visible = np.array(target_plot[local_time], copy=True)
         visible[density_mask[local_time] < 0.5] = np.nan
+        # Raw model output over the full field, including visible Density sites.
         pred = pred_plot[0, 3, local_time].detach().cpu().numpy()
         residual = normalized_residual(
             pred_norm[0, 3, local_time].detach().cpu().numpy(),
@@ -762,6 +870,7 @@ def build_spatial_qualitative_cache(ctx: Dict, args: argparse.Namespace) -> Tupl
             {
                 "name": name,
                 "density_masked_fraction": float(1.0 - density_mask.mean()),
+                "density_nrmse": density_nrmse_from_residual(residual),
             }
         )
     meta = {
@@ -775,7 +884,13 @@ def build_spatial_qualitative_cache(ctx: Dict, args: argparse.Namespace) -> Tupl
         "rows": row_meta,
         "b_condition": "B fully observed",
         "density_policy": "standardized ~50% multifunction geometries",
+        "prediction_definition": (
+            "raw model Density prediction over the full field, including visible sites"
+        ),
         "residual_definition": DENSITY_NRMSE_DEFINITION,
+        "residual_scope": (
+            "full-field prediction_normalized - target_normalized, including visible sites"
+        ),
         "sample_metadata": dict(metadata),
         "layout": {"rows": 4, "columns": 4},
     }
@@ -818,6 +933,11 @@ def plot_spatial_qualitative(
         bottom=0.06,
     )
     col_titles = ["Target Density", "Visible Density", "Prediction", "Residual"]
+    nrmse_by_name = {
+        str(row.get("name")): row.get("density_nrmse")
+        for row in metadata.get("rows") or []
+        if isinstance(row, dict)
+    }
     field_im = None
     residual_im = None
     for r, name in enumerate(row_names):
@@ -853,6 +973,10 @@ def plot_spatial_qualitative(
                     interpolation="nearest",
                 )
                 residual_im = im
+                nrmse = nrmse_by_name.get(name)
+                if nrmse is None:
+                    nrmse = density_nrmse_from_residual(panel)
+                annotate_density_nrmse(ax, float(nrmse))
             ax.set_xticks([])
             ax.set_yticks([])
             if r == 0:
@@ -996,9 +1120,24 @@ def plot_magnetic_ablation_summary(arrays: Dict, metadata: Dict, figures_dir: Pa
         (axes[1], "Jy NRMSE", "jy_median", "jy_p16", "jy_p84"),
     )
     for ax, ylabel, med_key, p16_key, p84_key in series:
-        ax.fill_between(x, arrays[p16_key], arrays[p84_key], color="C0", alpha=0.22, linewidth=0)
-        ax.plot(x, arrays[med_key], color="C0", marker="o", linewidth=1.8, markersize=5)
+        ax.fill_between(
+            x,
+            clip_positive_for_log(arrays[p16_key]),
+            clip_positive_for_log(arrays[p84_key]),
+            color="C0",
+            alpha=0.22,
+            linewidth=0,
+        )
+        ax.plot(
+            x,
+            clip_positive_for_log(arrays[med_key]),
+            color="C0",
+            marker="o",
+            linewidth=1.8,
+            markersize=5,
+        )
         ax.set_ylabel(ylabel)
+        ax.set_yscale("log")
         ax.grid(alpha=0.25, linewidth=0.6)
         ax.set_axisbelow(True)
     axes[1].set_xticks(x)
@@ -1184,15 +1323,16 @@ def plot_density_forecast_summary(arrays: Dict, metadata: Dict, figures_dir: Pat
             for ax, metric in ((axes[0], "density"), (axes[1], "jy")):
                 ax.fill_between(
                     frames,
-                    arrays[f"{tag}_{metric}_p16"],
-                    arrays[f"{tag}_{metric}_p84"],
+                    clip_positive_for_log(arrays[f"{tag}_{metric}_p16"]),
+                    clip_positive_for_log(arrays[f"{tag}_{metric}_p84"]),
                     color=color,
                     alpha=alpha,
-                    linewidth=0,
+                    linewidth=0.4,
+                    edgecolor="black",
                 )
                 ax.plot(
                     frames,
-                    arrays[f"{tag}_{metric}_median"],
+                    clip_positive_for_log(arrays[f"{tag}_{metric}_median"]),
                     color=color,
                     linestyle=linestyle,
                     linewidth=1.7,
@@ -1200,6 +1340,8 @@ def plot_density_forecast_summary(arrays: Dict, metadata: Dict, figures_dir: Pat
                 )
     axes[0].set_ylabel("Density NRMSE")
     axes[1].set_ylabel("Jy NRMSE")
+    axes[0].set_yscale("log")
+    axes[1].set_yscale("log")
     axes[1].set_xlabel(
         f"Local frame in {int(metadata['context_length'])}-frame context window"
     )
@@ -1237,8 +1379,8 @@ def plot_density_superres_summary(
     x = np.arange(len(probe_counts))
     fig, axes = plt.subplots(2, 1, figsize=(5.8, 5.8), sharex=True)
     styles = {
-        "B_full": dict(color="C0", linestyle="-", label="B visible 100%"),
-        "B_hidden": dict(color="C0", linestyle="--", label="B visible 0%"),
+        "B_full": dict(color="C0", linestyle="-", marker="o", label="B visible 100%"),
+        "B_hidden": dict(color="C0", linestyle="--", marker="^", label="B visible 0%"),
     }
     for key, style in styles.items():
         rows_by_count = {
@@ -1250,12 +1392,40 @@ def plot_density_superres_summary(
         jy = [rows_by_count[count]["jy_summary"]["median"] for count in probe_counts]
         jy_p16 = [rows_by_count[count]["jy_summary"]["p16"] for count in probe_counts]
         jy_p84 = [rows_by_count[count]["jy_summary"]["p84"] for count in probe_counts]
-        axes[0].fill_between(x, density_p16, density_p84, color=style["color"], alpha=0.18, linewidth=0)
-        axes[1].fill_between(x, jy_p16, jy_p84, color=style["color"], alpha=0.18, linewidth=0)
-        axes[0].plot(x, density, marker="o", linewidth=1.8, **{k: v for k, v in style.items() if k != "label"}, label=style["label"])
-        axes[1].plot(x, jy, marker="o", linewidth=1.8, **{k: v for k, v in style.items() if k != "label"})
+        axes[0].fill_between(
+            x,
+            clip_positive_for_log(density_p16),
+            clip_positive_for_log(density_p84),
+            color=style["color"],
+            alpha=0.18,
+            linewidth=0,
+        )
+        axes[1].fill_between(
+            x,
+            clip_positive_for_log(jy_p16),
+            clip_positive_for_log(jy_p84),
+            color=style["color"],
+            alpha=0.18,
+            linewidth=0,
+        )
+        plot_style = {k: v for k, v in style.items() if k != "label"}
+        axes[0].plot(
+            x,
+            clip_positive_for_log(density),
+            linewidth=1.8,
+            **plot_style,
+            label=style["label"],
+        )
+        axes[1].plot(
+            x,
+            clip_positive_for_log(jy),
+            linewidth=1.8,
+            **plot_style,
+        )
     axes[0].set_ylabel("Density NRMSE")
     axes[1].set_ylabel("Jy NRMSE")
+    axes[0].set_yscale("log")
+    axes[1].set_yscale("log")
     axes[1].set_xlabel("Density visible ratio (%)")
     axes[1].set_xticks(x)
     axes[1].set_xticklabels([format_visible_ratio_percent(ratio) for ratio in ratios])
@@ -1283,6 +1453,107 @@ def find_sliding_step_files(run_dir: Path) -> Tuple[Path, Path] | None:
     return npz_matches[0], json_matches[0]
 
 
+def compute_sliding_aggregate_rmse(
+    ctx: Dict,
+    args: argparse.Namespace,
+    candidate_runs: Sequence[str],
+    slide_steps: Sequence[int],
+    n_frames: int = SLIDING_AGGREGATE_N_FRAMES,
+) -> Tuple[
+    np.ndarray,
+    Dict[str, Dict[int, np.ndarray]],
+    Dict[str, Dict[int, np.ndarray]],
+    Dict[str, Dict[int, np.ndarray]],
+    Dict[str, Dict[int, np.ndarray]],
+    List[str],
+    List[str],
+]:
+    device = ctx["device"]
+    mean = ctx["mean"].reshape(4, 1, 1, 1)
+    std = ctx["std"].reshape(4, 1, 1, 1)
+    betas = ctx["ckpt_args"].get("betas", [0.2])
+    window_size = int(ctx["delta_t"])
+    frame_index = np.arange(int(n_frames), dtype=np.int32)
+    b_keys = ("B_full", "B_hidden")
+    per_rmse: Dict[str, Dict[int, List[np.ndarray]]] = {
+        key: {int(step): [] for step in slide_steps} for key in b_keys
+    }
+    loaded: List[str] = []
+    skipped: List[str] = []
+    for run_name in candidate_runs:
+        n_available = peek_run_n_frames(ctx["h5_dir"], betas, run_name)
+        if n_available is None:
+            print(f"Skipping {run_name}: not found in HDF5")
+            skipped.append(str(run_name))
+            continue
+        if int(n_available) < int(n_frames):
+            print(
+                f"Skipping {run_name}: {n_available} frames < {n_frames}, no padding"
+            )
+            skipped.append(str(run_name))
+            continue
+        fields, _frame_ids, h5_path = find_and_load_run(ctx["h5_dir"], betas, run_name)
+        fields = np.asarray(fields)[: int(n_frames)]
+        print(
+            f"Sliding aggregate RMSE: {run_name} "
+            f"({n_available} frames, using first {n_frames}) from {h5_path}"
+        )
+        target = torch.from_numpy(np.transpose(fields, (1, 0, 2, 3))).to(
+            device=device, dtype=torch.float32
+        )
+        target_normalized = (target - mean) / (std + 1e-8)
+        target_density_plot = target[3].detach().cpu().numpy()
+        generator = torch.Generator().manual_seed(int(args.seed))
+        probe_mask_full, _probe_info = _density_probe_grid(
+            block=target_normalized.unsqueeze(0),
+            target_visible_fraction=float(args.density_visible_fraction),
+            generator=generator,
+        )
+        probe_mask = probe_mask_full[0, 0, 0]
+        for hide_magnetic, b_key in ((False, "B_full"), (True, "B_hidden")):
+            for step in slide_steps:
+                result = reconstruct_with_slide_step(
+                    model=ctx["model"],
+                    target_normalized=target_normalized,
+                    target_density_plot=target_density_plot,
+                    density_mean=mean[3],
+                    density_std=std[3],
+                    probe_mask=probe_mask,
+                    window_size=window_size,
+                    slide_step=int(step),
+                    plot_units="physical",
+                    x_index=int(args.x_index),
+                    amp=True,
+                    hide_magnetic=hide_magnetic,
+                )
+                rmse, _mae = framewise_rmse_mae(
+                    result["final_reconstruction"], target_density_plot
+                )
+                if np.asarray(rmse).shape[0] != int(n_frames):
+                    raise RuntimeError(
+                        f"{run_name} step={step} RMSE length {len(rmse)} != {n_frames}"
+                    )
+                per_rmse[b_key][int(step)].append(np.asarray(rmse, dtype=np.float64))
+        loaded.append(str(run_name))
+    if not loaded:
+        raise RuntimeError(
+            "No validation runs with at least "
+            f"{n_frames} frames were available for sliding aggregate RMSE."
+        )
+    medians: Dict[str, Dict[int, np.ndarray]] = {key: {} for key in b_keys}
+    p16s: Dict[str, Dict[int, np.ndarray]] = {key: {} for key in b_keys}
+    p84s: Dict[str, Dict[int, np.ndarray]] = {key: {} for key in b_keys}
+    stacked_by: Dict[str, Dict[int, np.ndarray]] = {key: {} for key in b_keys}
+    for b_key in b_keys:
+        for step in slide_steps:
+            stacked = np.stack(per_rmse[b_key][int(step)], axis=0)
+            medians[b_key][int(step)] = np.median(stacked, axis=0)
+            p16s[b_key][int(step)] = np.percentile(stacked, 16.0, axis=0)
+            p84s[b_key][int(step)] = np.percentile(stacked, 84.0, axis=0)
+            stacked_by[b_key][int(step)] = stacked
+    return frame_index, medians, p16s, p84s, stacked_by, loaded, skipped
+
+
 def build_sliding_appendix_cache(
     args: argparse.Namespace,
     run_dir: Path,
@@ -1297,6 +1568,8 @@ def build_sliding_appendix_cache(
             "Run visualization.sh sliding analysis first, or place "
             "*_final_reconstructions.npz and *_metrics.json there."
         )
+    if ctx is None:
+        raise RuntimeError("Sliding multi-run RMSE needs inference context.")
     npz_path, json_path = found
     metrics = json.loads(json_path.read_text())
     provenance_error = sliding_provenance_error(
@@ -1312,26 +1585,43 @@ def build_sliding_appendix_cache(
             int(step): np.asarray(handle[f"prediction_step_{step}"])
             for step in metrics["slide_steps"]
         }
-    std_density = None
-    if ctx is not None:
-        std_density = float(ctx["std"].detach().cpu().numpy().reshape(-1)[3])
-    else:
-        std_density = density_std_from_run_dir(run_dir)
+    std_density = float(ctx["std"].detach().cpu().numpy().reshape(-1)[3])
+    slide_steps = [int(step) for step in metrics["slide_steps"]]
+    candidate_runs = validation_run_order(run_dir)
+    if not candidate_runs:
+        raise RuntimeError(f"No validation runs in {run_dir / 'split.json'}")
+    aggregate_runs = select_sliding_aggregate_runs(
+        candidate_runs,
+        int(args.sliding_max_runs),
+    )
+    (
+        aggregate_frames,
+        medians,
+        p16s,
+        p84s,
+        stacked_by,
+        loaded_runs,
+        skipped_runs,
+    ) = compute_sliding_aggregate_rmse(
+        ctx,
+        args,
+        aggregate_runs,
+        slide_steps,
+        n_frames=SLIDING_AGGREGATE_N_FRAMES,
+    )
     arrays = {
         "frame_ids": frame_ids.astype(np.int32),
+        "aggregate_frame_ids": np.asarray(aggregate_frames, dtype=np.int32),
         "target_density": target.astype(np.float32),
         "probe_mask": probe_mask.astype(np.float32),
         "target_tz": project_time_z(target, x_index=args.x_index).astype(np.float32),
     }
     for step, prediction in predictions.items():
-        rmse, mae = framewise_rmse_mae(prediction, target)
         arrays[f"step_{step}_prediction"] = prediction.astype(np.float32)
-        arrays[f"step_{step}_rmse"] = rmse.astype(np.float32)
-        arrays[f"step_{step}_mae"] = mae.astype(np.float32)
         arrays[f"step_{step}_tz"] = project_time_z(
             prediction, x_index=args.x_index
         ).astype(np.float32)
-        if std_density is not None and std_density > 0:
+        if std_density > 0:
             arrays[f"step_{step}_tz_residual"] = (
                 (arrays[f"step_{step}_tz"] - arrays["target_tz"]) / std_density
             ).astype(np.float32)
@@ -1339,6 +1629,19 @@ def build_sliding_appendix_cache(
             arrays[f"step_{step}_tz_residual"] = (
                 arrays[f"step_{step}_tz"] - arrays["target_tz"]
             ).astype(np.float32)
+        for b_key in ("B_full", "B_hidden"):
+            arrays[f"{b_key}_step_{step}_rmse_median"] = np.asarray(
+                medians[b_key][int(step)], dtype=np.float32
+            )
+            arrays[f"{b_key}_step_{step}_rmse_p16"] = np.asarray(
+                p16s[b_key][int(step)], dtype=np.float32
+            )
+            arrays[f"{b_key}_step_{step}_rmse_p84"] = np.asarray(
+                p84s[b_key][int(step)], dtype=np.float32
+            )
+            arrays[f"{b_key}_step_{step}_rmse_per_run"] = np.asarray(
+                stacked_by[b_key][int(step)], dtype=np.float32
+            )
     representative_step = int(min(metrics["slide_steps"]))
     meta = {
         "figure": "sliding_window_appendix",
@@ -1347,9 +1650,27 @@ def build_sliding_appendix_cache(
         "slide_steps": list(metrics["slide_steps"]),
         "representative_step": representative_step,
         "x_index": int(args.x_index),
-        "density_visible_fraction_actual": metrics.get("density_visible_fraction_actual"),
         "run_name": metrics.get("run_name"),
         "plot_units": metrics.get("plot_units"),
+        "left_panel": "multi_run_framewise_rmse",
+        "right_panel": "single_run_qualitative",
+        "qualitative_run": metrics.get("run_name") or args.run_name,
+        "b_conditions": ["B_full", "B_hidden"],
+        "aggregate_n_runs": len(loaded_runs),
+        "aggregate_runs": loaded_runs,
+        "aggregate_skipped_runs": skipped_runs,
+        "statistical_unit": "run",
+        "frame_range": [0, SLIDING_AGGREGATE_N_FRAMES],
+        "n_frames": SLIDING_AGGREGATE_N_FRAMES,
+        "context_length": int(ctx["delta_t"]),
+        "hide_magnetic": True,
+        "density_visible_fraction": float(args.density_visible_fraction),
+        "density_visible_fraction_actual": metrics.get("density_visible_fraction_actual"),
+        "aggregation": (
+            f"{len(loaded_runs)} validation runs; one framewise RMSE series per run "
+            "from frames 0:52, B condition, and slide step; then median and "
+            "16th-84th percentiles across runs"
+        ),
         "source_files": [str(npz_path), str(json_path)],
         "source_checkpoint": str(metrics.get("checkpoint") or checkpoint_path),
         "source_checkpoint_epoch": int(
@@ -1370,6 +1691,7 @@ def plot_sliding_window_appendix(
 ) -> None:
     steps = [int(step) for step in metadata["slide_steps"]]
     frame_ids = arrays["frame_ids"]
+    aggregate_frames = arrays.get("aggregate_frame_ids", frame_ids)
     fig = plt.figure(figsize=(8.4, 4.6))
     gs = gridspec.GridSpec(
         3,
@@ -1384,14 +1706,55 @@ def plot_sliding_window_appendix(
         bottom=0.12,
     )
     ax_err = fig.add_subplot(gs[:, 0])
-    for step in steps:
-        ax_err.plot(frame_ids, arrays[f"step_{step}_rmse"], linewidth=1.6, label=f"step={step}")
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    b_styles = (
+        ("B_full", "-", 0.18),
+        ("B_hidden", "--", 0.08),
+    )
+    for index, step in enumerate(steps):
+        color = colors[index % len(colors)]
+        for b_key, linestyle, alpha in b_styles:
+            ax_err.fill_between(
+                aggregate_frames,
+                arrays[f"{b_key}_step_{step}_rmse_p16"],
+                arrays[f"{b_key}_step_{step}_rmse_p84"],
+                color=color,
+                alpha=alpha,
+                linewidth=0,
+            )
+            ax_err.plot(
+                aggregate_frames,
+                arrays[f"{b_key}_step_{step}_rmse_median"],
+                color=color,
+                linestyle=linestyle,
+                linewidth=1.6,
+            )
     ax_err.set_xlabel("Global frame")
     ax_err.set_ylabel("Frame RMSE")
     ax_err.grid(alpha=0.25, linewidth=0.6)
     ax_err.set_axisbelow(True)
-    ax_err.legend(frameon=False, fontsize=8)
-    ax_err.set_title("B fully hidden", fontsize=10)
+    color_handles = [
+        Line2D(
+            [0],
+            [0],
+            color=colors[index % len(colors)],
+            linewidth=1.6,
+            label=f"step={step}",
+        )
+        for index, step in enumerate(steps)
+    ]
+    style_handles = [
+        Line2D([0], [0], color="0.3", linestyle="-", linewidth=1.6, label="B visible 100%"),
+        Line2D([0], [0], color="0.3", linestyle="--", linewidth=1.6, label="B visible 0%"),
+    ]
+    color_legend = ax_err.legend(
+        handles=color_handles, frameon=False, fontsize=7, loc="upper left"
+    )
+    ax_err.add_artist(color_legend)
+    ax_err.legend(handles=style_handles, frameon=False, fontsize=7, loc="upper right")
+    n_runs = metadata.get("aggregate_n_runs")
+    title = f"{int(n_runs)} validation runs" if n_runs else "Validation runs"
+    ax_err.set_title(title, fontsize=10)
 
     step = int(metadata["representative_step"])
     panels = [
@@ -1543,6 +1906,19 @@ def main() -> None:
             "b_visible": 0.0,
             "density_visible_fraction": float(args.density_visible_fraction),
             "x_index": int(args.x_index),
+            "left_panel": "multi_run_framewise_rmse",
+            "right_panel": "single_run_qualitative",
+            "statistical_unit": "run",
+            "sliding_max_runs": int(args.sliding_max_runs),
+            "selected_runs": select_sliding_aggregate_runs(
+                validation_run_order(run_dir),
+                int(args.sliding_max_runs),
+            ),
+            "b_conditions": ["B_full", "B_hidden"],
+            "min_run_frames": SLIDING_AGGREGATE_N_FRAMES,
+            "frame_range": [0, SLIDING_AGGREGATE_N_FRAMES],
+            "val_run_order": validation_run_order(run_dir),
+            "context_length": 24,
         }
         found = find_sliding_step_files(run_dir)
         if found is not None:
@@ -1684,7 +2060,7 @@ def main() -> None:
             FIGURE_STEMS["sliding"],
             sliding_signature(),
             builder=lambda: build_sliding_appendix_cache(
-                args, run_dir, ctx, checkpoint_path, checkpoint_epoch
+                args, run_dir, ensure_ctx(), checkpoint_path, checkpoint_epoch
             ),
             force=args.force_recompute,
             provenance=provenance,

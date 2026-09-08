@@ -21,17 +21,25 @@ from make_paper_figures import (  # noqa: E402
     base_signature,
     build_magnetic_ablation_cache,
     build_paired_b_condition_cache,
+    clip_positive_for_log,
+    density_nrmse_from_residual,
     density_visible_ratio,
+    format_density_nrmse_label,
     load_figure_cache,
     load_or_build_figure_cache,
     local_index_for_global_frame,
     manifest_figure_entry,
+    paper_signatures_match,
     plot_density_forecast_summary,
     plot_density_superres_summary,
     plot_magnetic_ablation_summary,
+    plot_sliding_window_appendix,
     plot_spatial_qualitative,
+    select_sliding_aggregate_runs,
     sliding_provenance_error,
+    stack_rmse_by_global_frame,
     try_load_validation_json,
+    validation_run_order,
 )
 
 
@@ -432,3 +440,137 @@ def test_manifest_records_per_figure_checkpoint_path_and_epoch(tmp_path):
         item["source_checkpoint"] and item["source_checkpoint_epoch"] == 4500
         for item in manifest["figure_provenance"]
     )
+
+
+def test_spatial_prediction_and_residual_are_full_field(tmp_path):
+    target = np.ones((6, 5), dtype=np.float32) * 2.0
+    prediction = target + 0.4
+    residual = np.full_like(target, 0.25)
+    visible = target.copy()
+    visible[:, 3:] = np.nan
+    arrays = {"target_density": target}
+    for name in SPATIAL_ROW_ORDER:
+        arrays[f"{name}_visible"] = visible
+        arrays[f"{name}_prediction"] = prediction
+        arrays[f"{name}_residual"] = residual
+        arrays[f"{name}_mask"] = np.isfinite(visible).astype(np.float32)
+    assert np.all(np.isfinite(prediction))
+    assert np.all(np.isfinite(residual))
+    assert abs(density_nrmse_from_residual(residual) - 0.25) < 1e-6
+    assert format_density_nrmse_label(0.25) == "NRMSE = 0.25"
+    n_rows, n_cols = plot_spatial_qualitative(
+        arrays,
+        {
+            "row_names": list(SPATIAL_ROW_ORDER),
+            "global_frame": 45,
+            "rows": [
+                {"name": name, "density_nrmse": 0.25} for name in SPATIAL_ROW_ORDER
+            ],
+        },
+        tmp_path,
+        extent=[-1.0, 1.0, -1.0, 1.0],
+        residual_vmax=1.0,
+        field_q=99.0,
+        dpi=80,
+    )
+    assert (n_rows, n_cols) == (4, 4)
+
+
+def test_clip_positive_for_log_avoids_nonpositive():
+    clipped = clip_positive_for_log(np.array([0.0, -1.0, 0.5]))
+    assert np.all(clipped > 0)
+    assert clipped[-1] == 0.5
+
+
+def test_select_sliding_aggregate_runs_uses_split_order():
+    assert select_sliding_aggregate_runs(
+        ["short", "long_a", "canonical", "long_b"], max_runs=2
+    ) == ["short", "long_a"]
+    assert select_sliding_aggregate_runs(["b", "a", "c"], max_runs=2) == ["b", "a"]
+
+
+def test_sliding_first_52_frames_skips_short_and_drops_later_frames():
+    def first_52_or_skip(n_frames: int) -> tuple[int, int] | None:
+        if n_frames < 52:
+            return None
+        return (0, 52)
+
+    assert first_52_or_skip(51) is None
+    assert first_52_or_skip(52) == (0, 52)
+    assert first_52_or_skip(104) == (0, 52)
+    assert first_52_or_skip(130) == (0, 52)
+
+
+def test_validation_run_order_preserves_split_json(tmp_path):
+    (tmp_path / "split.json").write_text(
+        json.dumps({"val_runs": ["run_b", "run_a"], "train_runs": []})
+    )
+    assert validation_run_order(tmp_path) == ["run_b", "run_a"]
+
+
+def test_stack_rmse_aligns_global_frames():
+    frames, stacked = stack_rmse_by_global_frame(
+        [np.array([0, 1]), np.array([1, 2])],
+        [np.array([10.0, 20.0]), np.array([30.0, 40.0])],
+    )
+    np.testing.assert_array_equal(frames, [0, 1, 2])
+    assert np.isnan(stacked[0, 2])
+    assert stacked[1, 1] == 30.0
+
+
+def test_sliding_signature_change_invalidates_old_single_run_cache():
+    old = {
+        "cache_version": 2,
+        "figure": "sliding",
+        "slide_steps": [8, 4, 2, 1],
+    }
+    new = {
+        **old,
+        "cache_version": 6,
+        "left_panel": "multi_run_framewise_rmse",
+        "right_panel": "single_run_qualitative",
+        "statistical_unit": "run",
+        "sliding_max_runs": 16,
+        "b_conditions": ["B_full", "B_hidden"],
+        "frame_range": [0, 52],
+    }
+    assert not paper_signatures_match(old, new)
+
+
+def test_compatible_cache_versions_reuse_unchanged_signatures():
+    stored = {"cache_version": 2, "figure": "forecast", "histories": [23]}
+    current = {"cache_version": 6, "figure": "forecast", "histories": [23]}
+    assert paper_signatures_match(stored, current)
+
+
+def test_sliding_plot_uses_segment_rmse_and_both_b_conditions(tmp_path):
+    frames = np.arange(52)
+    arrays = {
+        "frame_ids": frames,
+        "aggregate_frame_ids": frames,
+        "target_tz": np.zeros((52, 6), dtype=np.float32),
+        "step_1_tz": np.zeros((52, 6), dtype=np.float32),
+        "step_1_tz_residual": np.zeros((52, 6), dtype=np.float32),
+    }
+    for step in (8, 4, 2, 1):
+        median = np.linspace(0.1, 0.2, 52)
+        for b_key in ("B_full", "B_hidden"):
+            arrays[f"{b_key}_step_{step}_rmse_median"] = median
+            arrays[f"{b_key}_step_{step}_rmse_p16"] = median * 0.8
+            arrays[f"{b_key}_step_{step}_rmse_p84"] = median * 1.2
+    plot_sliding_window_appendix(
+        arrays,
+        {
+            "slide_steps": [8, 4, 2, 1],
+            "representative_step": 1,
+            "aggregate_n_runs": 16,
+            "frame_range": [0, 52],
+            "b_conditions": ["B_full", "B_hidden"],
+            "statistical_unit": "run",
+        },
+        tmp_path,
+        extent=[-21.0, 21.0, -50.0, 50.0],
+        dpi=80,
+    )
+    assert (tmp_path / f"{FIGURE_STEMS['sliding']}.png").exists()
+    assert (tmp_path / f"{FIGURE_STEMS['sliding']}.pdf").exists()
