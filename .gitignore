@@ -12,6 +12,11 @@
 *.mp4
 *.gif
 
+# Curated paper-figure PNGs for GitHub README rendering.
+!assets/
+!assets/paper_figures/
+!assets/paper_figures/*.png
+
 # logs
 logs/
 *.out

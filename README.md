@@ -316,23 +316,23 @@ reconstruction quality → multimodal transfer → sparse-observation scaling �
 
 **Spatial qualitative reconstruction.** 4×4：Target / Visible / Prediction / Residual。B fully observed；Density 用 multifunction 的 standardized ~50% 几何（random 精确一半、grid 为 checkerboard、block 为居中矩形 inpainting/outpainting）。Prediction 是模型 raw full-field 输出，visible 位置也不粘贴 GT；Residual 是全场 `pred_norm - target_norm`。random / grid / inpainting 的 Density NRMSE 约为 0.066–0.073，outpainting 约 0.126。误差主要集中在强结构和边界附近。适合作为正文 qualitative figure。
 
-![Spatial qualitative reconstruction](runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v15_orientedSpatialBlock_independentBD_logUniformCounts_attention_spatialpool_b8_e4500/paper_figures_v1/figures/spatial_qualitative.png)
+![Spatial qualitative reconstruction](assets/paper_figures/spatial_qualitative.png)
 
 **Magnetic ablation / cross-modal reconstruction.** 1×2（Density NRMSE | Jy NRMSE），share y、log y。B visible 为 nested 0 / 0.1 / 0.3 / 1 / 3 / 10 / 30 / 100%。先抽一份 spatial ranking，低可见集合是高可见集合的 subset；Density fully hidden 与 Density 100% 是同一组 mask 的 clone，只改 Density 通道，并且这套 ranking 套到每一个 validation window。线型：Density hidden 为 `C0` 实线圆点，Density 100% 为 `C1` 虚线三角。Density fully hidden 时，极少 B probes 就能显著降低 Density error：从 B=0 时接近 NRMSE 0.9，降到 0.1% B 时约 0.1，并在约 1% B 后逐渐接近饱和。Density fully visible 时，即使 B 很少，Density reconstruction 也几乎保持在很低的 error floor。对 \(J_y\)，完整 Density 在 B 极少或完全缺失时有明显帮助，但 B probe 增多后两种 Density condition 的 Jy error 逐渐接近；B=100% 时 Jy error 最低。这是目前最强的 bidirectional multimodal information transfer 证据之一。
 
-![Magnetic ablation summary](runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v15_orientedSpatialBlock_independentBD_logUniformCounts_attention_spatialpool_b8_e4500/paper_figures_v1/figures/magnetic_ablation_summary.png)
+![Magnetic ablation summary](assets/paper_figures/magnetic_ablation_summary.png)
 
 **Density super-resolution.** 同样 1×2、share y、log y。x 轴是 `Density visible ratio (%)`，对应精确 probe 数 0 / 10 / 100 / 1000（在 `(X,Z)=(154,62)` 上约为 0 / 0.105 / 1.05 / 10.47%）。B 100% 为 `C0` 实线圆点，B 0% 为 `C1` 虚线三角。B fully observed 时，即使没有 Density probes，Density NRMSE 已经只有约 0.06，继续增加 Density probes 的边际收益很小。B completely hidden 时，Density probes 的作用非常明显：从 0 probes 时接近 NRMSE 0.9，增加到约 0.1% visibility 后大幅下降，到约 1% visibility 时已经接近 B-full 的 Density reconstruction 水平。Jy 不同：没有 B 时，即使有 10.47% Density probes，Jy error 仍明显高于 B-full case。Density 相对容易从稀疏 Density/B 信息恢复，而 magnetic/current structure 对直接 magnetic observations 更敏感。
 
-![Density super-resolution summary](runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v15_orientedSpatialBlock_independentBD_logUniformCounts_attention_spatialpool_b8_e4500/paper_figures_v1/figures/density_superres_summary.png)
+![Density super-resolution summary](assets/paper_figures/density_superres_summary.png)
 
 **Density forecast.** 1×2、share y、log y。Density prefix 为 23 / 18 / 12 / 6 帧（horizon 1 / 6 / 12 / 18），每条曲线同时画 B 100%（实线）和 B 0%（虚线），颜色表示 horizon。x 轴是 24-frame context 内的 local frame。在 Density observable prefix 内，Density error 很低；进入 forecast region 后 error 会明显上升。完整 B conditioning 能显著抑制长 horizon 的 Density forecast error，而 B hidden 时误差随 forecast horizon 增长得更明显。Jy 的差异更强：B hidden 时 Jy NRMSE 明显高于 B-full，并随 forecast 深度增加而恶化。B-full 时 Jy error 不为 0，是因为模型没有 hard clamp visible B，且 Jy 由预测 B 的空间导数计算得到。
 
-![Density forecast summary](runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v15_orientedSpatialBlock_independentBD_logUniformCounts_attention_spatialpool_b8_e4500/paper_figures_v1/figures/density_forecast_summary.png)
+![Density forecast summary](assets/paper_figures/density_forecast_summary.png)
 
 **Sliding-window long sequence reconstruction.** 与第 7 节 GIF 诊断不同：paper appendix 用精确 1000-count Density grid（与 superres 最右点相同，50×20，10.47% visibility），slide steps 为 1 / 12 / 24，只取每个 run 的前 48 帧且不 padding，短于 48 帧的 run 跳过。统计单位是 run：每个 run 一条 framewise RMSE，再跨 run 取 median 和 p16–p84。左列是 Target + RMSE；右两列是 canonical run、B hidden 的 Prediction / Residual。legend 中 `step=…  a / b` 是该 step 上 cross-run median 曲线对 48 帧的时间平均（B100 / B0）。当前 cache 在 `--sliding-max-runs 25` 下实际用了 18 个足够长的 validation runs。step=12 和 step=24 的平均 frame RMSE 基本一致，并且低于 step=1，大约是 0.020 / 0.022（step=1）对 0.017 / 0.017（step=12 和 24）。canonical example 的 48-frame NRMSE 也是 step=12/24 略优于 step=1。更高 overlap / 更频繁 recursive reuse 并不一定更好，step=1 反而更容易积累误差。这张图放 appendix，不进正文。
 
-![Sliding-window appendix](runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v15_orientedSpatialBlock_independentBD_logUniformCounts_attention_spatialpool_b8_e4500/paper_figures_v1/figures/sliding_window_appendix.png)
+![Sliding-window appendix](assets/paper_figures/sliding_window_appendix.png)
 
 ## 7. 整 run sliding Density reconstruction
 
