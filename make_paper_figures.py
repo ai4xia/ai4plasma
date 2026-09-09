@@ -64,8 +64,8 @@ from visualize_sliding_density_reconstruction import (
 )
 
 
-PAPER_CACHE_VERSION = 9
-COMPATIBLE_PAPER_CACHE_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8, 9)
+PAPER_CACHE_VERSION = 11
+COMPATIBLE_PAPER_CACHE_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)
 PAPER_DIRNAME = "paper_figures_v1"
 DEFAULT_GLOBAL_FRAME = 45
 DEFAULT_SLIDE_STEPS = (1, 12, 24)
@@ -120,6 +120,14 @@ EXPECTED_MAGNETIC_ROW_NAMES = tuple(
     f"magnetic_ablation_{percent / 100.0:g}"
     for percent in DEFAULT_MAGNETIC_ABLATION_VISIBLE_PERCENTS
 )
+MAGNETIC_DENSITY_CONDITIONS = (
+    ("density_hidden", "Density fully hidden"),
+    ("density_full", "Density visible 100%"),
+)
+SUPERRES_B_CONDITION_STYLES = {
+    "B_full": dict(color="C0", linestyle="-", marker="o", label="B visible 100%"),
+    "B_hidden": dict(color="C1", linestyle="--", marker="^", label="B visible 0%"),
+}
 
 DENSITY_NRMSE_DEFINITION = (
     "RMS of (prediction_normalized - target_normalized) on the Density channel"
@@ -1097,6 +1105,76 @@ def plot_spatial_qualitative(
 # ---------------------------------------------------------------------------
 
 
+def _magnetic_ablation_rows_from_stats(stats: Sequence[Dict]) -> List[Dict]:
+    rows = []
+    for row in stats:
+        rows.append(
+            {
+                "name": row["name"],
+                "visible_fraction": parse_trailing_number(row["name"]),
+                "density": summarize_run_scalars(
+                    {
+                        name: profile.tolist()
+                        for name, profile in zip(
+                            row["density"]["run_names"],
+                            row["density"]["run_profiles"],
+                        )
+                    }
+                ),
+                "jy": summarize_run_scalars(
+                    {
+                        name: profile.tolist()
+                        for name, profile in zip(
+                            row["jy"]["run_names"],
+                            row["jy"]["run_profiles"],
+                        )
+                    }
+                ),
+            }
+        )
+    rows.sort(key=lambda item: item["visible_fraction"])
+    return rows
+
+
+def _magnetic_ablation_rows_from_payload(payload: Dict) -> List[Dict]:
+    rows = []
+    for row in payload["rows"]:
+        rows.append(
+            {
+                "name": row["name"],
+                "visible_fraction": parse_trailing_number(row["name"]),
+                "density": summarize_run_scalars(_profiles_from_val_row(row, "density")),
+                "jy": summarize_run_scalars(_profiles_from_val_row(row, "jy")),
+            }
+        )
+    rows.sort(key=lambda item: item["visible_fraction"])
+    return rows
+
+
+def _pack_magnetic_condition(rows: Sequence[Dict], prefix: str) -> Dict[str, np.ndarray]:
+    return {
+        f"{prefix}_density_median": np.asarray([row["density"]["median"] for row in rows]),
+        f"{prefix}_density_p16": np.asarray([row["density"]["p16"] for row in rows]),
+        f"{prefix}_density_p84": np.asarray([row["density"]["p84"] for row in rows]),
+        f"{prefix}_jy_median": np.asarray([row["jy"]["median"] for row in rows]),
+        f"{prefix}_jy_p16": np.asarray([row["jy"]["p16"] for row in rows]),
+        f"{prefix}_jy_p84": np.asarray([row["jy"]["p84"] for row in rows]),
+        f"{prefix}_density_per_run": np.asarray([row["density"]["per_run"] for row in rows]),
+        f"{prefix}_jy_per_run": np.asarray([row["jy"]["per_run"] for row in rows]),
+    }
+
+
+def _magnetic_ablation_masks_with_density_full(
+    mask_rows: Sequence[Tuple[str, str, torch.Tensor]],
+) -> List[Tuple[str, str, torch.Tensor]]:
+    filled = []
+    for name, label, mask in mask_rows:
+        mask_full = mask.clone()
+        mask_full[:, 3:4] = 1.0
+        filled.append((name, label, mask_full))
+    return filled
+
+
 def build_magnetic_ablation_cache(
     args: argparse.Namespace,
     run_dir: Path,
@@ -1104,141 +1182,137 @@ def build_magnetic_ablation_cache(
     ctx: Dict | None,
     checkpoint_epoch: int,
 ) -> Tuple[Dict, Dict]:
-    payload = None if args.force_recompute else try_load_validation_json(
-        run_dir,
-        checkpoint_path,
-        "magnetic_ablation",
-        hide_magnetic=False,
-        checkpoint_epoch=checkpoint_epoch,
-    )
-    source = "validation_json"
-    source_files: List[str] = []
-    if payload is None:
-        if ctx is None:
-            raise RuntimeError("Magnetic ablation cache needs inference context.")
-        sample, y = select_named_window(ctx, args)
-        generator = torch.Generator().manual_seed(args.seed)
-        mask_rows = build_magnetic_ablation_rows(
-            block=y,
-            magnetic_visible_fractions=list(DEFAULT_MAGNETIC_ABLATION_VISIBLE_FRACTIONS),
-            generator=generator,
+    if ctx is None:
+        raise RuntimeError(
+            "Magnetic ablation paired density conditions need inference context."
         )
-        stats = collect_experiment_statistics(
-            ctx,
-            args,
-            {"magnetic_ablation": row_dicts_from_masks(mask_rows)},
-        )["magnetic_ablation"]
-        rows = []
-        for row in stats:
-            rows.append(
-                {
-                    "name": row["name"],
-                    "visible_fraction": parse_trailing_number(row["name"]),
-                    "density": summarize_run_scalars(
-                        {
-                            name: profile.tolist()
-                            for name, profile in zip(
-                                row["density"]["run_names"],
-                                row["density"]["run_profiles"],
-                            )
-                        }
-                    ),
-                    "jy": summarize_run_scalars(
-                        {
-                            name: profile.tolist()
-                            for name, profile in zip(
-                                row["jy"]["run_names"],
-                                row["jy"]["run_profiles"],
-                            )
-                        }
-                    ),
-                }
-            )
-        source = "collect_validation_statistics"
-        run_count = len(rows[0]["density"]["run_names"]) if rows else 0
-    else:
-        rows = []
-        for row in payload["rows"]:
-            visible_fraction = parse_trailing_number(row["name"])
-            rows.append(
-                {
-                    "name": row["name"],
-                    "visible_fraction": visible_fraction,
-                    "density": summarize_run_scalars(_profiles_from_val_row(row, "density")),
-                    "jy": summarize_run_scalars(_profiles_from_val_row(row, "jy")),
-                }
-            )
-        run_count = int(payload.get("run_count", len(rows[0]["density"]["run_names"])))
-        source_files = [str(payload.get("_source_json"))]
-
-    rows.sort(key=lambda item: item["visible_fraction"])
-    percents = np.asarray(
-        [100.0 * float(row["visible_fraction"]) for row in rows], dtype=np.float64
+    _sample, y = select_named_window(ctx, args)
+    generator = torch.Generator().manual_seed(args.seed)
+    base_rows = build_magnetic_ablation_rows(
+        block=y,
+        magnetic_visible_fractions=list(DEFAULT_MAGNETIC_ABLATION_VISIBLE_FRACTIONS),
+        generator=generator,
     )
-    arrays = {
-        "b_visible_percent": percents,
-        "density_median": np.asarray([row["density"]["median"] for row in rows]),
-        "density_p16": np.asarray([row["density"]["p16"] for row in rows]),
-        "density_p84": np.asarray([row["density"]["p84"] for row in rows]),
-        "jy_median": np.asarray([row["jy"]["median"] for row in rows]),
-        "jy_p16": np.asarray([row["jy"]["p16"] for row in rows]),
-        "jy_p84": np.asarray([row["jy"]["p84"] for row in rows]),
-        "density_per_run": np.asarray([row["density"]["per_run"] for row in rows]),
-        "jy_per_run": np.asarray([row["jy"]["per_run"] for row in rows]),
-    }
+    full_rows_masks = _magnetic_ablation_masks_with_density_full(base_rows)
+    stats = collect_experiment_statistics(
+        ctx,
+        args,
+        {
+            "magnetic_ablation": row_dicts_from_masks(base_rows),
+            "magnetic_ablation_density_full": row_dicts_from_masks(full_rows_masks),
+        },
+    )
+    hidden_rows = _magnetic_ablation_rows_from_stats(stats["magnetic_ablation"])
+    full_rows = _magnetic_ablation_rows_from_stats(stats["magnetic_ablation_density_full"])
+    percents = np.asarray(
+        [100.0 * float(row["visible_fraction"]) for row in hidden_rows],
+        dtype=np.float64,
+    )
+    full_percents = np.asarray(
+        [100.0 * float(row["visible_fraction"]) for row in full_rows],
+        dtype=np.float64,
+    )
+    if not np.allclose(percents, full_percents):
+        raise RuntimeError("Magnetic ablation B-visible levels differ across density conditions.")
+    arrays = {"b_visible_percent": percents}
+    arrays.update(_pack_magnetic_condition(hidden_rows, "density_hidden"))
+    arrays.update(_pack_magnetic_condition(full_rows, "density_full"))
+    run_count = len(hidden_rows[0]["density"]["run_names"]) if hidden_rows else 0
     meta = {
         "figure": "magnetic_ablation_summary",
-        "source": source,
-        "density_visible": 0.0,
+        "source": {
+            "density_hidden": "collect_validation_statistics",
+            "density_full": "collect_validation_statistics",
+        },
+        "density_conditions": ["fully_hidden", "visible_100"],
+        "shared_b_probe_layout": True,
+        "b_probe_layout": (
+            "single nested spatial ranking cloned across Density hidden and "
+            "Density 100%; same ranking applied to every validation window"
+        ),
         "b_visible_percents": percents.tolist(),
-        "n_levels": len(rows),
+        "n_levels": len(hidden_rows),
         "run_count": run_count,
-        "rows": rows,
+        "rows": {"density_hidden": hidden_rows, "density_full": full_rows},
         "density_nrmse_definition": DENSITY_NRMSE_DEFINITION,
         "jy_nrmse_definition": JY_NRMSE_DEFINITION,
         "jy_definition": JY_STATS_DEFINITION,
         "interval": "median and 16th-84th percentile range",
-        "source_files": source_files,
+        "source_files": [],
     }
     return arrays, meta
 
 
-def plot_magnetic_ablation_summary(arrays: Dict, metadata: Dict, figures_dir: Path, dpi: int) -> None:
+def plot_magnetic_ablation_summary(arrays: Dict, metadata: Dict, figures_dir: Path, dpi: int) -> Dict:
     percents = np.asarray(arrays["b_visible_percent"])
     x = np.arange(len(percents))
     labels = [f"{value:g}" for value in percents]
-    fig, axes = plt.subplots(2, 1, figsize=(5.6, 5.6), sharex=True)
-    series = (
-        (axes[0], "Density NRMSE", "density_median", "density_p16", "density_p84"),
-        (axes[1], "Jy NRMSE", "jy_median", "jy_p16", "jy_p84"),
-    )
-    for ax, ylabel, med_key, p16_key, p84_key in series:
-        ax.fill_between(
-            x,
-            clip_positive_for_log(arrays[p16_key]),
-            clip_positive_for_log(arrays[p84_key]),
-            color="C0",
-            alpha=0.22,
-            linewidth=0,
-        )
-        ax.plot(
-            x,
-            clip_positive_for_log(arrays[med_key]),
-            color="C0",
-            marker="o",
-            linewidth=1.8,
-            markersize=5,
-        )
-        ax.set_ylabel(ylabel)
+    fig, axes = plt.subplots(1, 2, figsize=(9.6, 3.8), sharey=True)
+    styles = {
+        "density_hidden": dict(
+            color="C0", linestyle="-", marker="o", label="Density fully hidden"
+        ),
+        "density_full": dict(
+            color="C1", linestyle="--", marker="^", label="Density visible 100%"
+        ),
+    }
+    plotted = []
+    for prefix, style in styles.items():
+        plot_style = {k: v for k, v in style.items() if k != "label"}
+        for ax, metric, labeled in (
+            (axes[0], "density", True),
+            (axes[1], "jy", False),
+        ):
+            med = clip_positive_for_log(arrays[f"{prefix}_{metric}_median"])
+            lo = clip_positive_for_log(arrays[f"{prefix}_{metric}_p16"])
+            hi = clip_positive_for_log(arrays[f"{prefix}_{metric}_p84"])
+            plotted.extend([med, lo, hi])
+            ax.fill_between(
+                x,
+                lo,
+                hi,
+                color=style["color"],
+                alpha=0.18,
+                linewidth=0.4,
+                edgecolor="black",
+            )
+            ax.plot(
+                x,
+                med,
+                linewidth=1.8,
+                markersize=5,
+                **plot_style,
+                label=style["label"] if labeled else None,
+            )
+    stacked = np.concatenate([np.asarray(values, dtype=np.float64).ravel() for values in plotted])
+    stacked = stacked[np.isfinite(stacked) & (stacked > 0)]
+    if stacked.size == 0:
+        ymin, ymax = LOG_Y_FLOOR, 1.0
+    else:
+        ymin = max(LOG_Y_FLOOR, float(np.min(stacked))) / 1.2
+        ymax = float(np.max(stacked)) * 1.2
+    titles = ("Density NRMSE", "Jy NRMSE")
+    for ax, title in zip(axes, titles):
+        ax.set_title(title, fontsize=10)
         ax.set_yscale("log")
+        ax.set_ylim(ymin, ymax)
+        ax.set_xlabel("B visible (%)")
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels)
         ax.grid(alpha=0.25, linewidth=0.6)
         ax.set_axisbelow(True)
-    axes[1].set_xticks(x)
-    axes[1].set_xticklabels(labels)
-    axes[1].set_xlabel("B visible (%)")
-    fig.suptitle("Density fully hidden", fontsize=10, y=0.98)
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
+    axes[0].set_ylabel("NRMSE")
+    axes[0].legend(frameon=False, fontsize=8)
+    fig.tight_layout()
+    ylims = (axes[0].get_ylim(), axes[1].get_ylim())
     save_png_pdf(fig, figures_dir, FIGURE_STEMS["magnetic_ablation"], dpi)
+    return {
+        "layout": (1, 2),
+        "titles": list(titles),
+        "sharey": True,
+        "ylims": ylims,
+        "density_conditions": [label for _prefix, label in MAGNETIC_DENSITY_CONDITIONS],
+    }
 
 
 def _forecast_or_superres_from_stats_rows(stats_rows: List[Dict], kind: str) -> List[Dict]:
@@ -1481,7 +1555,7 @@ def plot_density_superres_summary(
     dpi: int,
     size_x: int,
     size_z: int,
-) -> None:
+) -> Dict:
     full_rows = sorted(metadata["rows"]["B_full"], key=lambda row: int(row["probe_count"]))
     probe_counts = [int(row["probe_count"]) for row in full_rows]
     ratios = [100.0 * density_visible_ratio(count, size_x, size_z) for count in probe_counts]
@@ -1489,64 +1563,92 @@ def plot_density_superres_summary(
     metadata["size_z"] = int(size_z)
     metadata["visible_ratio_percent"] = ratios
     x = np.arange(len(probe_counts))
-    fig, axes = plt.subplots(2, 1, figsize=(5.8, 5.8), sharex=True)
-    styles = {
-        "B_full": dict(color="C0", linestyle="-", marker="o", label="B visible 100%"),
-        "B_hidden": dict(color="C0", linestyle="--", marker="^", label="B visible 0%"),
-    }
+    fig, axes = plt.subplots(1, 2, figsize=(9.6, 3.8), sharey=True)
+    styles = SUPERRES_B_CONDITION_STYLES
+    plotted = []
     for key, style in styles.items():
         rows_by_count = {
             int(row["probe_count"]): row for row in metadata["rows"][key]
         }
-        density = [rows_by_count[count]["density_summary"]["median"] for count in probe_counts]
-        density_p16 = [rows_by_count[count]["density_summary"]["p16"] for count in probe_counts]
-        density_p84 = [rows_by_count[count]["density_summary"]["p84"] for count in probe_counts]
-        jy = [rows_by_count[count]["jy_summary"]["median"] for count in probe_counts]
-        jy_p16 = [rows_by_count[count]["jy_summary"]["p16"] for count in probe_counts]
-        jy_p84 = [rows_by_count[count]["jy_summary"]["p84"] for count in probe_counts]
-        axes[0].fill_between(
-            x,
-            clip_positive_for_log(density_p16),
-            clip_positive_for_log(density_p84),
-            color=style["color"],
-            alpha=0.18,
-            linewidth=0,
+        density = clip_positive_for_log(
+            [rows_by_count[count]["density_summary"]["median"] for count in probe_counts]
         )
-        axes[1].fill_between(
-            x,
-            clip_positive_for_log(jy_p16),
-            clip_positive_for_log(jy_p84),
-            color=style["color"],
-            alpha=0.18,
-            linewidth=0,
+        density_p16 = clip_positive_for_log(
+            [rows_by_count[count]["density_summary"]["p16"] for count in probe_counts]
         )
+        density_p84 = clip_positive_for_log(
+            [rows_by_count[count]["density_summary"]["p84"] for count in probe_counts]
+        )
+        jy = clip_positive_for_log(
+            [rows_by_count[count]["jy_summary"]["median"] for count in probe_counts]
+        )
+        jy_p16 = clip_positive_for_log(
+            [rows_by_count[count]["jy_summary"]["p16"] for count in probe_counts]
+        )
+        jy_p84 = clip_positive_for_log(
+            [rows_by_count[count]["jy_summary"]["p84"] for count in probe_counts]
+        )
+        plotted.extend([density, density_p16, density_p84, jy, jy_p16, jy_p84])
         plot_style = {k: v for k, v in style.items() if k != "label"}
-        axes[0].plot(
-            x,
-            clip_positive_for_log(density),
-            linewidth=1.8,
-            **plot_style,
-            label=style["label"],
-        )
-        axes[1].plot(
-            x,
-            clip_positive_for_log(jy),
-            linewidth=1.8,
-            **plot_style,
-        )
-    axes[0].set_ylabel("Density NRMSE")
-    axes[1].set_ylabel("Jy NRMSE")
-    axes[0].set_yscale("log")
-    axes[1].set_yscale("log")
-    axes[1].set_xlabel("Density visible ratio (%)")
-    axes[1].set_xticks(x)
-    axes[1].set_xticklabels([format_visible_ratio_percent(ratio) for ratio in ratios])
-    for ax in axes:
+        for ax, lo, hi, mid, labeled in (
+            (axes[0], density_p16, density_p84, density, True),
+            (axes[1], jy_p16, jy_p84, jy, False),
+        ):
+            ax.fill_between(
+                x,
+                lo,
+                hi,
+                color=style["color"],
+                alpha=0.18,
+                linewidth=0.4,
+                edgecolor="black",
+            )
+            ax.plot(
+                x,
+                mid,
+                linewidth=1.8,
+                markersize=5,
+                **plot_style,
+                label=style["label"] if labeled else None,
+            )
+    stacked = np.concatenate([np.asarray(values, dtype=np.float64).ravel() for values in plotted])
+    stacked = stacked[np.isfinite(stacked) & (stacked > 0)]
+    if stacked.size == 0:
+        ymin, ymax = LOG_Y_FLOOR, 1.0
+    else:
+        ymin = max(LOG_Y_FLOOR, float(np.min(stacked))) / 1.2
+        ymax = float(np.max(stacked)) * 1.2
+    titles = ("Density NRMSE", "Jy NRMSE")
+    xticklabels = [format_visible_ratio_percent(ratio) for ratio in ratios]
+    for ax, title in zip(axes, titles):
+        ax.set_title(title, fontsize=10)
+        ax.set_yscale("log")
+        ax.set_ylim(ymin, ymax)
+        ax.set_xlabel("Density visible ratio (%)")
+        ax.set_xticks(x)
+        ax.set_xticklabels(xticklabels)
         ax.grid(alpha=0.25, linewidth=0.6)
         ax.set_axisbelow(True)
+    axes[0].set_ylabel("NRMSE")
     axes[0].legend(frameon=False, fontsize=8)
     fig.tight_layout()
+    ylims = (axes[0].get_ylim(), axes[1].get_ylim())
     save_png_pdf(fig, figures_dir, FIGURE_STEMS["superres"], dpi)
+    return {
+        "layout": (1, 2),
+        "titles": list(titles),
+        "sharey": True,
+        "ylims": ylims,
+        "b_condition_styles": {
+            key: {
+                "color": style["color"],
+                "linestyle": style["linestyle"],
+                "marker": style["marker"],
+                "label": style["label"],
+            }
+            for key, style in styles.items()
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2143,7 +2245,9 @@ def main() -> None:
         return {
             **sig_base,
             "figure": "magnetic_ablation",
-            "density_visible": 0.0,
+            "density_conditions": ["fully_hidden", "visible_100"],
+            "shared_b_probe_layout": True,
+            "layout": "1x2_density_jy",
             "b_visible_levels": list(DEFAULT_MAGNETIC_ABLATION_VISIBLE_PERCENTS),
         }
 
@@ -2161,6 +2265,7 @@ def main() -> None:
             "figure": "superres",
             "probe_counts": [int(value) for value in args.density_probe_counts],
             "b_conditions": ["B_full", "B_hidden"],
+            "line_style": "two_color_b_conditions",
         }
 
     def sliding_signature() -> Dict:

@@ -1,6 +1,6 @@
 # AI4Plasma：VPIC 四场时空重建
 
-本文档记录仓库截至 2026-08-28 的实际实现、当前训练结果和下一步实验计划。当前模型使用稀疏或缺失的磁场与密度观测，同时重建完整的 `Bx`、`By`、`Bz` 和 `Density` 时空块；它既可用于单个 24 帧窗口，也可通过递归 sliding window 重建一个更长的 VPIC run。
+本文档记录仓库截至 2026-09-08 的实际实现、当前训练结果和下一步实验计划。当前正式 checkpoint 是 v15 `latest.pt`（epoch 4500）。模型使用稀疏或缺失的磁场与密度观测，同时重建完整的 `Bx`、`By`、`Bz` 和 `Density` 时空块；它既可用于单个 24 帧窗口，也可通过递归 sliding window 重建一个更长的 VPIC run。
 
 ## 1. 当前功能概览
 
@@ -20,7 +20,7 @@ VPIC CSV
 
 核心用途包括：
 
-- 四种缺失模式下的通用场重建；
+- 五种缺失模式下的通用场重建；
 - 稀疏 Density probes 的空间 super-resolution；
 - 改变磁场可见比例，分析磁场对 Density 重建的贡献；
 - 在完整磁场已知时，对窗口末端 Density 做条件时间外推；
@@ -101,15 +101,16 @@ train/validation 是按完整 `run_name` 划分，而不是随机拆分窗口。
 | base channels | 24 |
 | channel multipliers | 1, 2, 4, 8 |
 | encoder channels | 24, 48, 96, 192 |
-| 参数量 | 5,340,052（约 5.340 M） |
+| 参数量 | 5,526,100（约 5.526 M；含 attention） |
 | 卷积 | 3×3×3 Conv3d |
 | activation normalization | 无；保留中间特征的绝对均值与尺度 |
 | 激活 | SiLU |
-| 下采样 | 2×2×2 MaxPool3d |
+| 下采样 | 空间-only MaxPool3d，kernel `(1,2,2)`（时间维不降采样） |
 | 上采样 | trilinear interpolation |
+| attention | 开启；对统一 `(T,X,Z)` token 做 self-attention，并使用轴向 3D RoPE |
 | 输出层 | 零初始化的 1×1×1 Conv3d，预测四通道 residual |
 
-每个 resolution level 使用无 activation normalization 的 residual convolution block：两个 `Conv3d` 构成修正分支，输入通过 identity 或 1×1×1 projection 与修正相加。只在修正分支内部使用 `SiLU`，相加之后不再激活，使 skip path 保持严格线性并传递绝对 feature level。这样不会像 GroupNorm 一样移除中间特征的组内均值和尺度。四层模型自带三条 encoder-to-decoder skip connections：decoder 上采样后与对应 encoder feature concatenate，再经过 residual block。
+每个 resolution level 使用无 activation normalization 的 residual convolution block：两个 `Conv3d` 构成修正分支，输入通过 identity 或 1×1×1 projection 与修正相加。只在修正分支内部使用 `SiLU`，相加之后不再激活，使 skip path 保持严格线性并传递绝对 feature level。这样不会像 GroupNorm 一样移除中间特征的组内均值和尺度。四层模型自带三条 encoder-to-decoder skip connections：decoder 上采样后与对应 encoder feature concatenate，再经过 residual block。v15 在第三层 encoder 之后、最后一次空间下采样之前，以及 bottleneck 之后各放一层 `SpatiotemporalAttention3D`；attention 的输出投影零初始化，训练起点不改变卷积 U-Net 的 identity path。`--spatial-only-pooling` 只在 `(X,Z)` 上 MaxPool，时间长度在所有 level 保持 24。
 
 模型最终预测的是修正量：
 
@@ -129,10 +130,10 @@ prediction = visible_normalized_fields + UNet_residual([visible_fields, masks])
 
 | 通道 | mean | std |
 |---|---:|---:|
-| Bx | 0.002692 | 0.186642 |
-| By | 0.010094 | 0.064745 |
-| Bz | -0.007492 | 0.238265 |
-| Density | 0.545224 | 0.327088 |
+| Bx | 0.002949 | 0.196167 |
+| By | 0.009912 | 0.065603 |
+| Bz | -0.012265 | 0.239524 |
+| Density | 0.560506 | 0.328403 |
 
 训练和验证的 MSE/MAE 都在这一归一化空间中计算。可视化默认反归一化到物理单位，因此图中报告的 Density/Jy 误差不能与训练日志里的四通道 normalized MSE 直接比较。
 
@@ -144,35 +145,31 @@ prediction = visible_normalized_fields + UNet_residual([visible_fields, masks])
 |---|---|---|---|
 | `spatial_random` | 完全随机的 Density probe array，所有时间共用 | 与 Density 独立的 0 / log-uniform / full 可见点数，三通道共用随机位置 | 准确数量的 distinct probes，无放回均匀随机位置 |
 | `spatial_grid` | 近规则 Density probe array，所有时间共用 | 与 Density 独立的 0 / log-uniform / full 可见点数，三通道共用随机位置 | 准确 probe 数量，并随机化 grid phase/layout |
-| `spatial_block` | 隐藏一个随机矩形区域 | `Bx/By/Bz` 完全一致 | B/Density 独立选择矩形和位置 |
+| `spatial_block` | 隐藏或只保留一个随机矩形（50/50 inpainting/outpainting） | `Bx/By/Bz` 完全一致 | B/Density 独立选择矩形、位置和 orientation |
 | `temporal_random` | 随机选择 scattered 完整可见帧 | `Bx/By/Bz` 完全一致 | B/Density 独立选择可见帧和数量 |
 | `temporal_block` | oriented 连续时间块：中间缺失或中间可见 | `Bx/By/Bz` 完全一致 | B/Density 独立选择可见帧数、位置和 orientation |
 
 训练使用独立 B/Density sampler；controlled validation 对全部五种 pattern 使用下面的固定 ~50% benchmark，Bx/By/Bz/Density 共用同一 observation mask。visualization 的 spatial-block 诊断图仍是居中矩形 inpainting/outpainting，与 validation 的半平面切分不是同一套几何。
 
-训练时两个 probe pattern 对 B 和 Density 都使用同一套三部分 mixture：以 `p_zero` 取 `N_visible=0`，以 `p_full` 取 `N_visible=X*Z`，其余在 `[1, X*Z-1]` 上 log-uniform 抽取准确可见点数。默认 Density 为 `p_zero=0.15`、`p_full=0.10`，磁场为 `p_zero=0.10`、`p_full=0.30`，两者独立可配。磁场三个通道仍共用一次 `randperm` 选址。`spatial_block` 继续按 `mask_fraction ~ Uniform(0,1)` 采样矩形面积，并随机位置和长宽比。`spatial_grid` 的 Density 近规则阵列具有随机 phase，不能整齐分解成矩形 grid 时会从稍大的近各向同性 lattice 随机去掉多余位置。可视化的 custom grid 仍可使用显式固定 stride；multifunction 的 `spatial_grid` 改为 50% checkerboard。All five standardized validation tasks use approximately 50% masking and an identical observation mask across Bx, By, Bz, and Density. This controls the observation fraction and modality layout so that differences in validation loss primarily reflect mask geometry. These standardized validation metrics are not directly comparable with earlier validation metrics using different mask severities/layouts.
+训练时两个 probe pattern 对 B 和 Density 都使用同一套三部分 mixture：以 `p_zero` 取 `N_visible=0`，以 `p_full` 取 `N_visible=X*Z`，其余在 `[1, X*Z-1]` 上 log-uniform 抽取准确可见点数。v15 正式训练把 Density 和磁场都设为 `p_zero=0.05`、`p_full=0.05`，两者独立采样。磁场三个通道仍共用一次选址。`spatial_block` 按 `mask_fraction ~ Uniform(0,1)` 采样矩形面积，并随机位置、长宽比，以及 50/50 inpainting/outpainting orientation；B 与 Density 各自独立抽一块。`spatial_grid` 的 Density 用近规则阵列（随机 phase）；同一 pattern 下磁场 exact-count 仍是随机散点，不是 grid。可视化的 custom grid 仍可使用显式固定 stride；multifunction 的 `spatial_grid` 改为 50% checkerboard。`--density-probe-min` / `--density-probe-max` 只保留给旧 launch 脚本解析，当前训练和 standardized validation 都不用它们。五个 standardized validation task 都使用约 50% masking，并且 Bx/By/Bz/Density 共用同一 observation mask，因此 `val/*` 差异主要反映 mask geometry，不能与更早、不同 severity/layout 的 validation 数字直接比较。
 
 ### 4.3 损失、优化和验证
 
-网络优化的是完整输出上的 MSE：
+训练和 standardized validation 都使用 `full_mse_loss`：先把四通道分成磁场组 `(Bx,By,Bz)` 和 Density 组，再在每一组内分别对 visible / hidden 取均值，最后对两组取平均。某一组如果 visible 或 hidden 为空，则只平均仍存在的那一侧。因此它不是全体像素上的普通 `mean((pred-target)^2)`：稀疏观测时 hidden 区域不会因为像素更多而主导梯度，B 与 Density 的权重也保持 1:1。MAE 只作为诊断指标。代码中虽保留 hidden-only loss helper，但当前训练没有调用它。输出没有按 mask 把观测真值硬写回，visible 位置同样进入 loss。
 
-```text
-loss = mean((prediction - target)^2)
-```
-
-即 visible 和 hidden 位置都进入训练 loss；MAE 只作为诊断指标。代码中虽保留 hidden-only loss helper，但当前训练没有调用它。这样网络既学习补全，也学习在已知位置保持/重构原场。
-
-当前优化配置：
+当前正式 v15 优化配置（见 `train_masked_unet3d_4n16g.sbatch`）：
 
 - AdamW，learning rate `2e-4`，weight decay `1e-4`；
 - 前 10 epochs 线性 warmup：epoch 1 从 `2e-5` 开始，epoch 10 到达 `2e-4`；
-- epoch 11–3000 使用 cosine decay，最终降到 `2e-6`；
-- `spatial_grid` 和 `spatial_random` 训练时对 B/Density 独立使用 0 / log-uniform / full 可见点数 mixture（默认 Density `p_zero=0.15`、`p_full=0.10`，磁场 `p_zero=0.10`、`p_full=0.30`）；validation 不再使用旧的 probe-count sampler；
+- epoch 11–4500 使用 cosine decay，最终降到 `2e-6`；
+- `spatial_grid` 和 `spatial_random` 训练时对 B/Density 独立使用 0 / log-uniform / full 可见点数 mixture（v15：两者都是 `p_zero=0.05`、`p_full=0.05`）；validation 使用固定 ~50% layout，不再使用 probe-count sampler；
 - gradient norm clipping 为 1.0；
 - AMP mixed precision；
-- 3000 epochs；
+- 4500 epochs；
 - 4 nodes × 4 GPUs/node = 16 GPUs；
-- batch size 4/GPU，global batch size 64；
+- batch size 8/GPU，global batch size 128；
+- `--use-attention` 与 `--spatial-only-pooling`；
+- 从随机权重 + 训练集 channel stats 开始，不加载旧 checkpoint；
 - PyTorch DDP/NCCL。
 
 validation 对五个 pattern 分别推理，全部使用 deterministic standardized layout：`spatial_random` 精确一半随机空间点可见；`spatial_grid` 为 `(x+z)%2==0` 的 50% checkerboard；`spatial_block` 下半 `x` 可见、上半 `x` masked；`temporal_random` 偶数帧可见、奇数帧 masked；`temporal_block` 前一半时间可见、后一半 masked。四种场共用同一 mask，可见比例都约为 50%，因此 `val/*` 差异主要来自 mask geometry。这些 standardized validation metrics 不能与更早、不同 mask severity/layout 的数值直接比较。DDP 验证 sampler 不补重复样本，确保每个 validation window 恰好统计一次。
@@ -200,17 +197,17 @@ sbatch train_masked_unet3d_4n16g.sbatch
 ./train_masked_unet3d_4n16g.sbatch
 ```
 
-两种入口最终都会由该文件启动 `srun + torchrun`。当前正式训练配置是 v13：
+两种入口最终都会由该文件启动 `srun + torchrun`。当前正式训练配置是 v15：
 
 ```text
-masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v13_independentBD_logUniformCounts_attention_spatialpool_b8_e3000
+masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v15_orientedSpatialBlock_independentBD_logUniformCounts_attention_spatialpool_b8_e4500
 ```
 
-该 v13 run 从 v12 `best.pt`（epoch 3731）只加载 model weights 作为初始化，使用新的 output directory、fresh optimizer/scheduler，以及 `independentBD_fiveMask_logUniformCounts_v8` 的训练 mask sampler，总共 3000 epochs。`--auto-resume` 默认开启：第一次启动走 `--init-checkpoint`；如果 v13 自己的 `latest.pt` 已存在，则从该文件完整 resume（含 optimizer 和 epoch），并检查 masking version。不要把 `--out-dir` 指回 v12，否则 auto-resume 会因 `MASKING_VERSION` 不匹配而拒绝。额外 CLI 参数会追加给训练脚本。
+该 run 从随机权重训练 4500 epochs，使用 `independentBD_fiveMask_logUniformCounts_orientedSpatialBlock_v9` 的训练 mask sampler，并打开 unified spatiotemporal attention 与 spatial-only pooling。sbatch 会拒绝 `--init-checkpoint`。`--auto-resume` 默认开启：若 `out-dir/latest.pt` 已存在，则完整 resume（含 optimizer 和 epoch），并检查 masking version / attention / pooling 等关键参数。额外 CLI 参数会追加给训练脚本。
 
 ## 6. 单窗口 visualization 测试案例
 
-`visualize_mask_patterns_unet3d.py` 默认读取 `best.pt`，并稳定选择 held-out validation run `beta0.2_nu2_Bz0_dt2_tau70` 中从 `t0=28` 开始的窗口（global frames 28–51）。该窗口覆盖两个 plasmoid 的独立演化（t=43–45）、开始共享外层 separatrix（t=46）、接触（t=47）和融合（t=48）；Density 双峰和闭合 `Ay` 等高线都清楚支持这一拓扑演化。`--experiment all` 生成下面四套 table；`--all-times` 对窗口内全部 24 帧生成 PNG 并拼成视频。
+`visualize_mask_patterns_unet3d.py` 的 CLI 默认仍读 `best.pt`，但当前正式诊断和 paper figures 都用 v15 `latest.pt`（epoch 4500）。默认窗口是 held-out validation run `beta0.2_nu2_Bz0_dt2_tau70` 中从 `t0=28` 开始的 24 帧（global frames 28–51）。该窗口覆盖两个 plasmoid 的独立演化（t=43–45）、开始共享外层 separatrix（t=46）、接触（t=47）和融合（t=48）；Density 双峰和闭合 `Ay` 等高线都清楚支持这一拓扑演化。`--experiment all` 生成下面四套 table；`--all-times` 对窗口内全部 24 帧生成 PNG 并拼成视频。推荐入口是 `./visualization.sh`（GIF information-suite + sliding）和 `./make_paper_figures.sh`（论文静态图）。
 
 ### 6.1 Multifunction：只 mask Density
 
@@ -265,48 +262,83 @@ NMAE = mean(abs(r))
 ```bash
 srun -n 1 -c 32 -G 1 --gpu-bind=none \
   python visualize_mask_patterns_unet3d.py \
-  --run-dir runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine3000_v8 \
+  --run-dir runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v15_orientedSpatialBlock_independentBD_logUniformCounts_attention_spatialpool_b8_e4500 \
+  --checkpoint latest.pt \
   --run-name beta0.2_nu2_Bz0_dt2_tau70 \
   --t0 28 \
   --experiment all \
   --all-times \
-  --animation-format quicktime \
+  --animation-format gif \
   --fps 2 \
-  --out-dir runs/masked-unet3d_beta0p2_dt24_bc24_depth4_ddp16_sharedB_densityIndependentRandomGrid_v1/figures_information_suite
+  --out-dir runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v15_orientedSpatialBlock_independentBD_logUniformCounts_attention_spatialpool_b8_e4500/figures_information_suite_plasmoid_merger
 ```
+
+更省事的是直接跑 `./visualization.sh`：它会对同一 v15 checkpoint 生成 B-visible 和 B-hidden 两套 information-suite，以及 B-visible / B-hidden 两套 sliding 诊断（GIF 的 slide-steps 仍是 8/4/2/1、约 8% Density probes）。若对应 `--out-dir` 里已有匹配的 `plot_cache.pkl`，脚本会加 `--reuse-plot-data` 跳过 inference。
 
 `quicktime` 生成 Motion-JPEG 编码的 `.mov`，可直接用 macOS QuickTime 查看；视频格式不是 MP3。需要同时生成 `.mov` 和 GIF 时改为 `--animation-format both`。生成的 GIF 不写无限循环扩展，因此默认播放一轮后停在最后一帧。动画保存在 `--out-dir` 顶层，所有 PNG 统一放在 `--out-dir/images/<experiment>/`，便于直接找到视频。一条命令结束后再运行下一条，不要把两个完整的 `srun ... python ...` 无分隔地粘到同一行，否则第二个 `srun` 会被 argparse 当成第一个 Python 命令的参数。
 
 ### 6.7 Paper figures
 
-`make_paper_figures.py` 从现有 validation JSON / sliding arrays（必要时才做 inference）写出论文主图，数据和 PNG/PDF 都放在独立目录 `<run-dir>/paper_figures_v1/`。cache signature 匹配时只 redraw，不重新跑模型。
+`make_paper_figures.py` 是独立的论文静态图 pipeline，不改训练 / validation / masking / 模型，也不改 GIF 脚本。数据和 PNG/PDF 写在 `<run-dir>/paper_figures_v1/{data,figures}/`。每个 figure 有自己的 cache signature；匹配时只 redraw。`cache_version` 在兼容列表内且其余 signature 相同的旧 cache 可以复用，因此只改某一张图的 signature 时，其他图不会被一起重算。官方入口：
 
 ```bash
-python make_paper_figures.py \
-  --run-dir runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v15_orientedSpatialBlock_independentBD_logUniformCounts_attention_spatialpool_b8_e4500 \
-  --checkpoint latest.pt
+./make_paper_figures.sh
 ```
 
-同样的命令在 cache 已存在且 signature 匹配时只重绘。强制重新 inference / 聚合：
+等价于：
 
 ```bash
 python make_paper_figures.py \
   --run-dir runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v15_orientedSpatialBlock_independentBD_logUniformCounts_attention_spatialpool_b8_e4500 \
   --checkpoint latest.pt \
-  --force-recompute
+  --sliding-max-runs 25
 ```
 
-输出：
+`--figure` 可选 `spatial`、`magnetic_ablation`、`forecast`、`superres`、`sliding`；默认 `all` 的生成顺序是 spatial → magnetic_ablation → forecast → superres → sliding。`--force-recompute` 强制重跑 builder。Python 里 `--sliding-max-runs` 默认是 16；正式 paper 命令用 25。
 
-```text
-<run-dir>/paper_figures_v1/
-```
+何时会 inference：
 
-可用 `--figure spatial magnetic_ablation forecast superres sliding` 只画其中一部分；默认 `all`。
+- `spatial_qualitative`：需要模型，只跑 canonical window（`beta0.2_nu2_Bz0_dt2_tau70`，`t0=28`，global frame 45）。
+- `density_forecast_summary` / `density_superres_summary`：优先读 information-suite 的 `validation-runs_stride-24_experiment-*.json`（B-full 与 B-hidden 各一份）；JSON 与 checkpoint 对得上就不跑模型。
+- `magnetic_ablation_summary`：两种 Density condition 共用同一套 nested B ranking，必须 post-hoc 配对评估，不复用旧的 Density-hidden-only JSON。
+- `sliding_window_appendix`：需要模型；对 selected validation runs 做 recursive sliding，并对 canonical run 做 qualitative 重建。
+
+统计约定：定量曲线和 shaded band 是 held-out validation runs 上的 median 以及 16th–84th percentile。Density NRMSE 是 checkpoint 标准化空间中 Density 通道的 RMS residual。Jy NRMSE 是在同样标准化的 `Bx/Bz` 上计算 `Jy = dBx/dz - dBz/dx` 后，再用训练集 Jy std 归一化。
+
+建议阅读 / 正文顺序对应
+reconstruction quality → multimodal transfer → sparse-observation scaling → temporal extrapolation → long-sequence deployment：
+
+1. `spatial_qualitative`
+2. `magnetic_ablation_summary`
+3. `density_superres_summary`
+4. `density_forecast_summary`
+5. `sliding_window_appendix`（appendix，不进正文）
+
+**Spatial qualitative reconstruction.** 4×4：Target / Visible / Prediction / Residual。B fully observed；Density 用 multifunction 的 standardized ~50% 几何（random 精确一半、grid 为 checkerboard、block 为居中矩形 inpainting/outpainting）。Prediction 是模型 raw full-field 输出，visible 位置也不粘贴 GT；Residual 是全场 `pred_norm - target_norm`。random / grid / inpainting 的 Density NRMSE 约为 0.066–0.073，outpainting 约 0.126。误差主要集中在强结构和边界附近。适合作为正文 qualitative figure。
+
+![Spatial qualitative reconstruction](runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v15_orientedSpatialBlock_independentBD_logUniformCounts_attention_spatialpool_b8_e4500/paper_figures_v1/figures/spatial_qualitative.png)
+
+**Magnetic ablation / cross-modal reconstruction.** 1×2（Density NRMSE | Jy NRMSE），share y、log y。B visible 为 nested 0 / 0.1 / 0.3 / 1 / 3 / 10 / 30 / 100%。先抽一份 spatial ranking，低可见集合是高可见集合的 subset；Density fully hidden 与 Density 100% 是同一组 mask 的 clone，只改 Density 通道，并且这套 ranking 套到每一个 validation window。线型：Density hidden 为 `C0` 实线圆点，Density 100% 为 `C1` 虚线三角。Density fully hidden 时，极少 B probes 就能显著降低 Density error：从 B=0 时接近 NRMSE 0.9，降到 0.1% B 时约 0.1，并在约 1% B 后逐渐接近饱和。Density fully visible 时，即使 B 很少，Density reconstruction 也几乎保持在很低的 error floor。对 \(J_y\)，完整 Density 在 B 极少或完全缺失时有明显帮助，但 B probe 增多后两种 Density condition 的 Jy error 逐渐接近；B=100% 时 Jy error 最低。这是目前最强的 bidirectional multimodal information transfer 证据之一。
+
+![Magnetic ablation summary](runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v15_orientedSpatialBlock_independentBD_logUniformCounts_attention_spatialpool_b8_e4500/paper_figures_v1/figures/magnetic_ablation_summary.png)
+
+**Density super-resolution.** 同样 1×2、share y、log y。x 轴是 `Density visible ratio (%)`，对应精确 probe 数 0 / 10 / 100 / 1000（在 `(X,Z)=(154,62)` 上约为 0 / 0.105 / 1.05 / 10.47%）。B 100% 为 `C0` 实线圆点，B 0% 为 `C1` 虚线三角。B fully observed 时，即使没有 Density probes，Density NRMSE 已经只有约 0.06，继续增加 Density probes 的边际收益很小。B completely hidden 时，Density probes 的作用非常明显：从 0 probes 时接近 NRMSE 0.9，增加到约 0.1% visibility 后大幅下降，到约 1% visibility 时已经接近 B-full 的 Density reconstruction 水平。Jy 不同：没有 B 时，即使有 10.47% Density probes，Jy error 仍明显高于 B-full case。Density 相对容易从稀疏 Density/B 信息恢复，而 magnetic/current structure 对直接 magnetic observations 更敏感。
+
+![Density super-resolution summary](runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v15_orientedSpatialBlock_independentBD_logUniformCounts_attention_spatialpool_b8_e4500/paper_figures_v1/figures/density_superres_summary.png)
+
+**Density forecast.** 1×2、share y、log y。Density prefix 为 23 / 18 / 12 / 6 帧（horizon 1 / 6 / 12 / 18），每条曲线同时画 B 100%（实线）和 B 0%（虚线），颜色表示 horizon。x 轴是 24-frame context 内的 local frame。在 Density observable prefix 内，Density error 很低；进入 forecast region 后 error 会明显上升。完整 B conditioning 能显著抑制长 horizon 的 Density forecast error，而 B hidden 时误差随 forecast horizon 增长得更明显。Jy 的差异更强：B hidden 时 Jy NRMSE 明显高于 B-full，并随 forecast 深度增加而恶化。B-full 时 Jy error 不为 0，是因为模型没有 hard clamp visible B，且 Jy 由预测 B 的空间导数计算得到。
+
+![Density forecast summary](runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v15_orientedSpatialBlock_independentBD_logUniformCounts_attention_spatialpool_b8_e4500/paper_figures_v1/figures/density_forecast_summary.png)
+
+**Sliding-window long sequence reconstruction.** 与第 7 节 GIF 诊断不同：paper appendix 用精确 1000-count Density grid（与 superres 最右点相同，50×20，10.47% visibility），slide steps 为 1 / 12 / 24，只取每个 run 的前 48 帧且不 padding，短于 48 帧的 run 跳过。统计单位是 run：每个 run 一条 framewise RMSE，再跨 run 取 median 和 p16–p84。左列是 Target + RMSE；右两列是 canonical run、B hidden 的 Prediction / Residual。legend 中 `step=…  a / b` 是该 step 上 cross-run median 曲线对 48 帧的时间平均（B100 / B0）。当前 cache 在 `--sliding-max-runs 25` 下实际用了 18 个足够长的 validation runs。step=12 和 step=24 的平均 frame RMSE 基本一致，并且低于 step=1，大约是 0.020 / 0.022（step=1）对 0.017 / 0.017（step=12 和 24）。canonical example 的 48-frame NRMSE 也是 step=12/24 略优于 step=1。更高 overlap / 更频繁 recursive reuse 并不一定更好，step=1 反而更容易积累误差。这张图放 appendix，不进正文。
+
+![Sliding-window appendix](runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v15_orientedSpatialBlock_independentBD_logUniformCounts_attention_spatialpool_b8_e4500/paper_figures_v1/figures/sliding_window_appendix.png)
 
 ## 7. 整 run sliding Density reconstruction
 
-`visualize_sliding_density_reconstruction.py` 用完整磁场和固定 Density probe grid 重建一个完整 run。默认选择双 plasmoid 融合的 validation run：
+这一节是 GIF / information-suite 诊断脚本 `visualize_sliding_density_reconstruction.py`，默认约 8% Density probes、slide-steps 8/4/2/1，并且允许 run 尾部 padding。它和 6.7 的 paper appendix（1000 probes、steps 1/12/24、前 48 帧、不 padding）不是同一套实验。
+
+脚本可用完整磁场或 `--hide-magnetic`，并用固定 Density probe grid 重建一个完整 run。默认选择双 plasmoid 融合的 validation run：
 
 ```text
 beta0.2_nu2_Bz0_dt2_tau70, T=52
@@ -346,7 +378,8 @@ beta0.2_nu2_Bz0_dt2_tau70, T=52
 ```bash
 srun -n 1 -c 32 -G 1 --gpu-bind=none \
   python visualize_sliding_density_reconstruction.py \
-  --run-dir runs/masked-unet3d_beta0p2_dt24_bc24_depth4_ddp16_sharedB_densityIndependentRandomGrid_v1 \
+  --run-dir runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v15_orientedSpatialBlock_independentBD_logUniformCounts_attention_spatialpool_b8_e4500 \
+  --checkpoint latest.pt \
   --run-name beta0.2_nu2_Bz0_dt2_tau70 \
   --analysis both \
   --slide-steps 24 12 6 3 \
@@ -361,9 +394,9 @@ srun -n 1 -c 32 -G 1 --gpu-bind=none \
 
 脚本保存 final PNG、逐步 PNG、QuickTime/GIF/MP4、metrics JSON 和 reconstruction NPZ。动画、JSON 和 NPZ 位于 `--out-dir` 顶层；final/逐步 PNG 位于 `--out-dir/images/`，动画帧再按 analysis stem 分子目录。默认输出目录为该 checkpoint run 下的 `figures_sliding_density_reconstruction/`。
 
-### 7.4 当前 v8 checkpoint 的训练结果
+### 7.4 历史 v8 checkpoint 的训练结果
 
-当前正式实验为 `masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine3000_v8`。训练完整运行 3000 epochs，最佳 checkpoint 位于 epoch 2883：
+下面数字来自较早的 `masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine3000_v8`，不是当前 v15 paper checkpoint。该 v8 run 训练 3000 epochs，最佳 checkpoint 位于 epoch 2883：
 
 | 指标（normalized units） | 最佳 / epoch 2883 | 最终 / epoch 3000 |
 |---|---:|---:|
@@ -373,7 +406,9 @@ srun -n 1 -c 32 -G 1 --gpu-bind=none \
 
 最佳 epoch 的分 pattern validation MSE 为：`spatial_grid=0.001277`、`spatial_random=0.001771`、`temporal_random=0.009169`、`spatial_block=0.016862`。连续空间缺口和整帧时间缺失仍是主要瓶颈。相对 cosine-1000 v7，v8 最佳 validation MSE 改善约 18.3%；相对 cosine-400 v6 改善约 39.5%。完整逐 epoch 记录、配置、归一化统计和 run-level split 已作为精简审阅材料保存在当前 v8 run 目录中。
 
-### 7.5 逐帧误差诊断
+### 7.5 逐帧误差诊断（v8 GIF tables）
+
+下面嵌入的 PNG/GIF 仍来自 v8 information-suite / sliding 目录，用来说明 GIF 诊断图的读法。论文定量结论以 6.7 的 v15 paper figures 为准。
 
 每个 GIF 另存一张当前 canonical window/run 的 `*_error_vs_frame.png`：GIF 中每一行对应图中的一条曲线。information-suite 同时报告 Density/Jy frame NRMSE；sliding reconstruction 报告 plot units 中的 frame RMSE/MAE。逐帧数值写入相邻 JSON 或 metrics JSON，便于复算而不需要从图片读数。
 
@@ -391,11 +426,11 @@ information-suite 默认还会对 `split.json` 中全部 validation runs 生成 
 
 ![Conditional Density forecast framewise error](runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine3000_v8/figures_information_suite_plasmoid_merger/named_beta0.2_nu2_Bz0_dt2_tau70_t0-28_physical_experiment-density_forecast_error_vs_frame.png)
 
-这些曲线目前支持以下判断：
+这些曲线目前支持以下判断（仅针对图中的 v8 GIF tables）：
 
 - global frames 49–51 在所有任务中同时变难，说明末端误差峰值不只是 recursive sliding 的累计误差，也与 plasmoid merger 后期动力学或窗口边界上下文不足有关；
-- 旧的 30/20/10/0-probe 扫描中，各行 Density NRMSE 几乎重合，提示网络主要依靠 B 重建 Density；默认扫描现已改为 0/10/100/1000，需重新生成图后判断更宽 probe 数量范围的影响；
-- 现有 magnetic-ablation 图来自旧的约 8% Density-visible 设置；改为 0 Density probes 后需重新生成曲线，再判断 B 可见率对 Density/Jy NRMSE 的影响；
+- v8 的 30/20/10/0-probe 扫描中各行 Density NRMSE 几乎重合；当前默认扫描已是 0/10/100/1000，v15 定量结果见 6.7 的 `density_superres_summary`；
+- v8 magnetic-ablation 图仍是旧的约 8% Density-visible 设置；v15 paper figure 已改为 Density fully hidden 与 Density 100% 两条配对曲线，见 6.7；
 - conditional Density forecast 的误差随 horizon 从 1、6、12 到 18 steps 单调增大，模型仍明显受有限时间上下文约束。
 
 #### 完整 run sliding reconstruction
@@ -417,7 +452,7 @@ information-suite 默认还会对 `split.json` 中全部 validation runs 生成 
 
 ## 8. Legacy GroupNorm/direct-output checkpoint 结果
 
-以下结果来自架构调整前的 `masked-unet3d_beta0p2_dt24_bc24_depth4_ddp16_sharedB_densityIndependentRandomGrid_v1`，用于和新 residual/no-normalization run 对照；新模型尚需重新训练后更新本节。
+以下结果来自架构调整前的 `masked-unet3d_beta0p2_dt24_bc24_depth4_ddp16_sharedB_densityIndependentRandomGrid_v1`，只作历史对照。当前正式模型是 4.3 / 5 节的 v15 residual U-Net。
 
 ### 8.1 训练结果
 
@@ -500,15 +535,18 @@ W&B run：<https://wandb.ai/xiabin-georgia-institute-of-technology/ai4plasma/run
 |---|---|
 | `pack_csvdata_by_beta_fast.py` | 将四通道 CSV 并行打包为 HDF5 |
 | `data/vpic_hdf5_dataset.py` | HDF5 lazy loading、时间窗口索引、run metadata |
-| `data/masking.py` | 四种训练 mask、通道共享规则和损失 helper |
-| `models/unet3d.py` | 三层/四层 3D U-Net |
+| `data/masking.py` | 五种训练 mask、independent B/Density sampler、standardized validation layout 和损失 helper |
+| `models/unet3d.py` | 三层/四层 residual 3D U-Net、可选 spatiotemporal attention 与 spatial-only pooling |
 | `train_masked_unet3d.py` | DDP 训练、run-level split、validation、checkpoint、W&B |
 | `train_masked_unet3d_4n16g.sbatch` | 同时支持现有 salloc 和 sbatch 的 4-node/16-GPU launcher |
+| `evaluate_standardized_validation.py` | 五个 ~50% standardized mask 的 held-out 评估 |
 | `visualization.ipynb` | 原始物理可视化及 Ay integration 参考 |
 | `visualize_mask_patterns_unet3d.py` | 四套单窗口 information/forecast experiments |
 | `visualize_sliding_density_reconstruction.py` | 长 run sliding、bidirectional 与 equal-call 分析 |
+| `visualization.sh` | v15 information-suite + sliding GIF 的一键入口 |
 | `make_paper_figures.py` | 论文主图 / appendix 静态图与独立 plotting cache |
-| `tests/` | 模型、mask、DDP 和 visualization/sliding 单元测试 |
+| `make_paper_figures.sh` | 正式 paper 图命令（v15 `latest.pt`，`--sliding-max-runs 25`） |
+| `tests/` | 模型、mask、DDP 和 visualization/sliding/paper-figure 单元测试 |
 
 ## 11. 已知限制
 

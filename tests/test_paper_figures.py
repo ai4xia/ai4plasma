@@ -19,10 +19,14 @@ from make_paper_figures import (  # noqa: E402
     EXPECTED_MAGNETIC_ROW_NAMES,
     EXPECTED_SUPERRES_ROW_NAMES,
     FIGURE_STEMS,
+    MAGNETIC_DENSITY_CONDITIONS,
     PAPER_CACHE_VERSION,
+    SUPERRES_B_CONDITION_STYLES,
     SLIDING_AGGREGATE_N_FRAMES,
     SPATIAL_ROW_ORDER,
     _val_json_path,
+    _magnetic_ablation_masks_with_density_full,
+    _magnetic_ablation_rows_from_payload,
     base_signature,
     build_magnetic_ablation_cache,
     build_paired_b_condition_cache,
@@ -239,14 +243,72 @@ def test_magnetic_ablation_contains_all_eight_levels(tmp_path):
         names,
     )
     args = Namespace(force_recompute=False)
-    arrays, meta = build_magnetic_ablation_cache(
-        args, tmp_path, checkpoint, None, checkpoint_epoch=4500
+    payload = try_load_validation_json(
+        tmp_path, checkpoint, "magnetic_ablation", checkpoint_epoch=4500
     )
-    percents = [float(value) for value in arrays["b_visible_percent"]]
-    assert meta["n_levels"] == 8
+    assert payload is not None
+    rows = _magnetic_ablation_rows_from_payload(payload)
+    percents = [100.0 * float(row["visible_fraction"]) for row in rows]
+    assert len(rows) == 8
     assert percents == sorted(percents)
     np.testing.assert_allclose(sorted(percents), sorted(DEFAULT_MAGNETIC_ABLATION_VISIBLE_PERCENTS))
-    plot_magnetic_ablation_summary(arrays, meta, tmp_path, dpi=80)
+    try:
+        build_magnetic_ablation_cache(
+            args, tmp_path, checkpoint, None, checkpoint_epoch=4500
+        )
+        assert False, "density-full magnetic ablation should need inference context"
+    except RuntimeError as exc:
+        assert "paired density conditions" in str(exc)
+
+
+def test_magnetic_ablation_density_conditions_share_nested_b_layout():
+    import torch
+    from visualize_mask_patterns_unet3d import build_magnetic_ablation_rows
+
+    block = torch.zeros(1, 4, 2, 8, 6)
+    generator = torch.Generator().manual_seed(0)
+    hidden_rows = build_magnetic_ablation_rows(
+        block, [0.0, 0.1, 0.5, 1.0], generator
+    )
+    full_rows = _magnetic_ablation_masks_with_density_full(hidden_rows)
+    assert len(hidden_rows) == len(full_rows) == 4
+    previous_b = None
+    for (_h_name, _h_label, hidden), (_f_name, _f_label, full) in zip(
+        hidden_rows, full_rows
+    ):
+        assert torch.equal(hidden[:, :3], full[:, :3])
+        assert torch.all(hidden[:, 3] == 0)
+        assert torch.all(full[:, 3] == 1)
+        b_plane = hidden[0, 0, 0]
+        if previous_b is not None:
+            assert torch.all(b_plane[previous_b > 0.5] > 0.5)
+        previous_b = b_plane
+
+
+def test_magnetic_ablation_plot_is_1x2_with_both_density_conditions(tmp_path):
+    percents = np.asarray(DEFAULT_MAGNETIC_ABLATION_VISIBLE_PERCENTS, dtype=np.float64)
+    n = len(percents)
+    arrays = {"b_visible_percent": percents}
+    for prefix, scale in (("density_hidden", 0.2), ("density_full", 0.05)):
+        median = np.linspace(scale, scale / 2.0, n)
+        arrays[f"{prefix}_density_median"] = median
+        arrays[f"{prefix}_density_p16"] = median * 0.8
+        arrays[f"{prefix}_density_p84"] = median * 1.2
+        arrays[f"{prefix}_jy_median"] = median * 1.4
+        arrays[f"{prefix}_jy_p16"] = median * 1.1
+        arrays[f"{prefix}_jy_p84"] = median * 1.7
+    result = plot_magnetic_ablation_summary(arrays, {}, tmp_path, dpi=80)
+    assert result["layout"] == (1, 2)
+    assert result["titles"] == ["Density NRMSE", "Jy NRMSE"]
+    assert result["sharey"] is True
+    assert result["ylims"][0] == result["ylims"][1]
+    assert result["density_conditions"] == [
+        "Density fully hidden",
+        "Density visible 100%",
+    ]
+    assert [label for _prefix, label in MAGNETIC_DENSITY_CONDITIONS] == result[
+        "density_conditions"
+    ]
     assert (tmp_path / f"{FIGURE_STEMS['magnetic_ablation']}.png").exists()
 
 
@@ -282,12 +344,32 @@ def test_superres_plot_uses_probe_over_xz(tmp_path):
     )
     assert meta["b_conditions"] == ["B_full", "B_hidden"]
     size_x, size_z = 154, 50
-    plot_density_superres_summary(
+    result = plot_density_superres_summary(
         arrays, meta, tmp_path, dpi=80, size_x=size_x, size_z=size_z
     )
     expected = [100.0 * density_visible_ratio(count, size_x, size_z) for count in (0, 10, 100, 1000)]
     np.testing.assert_allclose(meta["visible_ratio_percent"], expected)
     assert size_x * size_z != 154 * 62
+    assert result["layout"] == (1, 2)
+    assert result["titles"] == ["Density NRMSE", "Jy NRMSE"]
+    assert result["sharey"] is True
+    assert result["ylims"][0] == result["ylims"][1]
+    assert result["b_condition_styles"] == {
+        "B_full": {
+            "color": "C0",
+            "linestyle": "-",
+            "marker": "o",
+            "label": "B visible 100%",
+        },
+        "B_hidden": {
+            "color": "C1",
+            "linestyle": "--",
+            "marker": "^",
+            "label": "B visible 0%",
+        },
+    }
+    assert SUPERRES_B_CONDITION_STYLES["B_full"]["color"] == "C0"
+    assert SUPERRES_B_CONDITION_STYLES["B_hidden"]["color"] == "C1"
     assert (tmp_path / f"{FIGURE_STEMS['superres']}.png").exists()
 
 
@@ -608,15 +690,42 @@ def test_sliding_probe_count_signature_invalidates_old_fraction_cache():
 
 
 def test_compatible_cache_versions_reuse_unchanged_signatures():
-    assert PAPER_CACHE_VERSION == 9
-    assert 8 in COMPATIBLE_PAPER_CACHE_VERSIONS
-    for figure in ("spatial", "magnetic_ablation", "forecast", "superres"):
-        stored = {"cache_version": 8, "figure": figure, "payload": 1}
-        current = {"cache_version": 9, "figure": figure, "payload": 1}
+    assert PAPER_CACHE_VERSION == 11
+    assert 10 in COMPATIBLE_PAPER_CACHE_VERSIONS
+    for figure in ("spatial", "forecast", "superres", "sliding"):
+        stored = {"cache_version": 10, "figure": figure, "payload": 1}
+        current = {"cache_version": 11, "figure": figure, "payload": 1}
         assert paper_signatures_match(stored, current)
     stored = {"cache_version": 2, "figure": "forecast", "histories": [23]}
-    current = {"cache_version": 9, "figure": "forecast", "histories": [23]}
+    current = {"cache_version": 11, "figure": "forecast", "histories": [23]}
     assert paper_signatures_match(stored, current)
+    old_mag = {
+        "cache_version": 9,
+        "figure": "magnetic_ablation",
+        "density_visible": 0.0,
+        "b_visible_levels": list(DEFAULT_MAGNETIC_ABLATION_VISIBLE_PERCENTS),
+    }
+    new_mag = {
+        "cache_version": 11,
+        "figure": "magnetic_ablation",
+        "density_conditions": ["fully_hidden", "visible_100"],
+        "shared_b_probe_layout": True,
+        "layout": "1x2_density_jy",
+        "b_visible_levels": list(DEFAULT_MAGNETIC_ABLATION_VISIBLE_PERCENTS),
+    }
+    assert not paper_signatures_match(old_mag, new_mag)
+    old_superres = {
+        "cache_version": 10,
+        "figure": "superres",
+        "probe_counts": [0, 10, 100, 1000],
+        "b_conditions": ["B_full", "B_hidden"],
+    }
+    new_superres = {
+        **old_superres,
+        "cache_version": 11,
+        "line_style": "two_color_b_conditions",
+    }
+    assert not paper_signatures_match(old_superres, new_superres)
 
 
 def test_sliding_plot_uses_framewise_rmse_and_both_b_conditions(tmp_path):
