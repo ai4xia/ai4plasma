@@ -430,6 +430,37 @@ def test_independent_batch_masks_mix_spatial_and_temporal_modalities():
     assert infos[1]["density_pattern"] == "spatial_grid"
 
 
+def test_training_spatial_grid_uses_sparse_grid_for_magnetic_and_density():
+    n_magnetic = 40
+    n_density = 25
+    mask, infos = sample_independent_batch_masks(
+        (1, 4, 6, 32, 24),
+        magnetic_patterns=["spatial_grid"],
+        density_patterns=["spatial_grid"],
+        magnetic_mask_fractions=[0.5],
+        density_mask_fractions=[0.5],
+        magnetic_visible_counts=[n_magnetic],
+        density_probe_counts=[n_density],
+        generator=make_generator(77),
+    )
+    info = infos[0]
+    assert info["magnetic_pattern"] == "spatial_grid"
+    assert info["density_pattern"] == "spatial_grid"
+    assert info["magnetic_probe_count"] == n_magnetic
+    assert info["density_probe_count"] == n_density
+    assert "magnetic_grid_count_x" in info
+    assert "magnetic_grid_count_z" in info
+    assert "density_grid_count_x" in info
+    assert "density_grid_count_z" in info
+    assert "magnetic_visible_count" not in info
+    assert int(mask[0, 0, 0].sum()) == n_magnetic
+    assert int(mask[0, 3, 0].sum()) == n_density
+    assert torch.equal(mask[:, 0], mask[:, 1])
+    assert torch.equal(mask[:, 1], mask[:, 2])
+    assert torch.equal(mask[:, :, 0], mask[:, :, -1])
+    assert not torch.equal(mask[0, 0, 0], mask[0, 3, 0])
+
+
 def test_parse_pattern_weights():
     weights = parse_pattern_weights(["spatial_random", "2", "spatial_grid", "2.5"])
     assert weights == {"spatial_random": 2.0, "spatial_grid": 2.5}

@@ -29,7 +29,11 @@ from visualize_mask_patterns_unet3d import (
     DEFAULT_RUN_DIR,
     DEFAULT_RUN_NAME,
     DEFAULT_T0,
+    JY_INCLUDES_MU0,
+    JY_NRMSE_DEFINITION,
+    JY_STATS_CACHE_VERSION,
     JY_STATS_DEFINITION,
+    JY_STATS_PREPROCESSING,
     RESIDUAL_CMAP,
     _density_probe_count_grid,
     build_density_forecast_rows,
@@ -44,6 +48,7 @@ from visualize_mask_patterns_unet3d import (
     expand_path,
     get_train_runs,
     get_val_runs,
+    jy_metric_metadata,
     jy_nrmse_from_residual,
     load_checkpoint,
     load_or_compute_jy_training_stats,
@@ -64,8 +69,8 @@ from visualize_sliding_density_reconstruction import (
 )
 
 
-PAPER_CACHE_VERSION = 11
-COMPATIBLE_PAPER_CACHE_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)
+PAPER_CACHE_VERSION = 13
+COMPATIBLE_PAPER_CACHE_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)
 PAPER_DIRNAME = "paper_figures_v1"
 DEFAULT_GLOBAL_FRAME = 45
 DEFAULT_SLIDE_STEPS = (1, 12, 24)
@@ -132,10 +137,19 @@ SUPERRES_B_CONDITION_STYLES = {
 DENSITY_NRMSE_DEFINITION = (
     "RMS of (prediction_normalized - target_normalized) on the Density channel"
 )
-JY_NRMSE_DEFINITION = (
-    "RMSE(Jy_pred - Jy_target) / training-set Jy std, with Jy = dBx/dz - dBz/dx "
-    "on checkpoint-standardized Bx,Bz"
-)
+
+
+def _jy_signature_fields() -> Dict:
+    return {
+        "jy_preprocessing": JY_STATS_PREPROCESSING,
+        "jy_stats_cache_version": JY_STATS_CACHE_VERSION,
+        "jy_includes_mu0": JY_INCLUDES_MU0,
+        "B_unit": "T",
+        "jy_unit": "A/m^2",
+    }
+
+
+JY_PAPER_PANEL_TITLE = "Jy NRMSE"
 
 
 def parse_args() -> argparse.Namespace:
@@ -777,6 +791,15 @@ def try_load_validation_json(
             f"Ignoring {path}: experiment {recorded_experiment} != {json_experiment}"
         )
         return None
+    recorded_preprocessing = payload.get(
+        "jy_preprocessing", payload.get("preprocessing")
+    )
+    if recorded_preprocessing != JY_STATS_PREPROCESSING:
+        print(
+            f"Ignoring {path}: Jy preprocessing {recorded_preprocessing!r} != "
+            f"{JY_STATS_PREPROCESSING!r}"
+        )
+        return None
     payload["_source_json"] = str(path)
     return payload
 
@@ -825,6 +848,8 @@ def load_inference_context(args: argparse.Namespace) -> Dict:
         mean=mean,
         std=std,
         extent=args.extent,
+        checkpoint_path=ckpt_path,
+        checkpoint_epoch=ckpt.get("epoch"),
     )
     model = UNet3D(
         in_channels=8,
@@ -1240,6 +1265,13 @@ def build_magnetic_ablation_cache(
         "interval": "median and 16th-84th percentile range",
         "source_files": [],
     }
+    meta.update(
+        jy_metric_metadata(
+            jy_stats=ctx.get("jy_stats"),
+            checkpoint_path=ctx.get("ckpt_path") or checkpoint_path,
+            checkpoint_epoch=checkpoint_epoch,
+        )
+    )
     return arrays, meta
 
 
@@ -1291,7 +1323,7 @@ def plot_magnetic_ablation_summary(arrays: Dict, metadata: Dict, figures_dir: Pa
     else:
         ymin = max(LOG_Y_FLOOR, float(np.min(stacked))) / 1.2
         ymax = float(np.max(stacked)) * 1.2
-    titles = ("Density NRMSE", "Jy NRMSE")
+    titles = ("Density NRMSE", JY_PAPER_PANEL_TITLE)
     for ax, title in zip(axes, titles):
         ax.set_title(title, fontsize=10)
         ax.set_yscale("log")
@@ -1382,6 +1414,7 @@ def build_paired_b_condition_cache(
     local_frames = None
     context_length = None
     run_count = None
+    jy_payload_stats = None
     for hide_magnetic, key in ((False, "B_full"), (True, "B_hidden")):
         payload = None if args.force_recompute else try_load_validation_json(
             run_dir,
@@ -1391,6 +1424,8 @@ def build_paired_b_condition_cache(
             checkpoint_epoch=checkpoint_epoch,
         )
         if payload is not None:
+            if jy_payload_stats is None:
+                jy_payload_stats = payload
             conditions[key] = _forecast_or_superres_from_stats_rows(payload["rows"], experiment)
             source[key] = payload.get("_source_json")
             source_files.append(str(payload.get("_source_json")))
@@ -1473,6 +1508,13 @@ def build_paired_b_condition_cache(
         meta["visible_ratio_percent"] = [
             100.0 * density_visible_ratio(count, size_x, size_z) for count in probe_counts
         ]
+    meta.update(
+        jy_metric_metadata(
+            jy_stats=(ctx or {}).get("jy_stats") or jy_payload_stats,
+            checkpoint_path=checkpoint_path,
+            checkpoint_epoch=checkpoint_epoch,
+        )
+    )
     return arrays, meta
 
 
@@ -1518,7 +1560,7 @@ def plot_density_forecast_summary(arrays: Dict, metadata: Dict, figures_dir: Pat
         ymin = max(LOG_Y_FLOOR, float(np.min(stacked))) / 1.2
         ymax = float(np.max(stacked)) * 1.2
     xlabel = f"Local frame in {int(metadata['context_length'])}-frame context window"
-    titles = ("Density NRMSE", "Jy NRMSE")
+    titles = ("Density NRMSE", JY_PAPER_PANEL_TITLE)
     for ax, title in zip(axes, titles):
         ax.set_title(title, fontsize=10)
         ax.set_yscale("log")
@@ -1618,7 +1660,7 @@ def plot_density_superres_summary(
     else:
         ymin = max(LOG_Y_FLOOR, float(np.min(stacked))) / 1.2
         ymax = float(np.max(stacked)) * 1.2
-    titles = ("Density NRMSE", "Jy NRMSE")
+    titles = ("Density NRMSE", JY_PAPER_PANEL_TITLE)
     xticklabels = [format_visible_ratio_percent(ratio) for ratio in ratios]
     for ax, title in zip(axes, titles):
         ax.set_title(title, fontsize=10)
@@ -2249,6 +2291,7 @@ def main() -> None:
             "shared_b_probe_layout": True,
             "layout": "1x2_density_jy",
             "b_visible_levels": list(DEFAULT_MAGNETIC_ABLATION_VISIBLE_PERCENTS),
+            **_jy_signature_fields(),
         }
 
     def forecast_signature() -> Dict:
@@ -2257,6 +2300,7 @@ def main() -> None:
             "figure": "forecast",
             "histories": default_density_forecast_visible_frames(24),
             "b_conditions": ["B_full", "B_hidden"],
+            **_jy_signature_fields(),
         }
 
     def superres_signature() -> Dict:
@@ -2266,6 +2310,7 @@ def main() -> None:
             "probe_counts": [int(value) for value in args.density_probe_counts],
             "b_conditions": ["B_full", "B_hidden"],
             "line_style": "two_color_b_conditions",
+            **_jy_signature_fields(),
         }
 
     def sliding_signature() -> Dict:

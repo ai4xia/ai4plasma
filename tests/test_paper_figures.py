@@ -20,6 +20,10 @@ from make_paper_figures import (  # noqa: E402
     EXPECTED_SUPERRES_ROW_NAMES,
     FIGURE_STEMS,
     MAGNETIC_DENSITY_CONDITIONS,
+    JY_INCLUDES_MU0,
+    JY_PAPER_PANEL_TITLE,
+    JY_STATS_CACHE_VERSION,
+    JY_STATS_PREPROCESSING,
     PAPER_CACHE_VERSION,
     SUPERRES_B_CONDITION_STYLES,
     SLIDING_AGGREGATE_N_FRAMES,
@@ -88,6 +92,8 @@ def _write_validation_json(
         "local_frames": list(range(n_frames)),
         "context_length": n_frames,
         "run_count": n_runs,
+        "jy_preprocessing": JY_STATS_PREPROCESSING,
+        "jy_includes_mu0": JY_INCLUDES_MU0,
     }
     if experiment is not None:
         payload["experiment"] = experiment
@@ -223,7 +229,7 @@ def test_forecast_cache_contains_both_b_conditions(tmp_path):
     assert [row["history"] for row in meta["rows"]["B_hidden"]] == [23, 18, 12, 6]
     result = plot_density_forecast_summary(arrays, meta, tmp_path, dpi=80)
     assert result["layout"] == (1, 2)
-    assert result["titles"] == ["Density NRMSE", "Jy NRMSE"]
+    assert result["titles"] == ["Density NRMSE", JY_PAPER_PANEL_TITLE]
     assert result["sharey"] is True
     assert result["ylims"][0] == result["ylims"][1]
     assert (tmp_path / f"{FIGURE_STEMS['forecast']}.png").exists()
@@ -299,7 +305,7 @@ def test_magnetic_ablation_plot_is_1x2_with_both_density_conditions(tmp_path):
         arrays[f"{prefix}_jy_p84"] = median * 1.7
     result = plot_magnetic_ablation_summary(arrays, {}, tmp_path, dpi=80)
     assert result["layout"] == (1, 2)
-    assert result["titles"] == ["Density NRMSE", "Jy NRMSE"]
+    assert result["titles"] == ["Density NRMSE", JY_PAPER_PANEL_TITLE]
     assert result["sharey"] is True
     assert result["ylims"][0] == result["ylims"][1]
     assert result["density_conditions"] == [
@@ -351,7 +357,7 @@ def test_superres_plot_uses_probe_over_xz(tmp_path):
     np.testing.assert_allclose(meta["visible_ratio_percent"], expected)
     assert size_x * size_z != 154 * 62
     assert result["layout"] == (1, 2)
-    assert result["titles"] == ["Density NRMSE", "Jy NRMSE"]
+    assert result["titles"] == ["Density NRMSE", JY_PAPER_PANEL_TITLE]
     assert result["sharey"] is True
     assert result["ylims"][0] == result["ylims"][1]
     assert result["b_condition_styles"] == {
@@ -689,41 +695,89 @@ def test_sliding_probe_count_signature_invalidates_old_fraction_cache():
     assert not paper_signatures_match(old, new)
 
 
+def test_validation_json_rejects_stale_standardized_b_jy(tmp_path):
+    checkpoint = _touch_checkpoint(tmp_path / "latest.pt")
+    path = _val_json_path(tmp_path, hide_magnetic=False, experiment="forecast")
+    _write_validation_json(
+        path,
+        checkpoint,
+        list(EXPECTED_FORECAST_ROW_NAMES),
+        experiment="density_forecast",
+    )
+    payload = json.loads(path.read_text())
+    payload["jy_preprocessing"] = "checkpoint channel-standardized Bx,Bz"
+    path.write_text(json.dumps(payload))
+    assert (
+        try_load_validation_json(
+            tmp_path,
+            checkpoint,
+            "forecast",
+            hide_magnetic=False,
+            checkpoint_epoch=4500,
+        )
+        is None
+    )
+
+
 def test_compatible_cache_versions_reuse_unchanged_signatures():
-    assert PAPER_CACHE_VERSION == 11
-    assert 10 in COMPATIBLE_PAPER_CACHE_VERSIONS
-    for figure in ("spatial", "forecast", "superres", "sliding"):
-        stored = {"cache_version": 10, "figure": figure, "payload": 1}
-        current = {"cache_version": 11, "figure": figure, "payload": 1}
+    assert PAPER_CACHE_VERSION == 13
+    assert 12 in COMPATIBLE_PAPER_CACHE_VERSIONS
+    for figure in ("spatial", "sliding"):
+        stored = {"cache_version": 12, "figure": figure, "payload": 1}
+        current = {"cache_version": 13, "figure": figure, "payload": 1}
         assert paper_signatures_match(stored, current)
-    stored = {"cache_version": 2, "figure": "forecast", "histories": [23]}
-    current = {"cache_version": 11, "figure": "forecast", "histories": [23]}
-    assert paper_signatures_match(stored, current)
-    old_mag = {
-        "cache_version": 9,
-        "figure": "magnetic_ablation",
-        "density_visible": 0.0,
-        "b_visible_levels": list(DEFAULT_MAGNETIC_ABLATION_VISIBLE_PERCENTS),
+    old_forecast = {
+        "cache_version": 12,
+        "figure": "forecast",
+        "histories": [23],
+        "b_conditions": ["B_full", "B_hidden"],
+        "jy_includes_mu0": False,
     }
-    new_mag = {
-        "cache_version": 11,
+    new_forecast = {
+        **old_forecast,
+        "cache_version": 13,
+        "jy_preprocessing": JY_STATS_PREPROCESSING,
+        "jy_stats_cache_version": JY_STATS_CACHE_VERSION,
+        "jy_includes_mu0": JY_INCLUDES_MU0,
+        "B_unit": "T",
+        "jy_unit": "A/m^2",
+    }
+    assert not paper_signatures_match(old_forecast, new_forecast)
+    old_mag = {
+        "cache_version": 12,
         "figure": "magnetic_ablation",
         "density_conditions": ["fully_hidden", "visible_100"],
         "shared_b_probe_layout": True,
         "layout": "1x2_density_jy",
         "b_visible_levels": list(DEFAULT_MAGNETIC_ABLATION_VISIBLE_PERCENTS),
+        "jy_includes_mu0": False,
+    }
+    new_mag = {
+        **old_mag,
+        "cache_version": 13,
+        "jy_preprocessing": JY_STATS_PREPROCESSING,
+        "jy_stats_cache_version": JY_STATS_CACHE_VERSION,
+        "jy_includes_mu0": JY_INCLUDES_MU0,
+        "B_unit": "T",
+        "jy_unit": "A/m^2",
     }
     assert not paper_signatures_match(old_mag, new_mag)
     old_superres = {
-        "cache_version": 10,
+        "cache_version": 12,
         "figure": "superres",
         "probe_counts": [0, 10, 100, 1000],
         "b_conditions": ["B_full", "B_hidden"],
+        "line_style": "two_color_b_conditions",
+        "jy_includes_mu0": False,
     }
     new_superres = {
         **old_superres,
-        "cache_version": 11,
-        "line_style": "two_color_b_conditions",
+        "cache_version": 13,
+        "jy_preprocessing": JY_STATS_PREPROCESSING,
+        "jy_stats_cache_version": JY_STATS_CACHE_VERSION,
+        "jy_includes_mu0": JY_INCLUDES_MU0,
+        "B_unit": "T",
+        "jy_unit": "A/m^2",
     }
     assert not paper_signatures_match(old_superres, new_superres)
 

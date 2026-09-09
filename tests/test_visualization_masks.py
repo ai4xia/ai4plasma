@@ -15,7 +15,16 @@ from data.masking import _spatial_block_plane, sample_mask  # noqa: E402
 
 from visualize_mask_patterns_unet3d import (  # noqa: E402
     DEFAULT_MAGNETIC_ABLATION_VISIBLE_FRACTIONS,
+    CM_TO_M,
+    JY_B_UNIT,
+    JY_INCLUDES_MU0,
     JY_NRMSE_YLABEL,
+    JY_SOURCE_COORDINATE_UNIT,
+    JY_STATS_CACHE_VERSION,
+    JY_STATS_DEFINITION,
+    JY_STATS_PREPROCESSING,
+    JY_UNIT,
+    MU0,
     make_centered_spatial_block_mask,
     apply_log_yscale_if_strictly_positive,
     build_density_forecast_rows,
@@ -25,12 +34,14 @@ from visualize_mask_patterns_unet3d import (  # noqa: E402
     aggregate_run_window_profiles,
     compute_ay_jy,
     compute_jy,
+    compute_physical_jy_from_normalized,
     collect_validation_statistics,
     default_density_forecast_visible_frames,
     format_magnetic_visible_percent,
     magnetic_ablation_visible_count,
     compute_normalized_metrics,
     information_suite_plot_cache_signature,
+    jy_metric_metadata,
     jy_nrmse_from_residual,
     jy_stats_cache_matches,
     normalize_field_np,
@@ -336,14 +347,14 @@ def test_magnetic_ablation_nrmse_panels_use_log_scale_when_positive(tmp_path):
                 "name": f"magnetic_ablation_{fraction:g}",
                 "label": f"Magnetic information ablation\n{format_magnetic_visible_percent(fraction)} (nested random)",
                 "pred_normalized": pred,
-                "pred_jy_normalized": pred_jy,
+                "pred_jy_physical": pred_jy,
             }
         )
     target = np.zeros((4, 3, 2, 2), dtype=np.float64)
     target_jy = np.zeros((3, 2, 2), dtype=np.float64)
     payload = save_information_suite_error_plot(
         target_field_normalized=target,
-        target_jy_normalized=target_jy,
+        target_jy_physical=target_jy,
         rows=rows,
         frame_ids=frames,
         out_path=tmp_path / "named_magnetic_ablation.png",
@@ -356,7 +367,7 @@ def test_magnetic_ablation_nrmse_panels_use_log_scale_when_positive(tmp_path):
     np.testing.assert_allclose(payload["rows"][0]["jy_nrmse"], [0.3, 0.3, 0.3])
     scaled_payload = save_information_suite_error_plot(
         target_field_normalized=target,
-        target_jy_normalized=target_jy,
+        target_jy_physical=target_jy,
         rows=rows,
         frame_ids=frames,
         out_path=tmp_path / "named_magnetic_ablation_scaled.png",
@@ -557,14 +568,96 @@ def test_jy_training_summary_and_cache_keys_match_visualization_definition():
     mean = np.array([0.0, 0.0, 0.0, 0.0])
     std = np.array([2.0, 1.0, 1.0, 1.0])
     extent = [-21.0, 21.0, -50.0, 50.0]
-    jy = compute_jy(normalize_field_np(field, mean, std), extent)
+    expected = (1.0 / CM_TO_M) / MU0
+    jy = compute_jy(field, extent)
     summary = summarize_jy_values(jy)
-    # Linear Bx / std=2 has constant dBx/dz = 0.5 after channel standardization.
-    np.testing.assert_allclose(jy, 0.5, atol=1e-12)
-    assert np.isclose(summary["jy_mean_train"], 0.5)
+    np.testing.assert_allclose(jy, expected, atol=1e-6, rtol=1e-12)
+    assert np.isclose(summary["jy_mean_train"], expected)
     assert np.isclose(summary["jy_std_train"], 0.0)
-    assert np.isclose(summary["jy_rms_train"], 0.5)
+    assert np.isclose(summary["jy_rms_train"], expected)
     cached = {
+        "train_runs": ["run_a"],
+        "jy_definition": JY_STATS_DEFINITION,
+        "preprocessing": JY_STATS_PREPROCESSING,
+        "jy_preprocessing": JY_STATS_PREPROCESSING,
+        "jy_stats_cache_version": JY_STATS_CACHE_VERSION,
+        "jy_includes_mu0": JY_INCLUDES_MU0,
+        "B_unit": JY_B_UNIT,
+        "jy_unit": JY_UNIT,
+        "source_coordinate_unit": JY_SOURCE_COORDINATE_UNIT,
+        "derivative_coordinate_unit": "m",
+        "extent": extent,
+        "channel_mean": mean.tolist(),
+        "channel_std": std.tolist(),
+    }
+    assert jy_stats_cache_matches(cached, {"run_a"}, mean, std, extent)
+    assert not jy_stats_cache_matches(cached, {"run_b"}, mean, std, extent)
+
+
+def test_jy_denormalize_before_derivative_ignores_checkpoint_b_std():
+    field = np.zeros((4, 2, 6, 5), dtype=np.float64)
+    z = np.linspace(-21.0, 21.0, 5)
+    field[0] = z[None, None, :]
+    field[2] = 0.0
+    mean = np.array([0.1, 0.0, -0.2, 0.0])
+    std_a = np.array([2.0, 1.0, 4.0, 1.0])
+    std_b = np.array([0.5, 1.0, 8.0, 1.0])
+    extent = [-21.0, 21.0, -50.0, 50.0]
+    expected = (1.0 / CM_TO_M) / MU0
+    normalized_a = normalize_field_np(field, mean, std_a)
+    normalized_b = normalize_field_np(field, mean, std_b)
+    jy_old_a = compute_jy(normalized_a, extent)
+    jy_old_b = compute_jy(normalized_b, extent)
+    jy_new_a = compute_physical_jy_from_normalized(normalized_a, mean, std_a, extent)
+    jy_new_b = compute_physical_jy_from_normalized(normalized_b, mean, std_b, extent)
+    physical = compute_jy(field, extent)
+    np.testing.assert_allclose(physical, expected, atol=1e-6, rtol=1e-12)
+    np.testing.assert_allclose(jy_new_a, physical, atol=1e-6, rtol=1e-12)
+    np.testing.assert_allclose(jy_new_b, physical, atol=1e-6, rtol=1e-12)
+    assert not np.allclose(jy_old_a, jy_old_b)
+    assert not np.allclose(jy_old_a, physical)
+
+
+def test_jy_uses_physical_coordinate_spacing_in_meters():
+    field = np.zeros((4, 1, 5, 9), dtype=np.float64)
+    z = np.linspace(-21.0, 21.0, 9)
+    field[0] = z[None, None, :]
+    extent_cm = [-21.0, 21.0, -50.0, 50.0]
+    extent_stretched = [-42.0, 42.0, -50.0, 50.0]
+    jy_cm = compute_jy(field, extent_cm)
+    jy_stretched = compute_jy(field, extent_stretched)
+    np.testing.assert_allclose(jy_cm, (1.0 / CM_TO_M) / MU0, atol=1e-6, rtol=1e-12)
+    np.testing.assert_allclose(jy_stretched, (0.5 / CM_TO_M) / MU0, atol=1e-6, rtol=1e-12)
+    np.testing.assert_allclose(jy_cm, 2.0 * jy_stretched, rtol=1e-12)
+
+
+def test_jy_applies_one_over_mu0():
+    field = np.zeros((4, 1, 4, 5), dtype=np.float64)
+    z = np.linspace(-21.0, 21.0, 5)
+    field[0] = z[None, None, :]
+    extent = [-21.0, 21.0, -50.0, 50.0]
+    jy = compute_jy(field, extent)
+    curl = (1.0 / CM_TO_M)
+    np.testing.assert_allclose(jy * MU0, curl, atol=1e-6, rtol=1e-12)
+    np.testing.assert_allclose(MU0, 4.0 * np.pi * 1e-7)
+
+
+def test_jy_unit_metadata_is_si():
+    meta = jy_metric_metadata()
+    assert meta["B_unit"] == "T"
+    assert meta["source_coordinate_unit"] == "cm"
+    assert meta["derivative_coordinate_unit"] == "m"
+    assert meta["jy_includes_mu0"] is True
+    assert meta["jy_unit"] == "A/m^2"
+    assert meta["jy_stats_cache_version"] == JY_STATS_CACHE_VERSION
+    assert meta["jy_definition"] == JY_STATS_DEFINITION
+
+
+def test_stale_standardized_b_jy_cache_is_rejected():
+    mean = np.array([0.0, 0.0, 0.0, 0.0])
+    std = np.array([2.0, 1.0, 1.0, 1.0])
+    extent = [-21.0, 21.0, -50.0, 50.0]
+    stale_standardized = {
         "train_runs": ["run_a"],
         "jy_definition": "dBx/dz - dBz/dx",
         "preprocessing": "checkpoint channel-standardized Bx,Bz",
@@ -572,8 +665,29 @@ def test_jy_training_summary_and_cache_keys_match_visualization_definition():
         "channel_mean": mean.tolist(),
         "channel_std": std.tolist(),
     }
-    assert jy_stats_cache_matches(cached, {"run_a"}, mean, std, extent)
-    assert not jy_stats_cache_matches(cached, {"run_b"}, mean, std, extent)
+    stale_no_mu0 = {
+        "train_runs": ["run_a"],
+        "jy_definition": "dBx/dz - dBz/dx",
+        "preprocessing": (
+            "denormalize checkpoint-standardized Bx,Bz to HDF5 stored values, "
+            "then differentiate"
+        ),
+        "jy_preprocessing": (
+            "denormalize checkpoint-standardized Bx,Bz to HDF5 stored values, "
+            "then differentiate"
+        ),
+        "jy_stats_cache_version": 2,
+        "jy_includes_mu0": False,
+        "B_unit": "HDF5 stored Bx/Bz",
+        "jy_unit": "HDF5 B units / cm",
+        "source_coordinate_unit": "cm",
+        "derivative_coordinate_unit": "cm",
+        "extent": extent,
+        "channel_mean": mean.tolist(),
+        "channel_std": std.tolist(),
+    }
+    assert not jy_stats_cache_matches(stale_standardized, {"run_a"}, mean, std, extent)
+    assert not jy_stats_cache_matches(stale_no_mu0, {"run_a"}, mean, std, extent)
 
 
 def test_collect_validation_statistics_scales_jy_nrmse_by_training_std():
@@ -634,6 +748,21 @@ def test_collect_validation_statistics_scales_jy_nrmse_by_training_std():
     np.testing.assert_allclose(
         scaled["density_superres"][0]["density"]["median"],
         raw["density_superres"][0]["density"]["median"],
+    )
+    distorted = collect_validation_statistics(
+        model=ZeroFieldModel(),
+        dataset=LinearBxDataset(),
+        sample_indices=[0],
+        args=args,
+        mean=torch.zeros((1, 4, 1, 1, 1)),
+        std=torch.tensor([2.0, 1.0, 4.0, 1.0]).view(1, 4, 1, 1, 1),
+        device=torch.device("cpu"),
+        canonical_rows=canonical_rows,
+        jy_std_train=1.0,
+    )
+    np.testing.assert_allclose(
+        distorted["density_superres"][0]["jy"]["median"],
+        raw_jy,
     )
 
 

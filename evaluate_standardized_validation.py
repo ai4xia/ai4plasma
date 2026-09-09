@@ -24,12 +24,15 @@ from data.vpic_hdf5_dataset import VPICWindowDataset
 from models.unet3d import LEGACY_MODEL_VERSION, UNet3D
 from visualize_mask_patterns_unet3d import (
     DEFAULT_RUN_DIR,
+    JY_NRMSE_DEFINITION,
     JY_STATS_DEFINITION,
     checkpoint_cache_signature,
     compute_jy,
+    denormalize,
     expand_path,
     get_train_runs,
     get_val_runs,
+    jy_metric_metadata,
     load_checkpoint,
     load_or_compute_jy_training_stats,
     normalize,
@@ -37,7 +40,7 @@ from visualize_mask_patterns_unet3d import (
 )
 
 
-CACHE_VERSION = 1
+CACHE_VERSION = 3
 OUTPUT_DIRNAME = "paper_figures_v1/standardized_validation"
 CACHE_STEM = "standardized_validation"
 PATTERN_LABELS = {
@@ -53,10 +56,6 @@ OVERALL_MSE_DEFINITION = (
 )
 DENSITY_NRMSE_DEFINITION = (
     "sqrt(mean((prediction_normalized - target_normalized)^2)) on the Density channel"
-)
-JY_NRMSE_DEFINITION = (
-    "RMSE(Jy_pred - Jy_target) / training-set Jy std, with Jy = dBx/dz - dBz/dx "
-    "on checkpoint-standardized Bx,Bz"
 )
 
 
@@ -134,6 +133,7 @@ def window_jy_nrmse(
     extent: Sequence[float],
     jy_std_train: float,
 ) -> float:
+    """Jy NRMSE on already-physical (HDF5-stored) Bx/Bz fields."""
     scale = float(jy_std_train)
     if scale <= 0.0:
         raise ValueError(f"jy_std_train must be positive, got {scale}.")
@@ -225,6 +225,17 @@ def cache_signature(
         "shared_channel_mask": True,
         "jy_stats": {
             "jy_definition": jy_stats.get("jy_definition", JY_STATS_DEFINITION),
+            "jy_preprocessing": jy_stats.get("jy_preprocessing")
+            or jy_stats.get("preprocessing"),
+            "jy_stats_cache_version": jy_stats.get("jy_stats_cache_version"),
+            "jy_includes_mu0": jy_stats.get("jy_includes_mu0"),
+            "B_unit": jy_stats.get("B_unit", jy_stats.get("jy_b_units")),
+            "source_coordinate_unit": jy_stats.get("source_coordinate_unit"),
+            "derivative_coordinate_unit": jy_stats.get("derivative_coordinate_unit"),
+            "jy_unit": jy_stats.get("jy_unit", jy_stats.get("jy_physical_units")),
+            "jy_b_units": jy_stats.get("jy_b_units"),
+            "jy_coordinate_units": jy_stats.get("jy_coordinate_units"),
+            "jy_physical_units": jy_stats.get("jy_physical_units"),
             "jy_std_train": float(jy_stats["jy_std_train"]),
             "jy_mean_train": float(jy_stats["jy_mean_train"]),
             "n_runs": jy_stats.get("n_runs"),
@@ -405,6 +416,8 @@ def evaluate_windows(
         prediction = model(torch.cat([visible, stacked_mask], dim=1)).float()
         target_np = stacked_target[0].detach().cpu().numpy()
         pred_np = prediction.detach().cpu().numpy()
+        target_phys_np = target[0].detach().cpu().numpy()
+        pred_phys_np = denormalize(prediction, mean, std).detach().cpu().numpy()
         metadata = sample["metadata"]
         for pattern_index, pattern in enumerate(FIXED_VALIDATION_PATTERNS):
             pred_i = pred_np[pattern_index]
@@ -418,7 +431,12 @@ def evaluate_windows(
                     "pattern": pattern,
                     "overall_mse": window_overall_mse(pred_i, target_np),
                     "density_nrmse": window_density_nrmse(pred_i, target_np),
-                    "jy_nrmse": window_jy_nrmse(pred_i, target_np, extent, jy_std_train),
+                    "jy_nrmse": window_jy_nrmse(
+                        pred_phys_np[pattern_index],
+                        target_phys_np,
+                        extent,
+                        jy_std_train,
+                    ),
                     "validate_style_mse": float(
                         full_mse_loss(pred_i_t, target_i, mask_i).detach().cpu()
                     ),
@@ -506,6 +524,8 @@ def main() -> None:
             mean=mean,
             std=std,
             extent=args.extent,
+            checkpoint_path=ckpt_path,
+            checkpoint_epoch=checkpoint_epoch,
         )
         model = UNet3D(
             in_channels=8,
@@ -528,6 +548,15 @@ def main() -> None:
             device=device,
             extent=args.extent,
             jy_std_train=float(jy_stats["jy_std_train"]),
+        )
+        signature = cache_signature(
+            checkpoint_path=ckpt_path,
+            checkpoint_epoch=checkpoint_epoch,
+            split=split,
+            mean=mean_list,
+            std=std_list,
+            jy_stats=jy_stats,
+            extent=args.extent,
         )
         summary = summarize_from_records(records)
         per_run = per_run_means(records)
@@ -560,6 +589,13 @@ def main() -> None:
                 "it is metadata only and is not the paper table statistic"
             ),
         }
+        payload.update(
+            jy_metric_metadata(
+                jy_stats=jy_stats,
+                checkpoint_path=ckpt_path,
+                checkpoint_epoch=checkpoint_epoch,
+            )
+        )
         save_payload(payload, out_dir)
         dataset.close()
 

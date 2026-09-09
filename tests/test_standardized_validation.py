@@ -15,6 +15,7 @@ from data.masking import (  # noqa: E402
 )
 from evaluate_standardized_validation import (  # noqa: E402
     CACHE_STEM,
+    CACHE_VERSION,
     build_standardized_masks,
     cache_signature,
     cross_run_stats,
@@ -22,8 +23,19 @@ from evaluate_standardized_validation import (  # noqa: E402
     per_run_means,
     summarize_from_records,
     window_density_nrmse,
+    window_jy_nrmse,
     window_overall_mse,
     write_tables_from_payload,
+)
+from visualize_mask_patterns_unet3d import (  # noqa: E402
+    CM_TO_M,
+    JY_INCLUDES_MU0,
+    JY_STATS_CACHE_VERSION,
+    JY_STATS_PREPROCESSING,
+    MU0,
+    compute_jy,
+    denormalize_field_np,
+    normalize_field_np,
 )
 
 
@@ -168,3 +180,73 @@ def test_cache_reuse_and_checkpoint_change_invalidates(tmp_path):
     )
     assert changed != signature
     assert load_cached_payload(tmp_path, changed) is None
+
+
+def test_standardized_validation_cache_version_and_jy_preprocessing(tmp_path):
+    assert CACHE_VERSION == 3
+    checkpoint = tmp_path / "latest.pt"
+    checkpoint.write_bytes(b"abc")
+    jy_old = {
+        "jy_std_train": 1.0,
+        "jy_mean_train": 0.0,
+        "jy_definition": "dBx/dz - dBz/dx",
+        "jy_preprocessing": "checkpoint channel-standardized Bx,Bz",
+        "jy_includes_mu0": False,
+        "n_runs": 1,
+        "count": 1,
+    }
+    jy_new = {
+        **jy_old,
+        "jy_preprocessing": JY_STATS_PREPROCESSING,
+        "jy_stats_cache_version": JY_STATS_CACHE_VERSION,
+        "jy_includes_mu0": JY_INCLUDES_MU0,
+        "B_unit": "T",
+        "jy_unit": "A/m^2",
+    }
+    split = {"val_runs": ["run_a"], "train_runs": ["train"]}
+    old_sig = cache_signature(
+        checkpoint_path=checkpoint,
+        checkpoint_epoch=4500,
+        split=split,
+        mean=[0.0, 0.0, 0.0, 0.0],
+        std=[1.0, 1.0, 1.0, 1.0],
+        jy_stats=jy_old,
+        extent=[-21.0, 21.0, -50.0, 50.0],
+    )
+    new_sig = cache_signature(
+        checkpoint_path=checkpoint,
+        checkpoint_epoch=4500,
+        split=split,
+        mean=[0.0, 0.0, 0.0, 0.0],
+        std=[1.0, 1.0, 1.0, 1.0],
+        jy_stats=jy_new,
+        extent=[-21.0, 21.0, -50.0, 50.0],
+    )
+    assert old_sig != new_sig
+    assert new_sig["cache_version"] == 3
+    assert new_sig["jy_stats"]["jy_preprocessing"] == JY_STATS_PREPROCESSING
+    assert new_sig["jy_stats"]["jy_includes_mu0"] is True
+
+
+def test_window_jy_nrmse_denormalizes_before_derivatives():
+    field = np.zeros((4, 2, 6, 5), dtype=np.float64)
+    z = np.linspace(-21.0, 21.0, 5)
+    field[0] = z[None, None, :]
+    pred = np.zeros_like(field)
+    extent = [-21.0, 21.0, -50.0, 50.0]
+    jy_scale = float(np.abs(np.mean(compute_jy(field, extent))))
+    np.testing.assert_allclose(window_jy_nrmse(pred, field, extent, jy_scale), 1.0)
+    np.testing.assert_allclose(jy_scale, (1.0 / CM_TO_M) / MU0, rtol=1e-12)
+    mean = np.zeros(4)
+    std = np.array([2.0, 1.0, 4.0, 1.0])
+    pred_norm = normalize_field_np(pred, mean, std)
+    target_norm = normalize_field_np(field, mean, std)
+    old_wrong = window_jy_nrmse(pred_norm, target_norm, extent, jy_scale)
+    assert not np.isclose(old_wrong, 1.0)
+    new = window_jy_nrmse(
+        denormalize_field_np(pred_norm, mean, std),
+        denormalize_field_np(target_norm, mean, std),
+        extent,
+        jy_scale,
+    )
+    np.testing.assert_allclose(new, 1.0)

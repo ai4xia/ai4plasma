@@ -49,11 +49,34 @@ DEFAULT_MAGNETIC_ABLATION_VISIBLE_FRACTIONS = tuple(
     percent / 100.0 for percent in DEFAULT_MAGNETIC_ABLATION_VISIBLE_PERCENTS
 )
 JY_STATS_FILENAME = "jy_stats.json"
-JY_NRMSE_YLABEL = "Jy NRMSE (normalized by training-set Jy std)"
-JY_STATS_DEFINITION = "dBx/dz - dBz/dx"
-JY_STATS_PREPROCESSING = "checkpoint channel-standardized Bx,Bz"
+JY_STATS_CACHE_VERSION = 3
+MU0 = 4.0 * math.pi * 1e-7
+CM_TO_M = 0.01
+JY_STATS_DEFINITION = "(1/mu0)*(dBx/dz - dBz/dx)"
+JY_STATS_PREPROCESSING = (
+    "denormalize checkpoint-standardized Bx,Bz to Tesla, convert --extent cm to m, "
+    "then multiply curl by 1/mu0"
+)
+JY_B_UNIT = "T"
+JY_B_UNITS = JY_B_UNIT
+JY_SOURCE_COORDINATE_UNIT = "cm"
+JY_DERIVATIVE_COORDINATE_UNIT = "m"
+JY_COORDINATE_UNITS = JY_SOURCE_COORDINATE_UNIT
+JY_COORDINATE_SOURCE = (
+    "visualization --extent [zmin, zmax, xmin, xmax]; default [-21, 21, -50, 50]; "
+    "plot labels z [cm], x [cm]; derivatives use meters"
+)
+JY_INCLUDES_MU0 = True
+JY_UNIT = "A/m^2"
+JY_PHYSICAL_UNITS = JY_UNIT
+JY_NRMSE_YLABEL = "Jy NRMSE"
+JY_NRMSE_DEFINITION = (
+    "RMSE(Jy_pred - Jy_target) / std(Jy over training runs), with "
+    "Jy = (1/mu0)*(dBx/dz - dBz/dx) after denormalizing Bx,Bz to Tesla "
+    "and converting x,z from cm to m"
+)
 PLOT_CACHE_FILENAME = "plot_cache.pkl"
-PLOT_CACHE_VERSION = 1
+PLOT_CACHE_VERSION = 3
 
 
 def format_magnetic_visible_percent(visible_fraction: float) -> str:
@@ -100,7 +123,7 @@ def apply_log_yscale_if_strictly_positive(
 
 def save_information_suite_error_plot(
     target_field_normalized: np.ndarray,
-    target_jy_normalized: np.ndarray,
+    target_jy_physical: np.ndarray,
     rows: List[Dict],
     frame_ids: np.ndarray,
     out_path: Path,
@@ -108,7 +131,7 @@ def save_information_suite_error_plot(
     experiment_name: str = "",
     jy_std_train: float = 1.0,
 ) -> Dict:
-    """Plot framewise RMS errors in preprocessing-standardized units."""
+    """Plot Density NRMSE in checkpoint-normalized units and physical-unit Jy NRMSE."""
     fig, axes = plt.subplots(2, 1, figsize=(10.5, 7.0), sharex=True)
     payload = []
     density_series = []
@@ -118,7 +141,7 @@ def save_information_suite_error_plot(
             row["pred_normalized"][3], target_field_normalized[3]
         )
         jy_residual = normalized_residual(
-            row["pred_jy_normalized"], target_jy_normalized
+            row["pred_jy_physical"], target_jy_physical
         )
         density_nrmse = np.sqrt(np.mean(np.square(density_residual), axis=(1, 2)))
         jy_nrmse = jy_nrmse_from_residual(jy_residual, jy_std_train)
@@ -165,14 +188,17 @@ def save_information_suite_error_plot(
     fig.savefig(out_path, dpi=180)
     plt.close(fig)
     print(f"Saved framewise error plot: {out_path}")
-    return {
+    payload_out = {
         "frame_ids": frame_ids.tolist(),
         "density_nrmse_yscale": yscales["density"],
         "jy_nrmse_yscale": yscales["jy"],
         "jy_nrmse_ylabel": JY_NRMSE_YLABEL,
+        "jy_nrmse_definition": JY_NRMSE_DEFINITION,
         "jy_std_train": float(jy_std_train),
         "rows": payload,
     }
+    payload_out.update(jy_metric_metadata())
+    return payload_out
 
 
 def resolve_checkpoint_path(run_dir: Path, checkpoint: str) -> Path:
@@ -226,6 +252,11 @@ def information_suite_plot_cache_signature(
         "plot_units": args.plot_units,
         "extent": [float(value) for value in args.extent],
         "h5_dir": args.h5_dir,
+        "jy_preprocessing": JY_STATS_PREPROCESSING,
+        "jy_stats_cache_version": JY_STATS_CACHE_VERSION,
+        "jy_includes_mu0": JY_INCLUDES_MU0,
+        "B_unit": JY_B_UNIT,
+        "jy_unit": JY_UNIT,
     }
 
 
@@ -1397,7 +1428,7 @@ def compute_ay_jy(
 
     The sign convention matches visualization.ipynb:
         Bx = -dAy/dz, Bz = dAy/dx
-        Jy = dBx/dz - dBz/dx
+        Jy = (1/mu0)*(dBx/dz - dBz/dx)
 
     Ay is path-integrated exactly as in the notebook and its arbitrary additive
     constant is removed independently for every frame.  This function is only
@@ -1434,15 +1465,31 @@ def compute_ay_jy(
 
 
 def compute_jy(field: np.ndarray, extent: Sequence[float]) -> np.ndarray:
-    """Derive Jy(T,X,Z) without the more expensive Ay path integration."""
+    """Jy = (1/mu0)*(dBx/dz - dBz/dx) in A/m^2.
+
+    ``field`` Bx/Bz are Tesla. ``extent`` is ``[zmin, zmax, xmin, xmax]`` in cm
+    and is converted to meters before differentiation.
+    """
     if field.ndim != 4 or field.shape[0] < 3:
         raise ValueError(f"Expected (C, T, X, Z) with Bx/Bz channels, got {field.shape}")
     bx = np.asarray(field[0], dtype=np.float64)
     bz = np.asarray(field[2], dtype=np.float64)
-    x, z = physical_coordinates(bx.shape[-2:], extent)
+    x_cm, z_cm = physical_coordinates(bx.shape[-2:], extent)
+    x = x_cm * CM_TO_M
+    z = z_cm * CM_TO_M
     d_bx_dz = np.gradient(bx, z, axis=2)
     d_bz_dx = np.gradient(bz, x, axis=1)
-    return d_bx_dz - d_bz_dx
+    return (d_bx_dz - d_bz_dx) / MU0
+
+
+def compute_physical_jy_from_normalized(
+    field_normalized: np.ndarray,
+    mean: torch.Tensor | np.ndarray | Sequence[float],
+    std: torch.Tensor | np.ndarray | Sequence[float],
+    extent: Sequence[float],
+) -> np.ndarray:
+    """Denormalize checkpoint-standardized Bx/Bz to Tesla, then SI Jy."""
+    return compute_jy(denormalize_field_np(field_normalized, mean, std), extent)
 
 
 def jy_nrmse_from_residual(jy_residual: np.ndarray, jy_std_train: float) -> np.ndarray:
@@ -1481,6 +1528,59 @@ def normalize_field_np(
     mean_np, std_np = _channel_stat_vectors(mean, std)
     field_np = np.asarray(field, dtype=np.float64)
     return (field_np - mean_np[:, None, None, None]) / (std_np[:, None, None, None] + 1e-8)
+
+
+def denormalize_field_np(
+    field: np.ndarray,
+    mean: torch.Tensor | np.ndarray | Sequence[float],
+    std: torch.Tensor | np.ndarray | Sequence[float],
+) -> np.ndarray:
+    """Invert checkpoint channel standardization back to HDF5 stored B/Density."""
+    mean_np, std_np = _channel_stat_vectors(mean, std)
+    field_np = np.asarray(field, dtype=np.float64)
+    return field_np * (std_np[:, None, None, None] + 1e-8) + mean_np[:, None, None, None]
+
+
+def jy_metric_metadata(
+    jy_stats: Dict | None = None,
+    checkpoint_path: Path | str | None = None,
+    checkpoint_epoch: int | None = None,
+) -> Dict:
+    """Provenance for physical-unit Jy metrics and training-set statistics."""
+    meta = {
+        "jy_definition": JY_STATS_DEFINITION,
+        "jy_preprocessing": JY_STATS_PREPROCESSING,
+        "preprocessing": JY_STATS_PREPROCESSING,
+        "B_unit": JY_B_UNIT,
+        "jy_b_units": JY_B_UNITS,
+        "source_coordinate_unit": JY_SOURCE_COORDINATE_UNIT,
+        "derivative_coordinate_unit": JY_DERIVATIVE_COORDINATE_UNIT,
+        "jy_coordinate_units": JY_COORDINATE_UNITS,
+        "jy_coordinate_source": JY_COORDINATE_SOURCE,
+        "jy_includes_mu0": JY_INCLUDES_MU0,
+        "jy_unit": JY_UNIT,
+        "jy_physical_units": JY_PHYSICAL_UNITS,
+        "jy_stats_cache_version": JY_STATS_CACHE_VERSION,
+        "jy_nrmse_definition": JY_NRMSE_DEFINITION,
+        "mu0": MU0,
+    }
+    if jy_stats is not None:
+        for key in ("jy_mean_train", "jy_std_train", "jy_rms_train", "count", "n_runs"):
+            if key in jy_stats:
+                meta[key] = jy_stats[key]
+        if checkpoint_path is None and jy_stats.get("source_checkpoint_path"):
+            checkpoint_path = jy_stats["source_checkpoint_path"]
+        elif checkpoint_path is None and jy_stats.get("source_checkpoint"):
+            checkpoint_path = jy_stats["source_checkpoint"]
+        if checkpoint_epoch is None and jy_stats.get("source_checkpoint_epoch") is not None:
+            checkpoint_epoch = jy_stats["source_checkpoint_epoch"]
+    if checkpoint_path is not None:
+        ckpt = Path(checkpoint_path)
+        meta["source_checkpoint"] = ckpt.name
+        meta["source_checkpoint_path"] = str(checkpoint_path)
+    if checkpoint_epoch is not None:
+        meta["source_checkpoint_epoch"] = int(checkpoint_epoch)
+    return meta
 
 
 def summarize_jy_values(jy: np.ndarray) -> Dict[str, float]:
@@ -1528,8 +1628,10 @@ def compute_jy_training_stats(
     mean: torch.Tensor | np.ndarray | Sequence[float],
     std: torch.Tensor | np.ndarray | Sequence[float],
     extent: Sequence[float],
+    checkpoint_path: Path | str | None = None,
+    checkpoint_epoch: int | None = None,
 ) -> Dict:
-    """Jy mean/std/rms on training runs only, matching visualization Jy."""
+    """Jy mean/std/rms on training-run HDF5 Bx/Bz treated as Tesla."""
     if not train_runs:
         raise ValueError("Cannot compute Jy training stats without training runs.")
 
@@ -1538,7 +1640,7 @@ def compute_jy_training_stats(
     count = 0
     n_runs = 0
     for _run_name, field in iter_unique_run_fields(dataset, train_runs):
-        jy = compute_jy(normalize_field_np(field, mean, std), extent)
+        jy = compute_jy(field, extent)
         sum_j += float(jy.sum())
         sumsq_j += float(np.square(jy).sum())
         count += int(jy.size)
@@ -1552,7 +1654,7 @@ def compute_jy_training_stats(
     jy_mean = sum_j / count
     jy_var = max(sumsq_j / count - jy_mean * jy_mean, 0.0)
     mean_np, std_np = _channel_stat_vectors(mean, std)
-    return {
+    stats = {
         "jy_mean_train": float(jy_mean),
         "jy_std_train": float(np.sqrt(jy_var)),
         "jy_rms_train": float(np.sqrt(sumsq_j / count)),
@@ -1562,10 +1664,15 @@ def compute_jy_training_stats(
         "extent": [float(v) for v in extent],
         "channel_mean": mean_np.tolist(),
         "channel_std": std_np.tolist(),
-        "jy_definition": JY_STATS_DEFINITION,
-        "preprocessing": JY_STATS_PREPROCESSING,
         "source": "training_runs",
     }
+    stats.update(
+        jy_metric_metadata(
+            checkpoint_path=checkpoint_path,
+            checkpoint_epoch=checkpoint_epoch,
+        )
+    )
+    return stats
 
 
 def jy_stats_cache_matches(
@@ -1579,7 +1686,24 @@ def jy_stats_cache_matches(
         return False
     if str(cached.get("jy_definition", "")) != JY_STATS_DEFINITION:
         return False
-    if str(cached.get("preprocessing", "")) != JY_STATS_PREPROCESSING:
+    recorded_preprocessing = str(
+        cached.get("jy_preprocessing", cached.get("preprocessing", ""))
+    )
+    if recorded_preprocessing != JY_STATS_PREPROCESSING:
+        return False
+    if int(cached.get("jy_stats_cache_version", -1)) != JY_STATS_CACHE_VERSION:
+        return False
+    if "jy_includes_mu0" not in cached:
+        return False
+    if bool(cached.get("jy_includes_mu0")) != JY_INCLUDES_MU0:
+        return False
+    if str(cached.get("B_unit", cached.get("jy_b_units", ""))) != JY_B_UNIT:
+        return False
+    if str(cached.get("jy_unit", cached.get("jy_physical_units", ""))) != JY_UNIT:
+        return False
+    if str(cached.get("source_coordinate_unit", "")) != JY_SOURCE_COORDINATE_UNIT:
+        return False
+    if str(cached.get("derivative_coordinate_unit", "")) != JY_DERIVATIVE_COORDINATE_UNIT:
         return False
     mean_np, std_np = _channel_stat_vectors(mean, std)
     try:
@@ -1599,8 +1723,10 @@ def load_or_compute_jy_training_stats(
     mean: torch.Tensor | np.ndarray | Sequence[float],
     std: torch.Tensor | np.ndarray | Sequence[float],
     extent: Sequence[float],
+    checkpoint_path: Path | str | None = None,
+    checkpoint_epoch: int | None = None,
 ) -> Dict:
-    """Reuse run-dir/jy_stats.json when the definition and split still match."""
+    """Reuse run-dir/jy_stats.json when the physical-unit definition still matches."""
     cache_path = Path(run_dir) / JY_STATS_FILENAME
     if cache_path.exists():
         cached = json.loads(cache_path.read_text())
@@ -1615,7 +1741,8 @@ def load_or_compute_jy_training_stats(
             return cached
         print(
             f"Cached Jy stats at {cache_path} do not match the current "
-            "training split / extent / channel stats; recomputing."
+            "physical-unit Jy definition / training split / extent / channel "
+            "stats; recomputing."
         )
 
     stats = compute_jy_training_stats(
@@ -1624,6 +1751,8 @@ def load_or_compute_jy_training_stats(
         mean=mean,
         std=std,
         extent=extent,
+        checkpoint_path=checkpoint_path,
+        checkpoint_epoch=checkpoint_epoch,
     )
     cache_path.write_text(json.dumps(stats, indent=2))
     print(f"Saved Jy training stats: {cache_path}")
@@ -1834,7 +1963,7 @@ def save_validation_statistics_plot(
     fig.savefig(out_path, dpi=180)
     plt.close(fig)
     print(f"Saved validation statistics plot: {out_path}")
-    return {
+    payload_out = {
         "experiment": experiment_name,
         "local_frames": local_frames.tolist(),
         "context_length": context_length,
@@ -1843,6 +1972,7 @@ def save_validation_statistics_plot(
         "density_nrmse_yscale": yscales["density"],
         "jy_nrmse_yscale": yscales["jy"],
         "jy_nrmse_ylabel": JY_NRMSE_YLABEL,
+        "jy_nrmse_definition": JY_NRMSE_DEFINITION,
         "aggregation_policy": (
             "median across windows within each run, then cross-run median and "
             "16th-84th percentiles"
@@ -1851,6 +1981,8 @@ def save_validation_statistics_plot(
         "window_counts_by_run": row_statistics[0]["density"]["window_counts"],
         "rows": payload_rows,
     }
+    payload_out.update(jy_metric_metadata())
+    return payload_out
 
 
 @torch.no_grad()
@@ -1884,7 +2016,8 @@ def collect_validation_statistics(
         target = sample["block"].unsqueeze(0).to(device)
         target_normalized = normalize(target, mean, std)
         target_np = target_normalized[0].detach().cpu().numpy()
-        target_jy = compute_jy(target_np, args.extent)
+        target_physical = target[0].detach().cpu().numpy()
+        target_jy = compute_jy(target_physical, args.extent)
         run_name = sample["metadata"]["run_name"]
         for experiment_name, canonical_experiment_rows in canonical_rows.items():
             masks = torch.stack(
@@ -1916,7 +2049,9 @@ def collect_validation_statistics(
                 density_nrmse = np.sqrt(
                     np.mean(np.square(density_residual), axis=(1, 2))
                 )
-                prediction_jy = compute_jy(predictions[row_index], args.extent)
+                prediction_jy = compute_physical_jy_from_normalized(
+                    predictions[row_index], mean, std, args.extent
+                )
                 jy_nrmse = jy_nrmse_from_residual(
                     prediction_jy - target_jy, jy_std_train
                 )
@@ -2228,7 +2363,7 @@ def combine_table_images(
 def plot_jy_ay_by_mask_patterns(
     target_ay: np.ndarray,
     target_jy: np.ndarray,
-    target_jy_normalized: np.ndarray,
+    target_jy_physical: np.ndarray,
     target_field: np.ndarray,
     rows: List[Dict],
     metadata: Dict,
@@ -2263,14 +2398,14 @@ def plot_jy_ay_by_mask_patterns(
     all_pred_jy = [row["pred_jy"][t] for row in rows for t in color_times]
     residual_arrays = [
         normalized_residual(
-            row["pred_jy_normalized"][local_time],
-            target_jy_normalized[local_time],
+            row["pred_jy_physical"][local_time],
+            target_jy_physical[local_time],
         )
         for row in rows
     ]
     all_residual_jy = [
         normalized_residual(
-            row["pred_jy_normalized"][t], target_jy_normalized[t]
+            row["pred_jy_physical"][t], target_jy_physical[t]
         )
         for row in rows
         for t in color_times
@@ -2396,7 +2531,7 @@ def plot_jy_ay_by_mask_patterns(
                         "Target Jy + Ay",
                         "Masked target Jy",
                         "Prediction Jy + Ay",
-                        "Normalized Jy residual",
+                        "Jy residual (A/m^2)",
                     ][c],
                     fontsize=11,
                     pad=4,
@@ -2404,11 +2539,15 @@ def plot_jy_ay_by_mask_patterns(
             _style_comparison_axis(axes[r, c], r, c, n_rows)
 
     cb_field = fig.colorbar(field_im, cax=cax_field)
-    cb_field.set_label(f"Jy ({plot_units})", fontsize=9, labelpad=8)
+    cb_field.set_label(
+        f"Jy ({JY_UNIT})" if plot_units == "physical" else f"Jy ({plot_units})",
+        fontsize=9,
+        labelpad=8,
+    )
     cb_field.ax.tick_params(labelsize=8, length=2.5)
     cb_res = fig.colorbar(residual_im, cax=cax_residual)
     cb_res.set_label(
-        "Prediction − target (preprocessing-standardized B units)",
+        f"Prediction − target ({JY_PHYSICAL_UNITS})",
         fontsize=9,
         labelpad=8,
     )
@@ -2681,7 +2820,7 @@ def main():
         y_norm_np = cached["y_norm_np"]
         target_ay = cached["target_ay"]
         target_jy = cached["target_jy"]
-        target_jy_normalized = cached["target_jy_normalized"]
+        target_jy_physical = cached["target_jy_physical"]
         experiment_rows = cached["experiment_rows"]
         jy_stats = cached["jy_stats"]
         jy_std_train = float(cached["jy_std_train"])
@@ -2833,6 +2972,8 @@ def main():
             mean=mean,
             std=std,
             extent=args.extent,
+            checkpoint_path=ckpt_path,
+            checkpoint_epoch=ckpt_epoch,
         )
         jy_std_train = float(jy_stats["jy_std_train"])
         if jy_std_train <= 0.0:
@@ -2870,7 +3011,8 @@ def main():
         # masked Visible input arrays.
         target_ay, target_jy = compute_ay_jy(y_plot_np, args.extent)
         y_norm_np = y_norm[0].detach().cpu().numpy()
-        _, target_jy_normalized = compute_ay_jy(y_norm_np, args.extent)
+        y_phys_np = y[0].detach().cpu().numpy()
+        target_jy_physical = compute_jy(y_phys_np, args.extent)
         experiment_mask_groups = build_experiment_mask_rows(
             args=args,
             block=y_norm,
@@ -2904,8 +3046,8 @@ def main():
                 row["pred_ay"], row["pred_jy"] = compute_ay_jy(
                     row["pred_plot"], args.extent
                 )
-                _, row["pred_jy_normalized"] = compute_ay_jy(
-                    row["pred_normalized"], args.extent
+                row["pred_jy_physical"] = compute_physical_jy_from_normalized(
+                    row["pred_normalized"], mean, std, args.extent
                 )
                 rows_for_plot.append(row)
             experiment_rows.append((experiment_name, rows_for_plot))
@@ -2961,7 +3103,7 @@ def main():
                 "y_norm_np": y_norm_np,
                 "target_ay": target_ay,
                 "target_jy": target_jy,
-                "target_jy_normalized": target_jy_normalized,
+                "target_jy_physical": target_jy_physical,
                 "experiment_rows": experiment_rows,
                 "jy_stats": jy_stats,
                 "jy_std_train": jy_std_train,
@@ -3000,10 +3142,14 @@ def main():
                     "window_stride": statistics_window_stride,
                     "max_windows_per_run": args.statistics_max_windows_per_run,
                     "mask_seed": args.seed,
-                    "jy_mean_train": jy_stats["jy_mean_train"],
-                    "jy_std_train": jy_stats["jy_std_train"],
-                    "jy_rms_train": jy_stats["jy_rms_train"],
                 }
+            )
+            statistics_payload.update(
+                jy_metric_metadata(
+                    jy_stats=jy_stats,
+                    checkpoint_path=ckpt_path,
+                    checkpoint_epoch=ckpt_epoch,
+                )
             )
             statistics_path = out_dir / f"{statistics_stem}.json"
             statistics_path.write_text(json.dumps(statistics_payload, indent=2))
@@ -3040,7 +3186,7 @@ def main():
         )
         error_payload = save_information_suite_error_plot(
             target_field_normalized=y_norm_np,
-            target_jy_normalized=target_jy_normalized,
+            target_jy_physical=target_jy_physical,
             rows=rows_for_plot,
             frame_ids=frame_ids,
             out_path=out_dir / f"{experiment_stem}_error_vs_frame.png",
@@ -3049,11 +3195,11 @@ def main():
             jy_std_train=jy_std_train,
         )
         error_payload.update(
-            {
-                "jy_mean_train": jy_stats["jy_mean_train"],
-                "jy_std_train": jy_stats["jy_std_train"],
-                "jy_rms_train": jy_stats["jy_rms_train"],
-            }
+            jy_metric_metadata(
+                jy_stats=jy_stats,
+                checkpoint_path=ckpt_path,
+                checkpoint_epoch=ckpt_epoch,
+            )
         )
         error_path = out_dir / f"{experiment_stem}_error_vs_frame.json"
         error_path.write_text(json.dumps(error_payload, indent=2))
@@ -3072,7 +3218,7 @@ def main():
             plot_jy_ay_by_mask_patterns(
                 target_ay=target_ay,
                 target_jy=target_jy,
-                target_jy_normalized=target_jy_normalized,
+                target_jy_physical=target_jy_physical,
                 target_field=y_plot_np,
                 rows=rows_for_plot,
                 metadata=metadata,

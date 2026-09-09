@@ -231,7 +231,7 @@ Density 在所有行中均为完全不可见（0 probes），防止模型从较�
 
 磁场不再分别画三张 `Bx/By/Bz` 图。每个 experiment 生成左右拼接的两张 table：
 
-- 左侧磁场/Jy table：Target `Jy + Ay contours`、Masked target `Jy`、Prediction `Jy + Ay contours`、normalized Jy residual；
+- 左侧磁场/Jy table：Target `Jy + Ay contours`、Masked target `Jy`、Prediction `Jy + Ay contours`、Jy residual in A/m²；
 - 右侧 Density table：Target、Visible input、Prediction、normalized Density residual，并叠加 `Ay` contours 和平面磁场箭头。
 
 物理量定义为：
@@ -239,15 +239,15 @@ Density 在所有行中均为完全不可见（0 probes），防止模型从较�
 ```text
 Bx = -dAy/dz
 Bz =  dAy/dx
-Jy =  dBx/dz - dBz/dx
+Jy = (1/mu0) * (dBx/dz - dBz/dx)
 |B| = sqrt(Bx^2 + By^2 + Bz^2)
 ```
 
-`Ay` 使用与 `visualization.ipynb` 一致的 path integration 并去掉任意加法常数。图位于 `x-z` 平面，所以 Density table 中的箭头只能表示面内分量 `(Bz,Bx)`；`By` 垂直图面，不能作为二维箭头。`Ay/Jy` 只从完整 Target 和 Prediction 计算，不对带缺失值的 Visible input 求导或积分；左侧第二列是在完整 Target `Jy` 计算完成后再应用三路磁场的共同 mask。
+`Jy` is physical current density in A/m². Checkpoint-standardized `Bx/Bz` are inverse-transformed to Tesla; `--extent` `x/z` coordinates (cm) are converted to meters; then `Jy = (1/μ0)(dBx/dz − dBz/dx)` with `μ0 = 4π×10⁻⁷ H/m`. `Ay` uses the same path integration as `visualization.ipynb` and an additive constant is removed independently on each frame. The figure is the `x-z` plane, so Density-table arrows are the in-plane `(Bz,Bx)` components; `By` is out of plane. `Ay/Jy` are computed only from complete Target and Prediction fields, never from incomplete Visible input. The second magnetic column applies the joint B mask after Target `Jy` is computed.
 
 所有 masked/visible panel 中黑色代表 invisible。Density table 的彩色位置是实际输入模型的 target 数值；左侧第二列则是为展示磁场观测范围而应用共同 B mask 的 Target `Jy`。
 
-第四列和 sliding/bidirectional residual panel 统一使用 preprocessing 的 channel mean/std 标准化空间。对 Density，residual 直接由 checkpoint 标准化后的 prediction 和 target 相减：
+Density residual（右侧第四列和 sliding/bidirectional residual panel）仍在 preprocessing 的 channel mean/std 标准化空间中计算。对 Density，residual 直接由 checkpoint 标准化后的 prediction 和 target 相减：
 
 ```text
 r = prediction_normalized - target_normalized
@@ -255,7 +255,7 @@ NRMSE = sqrt(mean(r**2))
 NMAE = mean(abs(r))
 ```
 
-这个分母在所有时间和空间位置都是同一个训练集 channel std，不再根据局部 target 幅值调整误差权重。Jy 是派生量；它的 normalized residual 由各自按 checkpoint 统计量标准化后的 `Bx/Bz` 先计算 Jy，再对 prediction/target 相减。所有 residual panel 默认使用固定的 `[-1, 1]` colorbar 和 `RdBu_r` colormap（负误差为蓝、正误差为红），便于跨样本、时间和实验直接比较；`--residual-vmax` 可覆盖这个对称范围，`--auto-residual-range` 可恢复基于分位数的自动范围。sliding JSON 同时保留 plot units 中的 RMSE/MAE 和标准化空间中的 NRMSE/NMAE。
+这个分母在所有时间和空间位置都是同一个训练集 channel std，不再根据局部 target 幅值调整误差权重。Jy residual 是 prediction 与 target 的 A/m² current density 之差。Jy NRMSE 用训练集 Jy std（A/m²）做分母，因此仍是无量纲的。所有 residual panel 默认使用固定的 `[-1, 1]` colorbar 和 `RdBu_r` colormap（负误差为蓝、正误差为红），便于跨样本、时间和实验直接比较；`--residual-vmax` 可覆盖这个对称范围，`--auto-residual-range` 可恢复基于分位数的自动范围。sliding JSON 同时保留 plot units 中的 RMSE/MAE 和标准化空间中的 NRMSE/NMAE。
 
 ### 6.6 运行全部四套单窗口实验
 
@@ -303,7 +303,7 @@ python make_paper_figures.py \
 - `magnetic_ablation_summary`：两种 Density condition 共用同一套 nested B ranking，必须 post-hoc 配对评估，不复用旧的 Density-hidden-only JSON。
 - `sliding_window_appendix`：需要模型；对 selected validation runs 做 recursive sliding，并对 canonical run 做 qualitative 重建。
 
-统计约定：定量曲线和 shaded band 是 held-out validation runs 上的 median 以及 16th–84th percentile。Density NRMSE 是 checkpoint 标准化空间中 Density 通道的 RMS residual。Jy NRMSE 是在同样标准化的 `Bx/Bz` 上计算 `Jy = dBx/dz - dBz/dx` 后，再用训练集 Jy std 归一化。
+统计约定：定量曲线和 shaded band 是 held-out validation runs 上的 median 以及 16th–84th percentile。Density NRMSE 是 checkpoint 标准化空间中 Density 通道的 RMS residual。Jy NRMSE 把反标准化后的 `Bx/Bz` 当作 Tesla，把 `--extent` 的 cm 换成 m，计算 `Jy = (1/μ0)(dBx/dz − dBz/dx)`（A/m²），再用训练集 Jy std 归一化。旧的 Jy cache 不能复用。
 
 建议阅读 / 正文顺序对应
 reconstruction quality → multimodal transfer → sparse-observation scaling → temporal extrapolation → long-sequence deployment：

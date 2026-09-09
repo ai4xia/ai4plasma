@@ -557,9 +557,6 @@ def _sample_modality_mask(
     if pattern == "spatial_grid":
         if visible_count is None:
             return _spatial_grid_plane(1, 1, X, Z, p, generator)
-        if modality == "magnetic":
-            # Preserve the existing magnetic exact-count random layout.
-            return _random_probe_plane(1, 1, X, Z, visible_count, generator)
         return _sparse_probe_grid_plane(1, 1, X, Z, visible_count, generator)
     if pattern == "spatial_block":
         return _spatial_block_plane(
