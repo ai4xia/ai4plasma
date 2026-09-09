@@ -64,8 +64,8 @@ from visualize_sliding_density_reconstruction import (
 )
 
 
-PAPER_CACHE_VERSION = 8
-COMPATIBLE_PAPER_CACHE_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8)
+PAPER_CACHE_VERSION = 9
+COMPATIBLE_PAPER_CACHE_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8, 9)
 PAPER_DIRNAME = "paper_figures_v1"
 DEFAULT_GLOBAL_FRAME = 45
 DEFAULT_SLIDE_STEPS = (1, 12, 24)
@@ -245,6 +245,76 @@ def clip_positive_for_log(
 def density_nrmse_from_residual(residual: np.ndarray) -> float:
     nrmse, _nmae = compute_normalized_metrics(residual)
     return float(nrmse)
+
+
+def qualitative_density_nrmse_key(step: int) -> str:
+    return f"qualitative_density_nrmse_step{int(step)}"
+
+
+def compute_sliding_qualitative_density_nrmse(arrays: Dict, step: int) -> float:
+    """Canonical-run Density NRMSE from cached sliding arrays, no inference.
+
+    Uses RMS(pred_norm - target_norm) on Density, same as the paper pipeline.
+    Prefers full (T,X,Z) prediction/target; falls back to the plotted (T,Z)
+    normalized residual. Scope is this canonical example only.
+    """
+    step = int(step)
+    pred = arrays.get(f"step_{step}_prediction")
+    target = arrays.get("target_density")
+    tz_residual = arrays.get(f"step_{step}_tz_residual")
+    tz_pred = arrays.get(f"step_{step}_tz")
+    tz_target = arrays.get("target_tz")
+    if (
+        pred is not None
+        and target is not None
+        and tz_residual is not None
+        and tz_pred is not None
+        and tz_target is not None
+    ):
+        slice_nrmse = density_nrmse_from_residual(tz_residual)
+        slice_rmse = density_nrmse_from_residual(
+            np.asarray(tz_pred, dtype=np.float64)
+            - np.asarray(tz_target, dtype=np.float64)
+        )
+        if (
+            slice_nrmse > 0
+            and np.isfinite(slice_nrmse)
+            and np.isfinite(slice_rmse)
+        ):
+            std = slice_rmse / slice_nrmse
+            if std > 0:
+                return density_nrmse_from_residual(
+                    (
+                        np.asarray(pred, dtype=np.float64)
+                        - np.asarray(target, dtype=np.float64)
+                    )
+                    / std
+                )
+    if tz_residual is None:
+        raise KeyError(f"missing Density residual arrays for sliding step={step}")
+    return density_nrmse_from_residual(tz_residual)
+
+
+def ensure_sliding_qualitative_nrmse_metadata(
+    arrays: Dict,
+    metadata: Dict,
+) -> bool:
+    """Fill canonical-run NRMSE scalars in metadata. Does not change signature."""
+    changed = False
+    for step in metadata.get("slide_steps") or []:
+        key = qualitative_density_nrmse_key(step)
+        nrmse = float(compute_sliding_qualitative_density_nrmse(arrays, int(step)))
+        if metadata.get(key) != nrmse:
+            metadata[key] = nrmse
+            changed = True
+    if metadata.get("qualitative_density_nrmse_definition") != DENSITY_NRMSE_DEFINITION:
+        metadata["qualitative_density_nrmse_definition"] = DENSITY_NRMSE_DEFINITION
+        metadata["qualitative_density_nrmse_scope"] = (
+            "canonical run, first 48 frames, B fully hidden, 1000 Density probes; "
+            "one aggregate over the qualitative reconstruction, not cross-run"
+        )
+        changed = True
+    return changed
 
 
 def format_density_nrmse_label(nrmse: float) -> str:
@@ -940,7 +1010,7 @@ def plot_spatial_qualitative(
         residual_arrays.append(arrays[f"{name}_residual"])
     vmin, vmax = robust_limits(field_arrays, channel=3, q=field_q, symmetric=False)
     res_vmin, res_vmax = -float(residual_vmax), float(residual_vmax)
-    field_cmap = make_nan_cmap("viridis")
+    field_cmap = make_nan_cmap("magma")
     residual_cmap = make_nan_cmap(RESIDUAL_CMAP)
 
     fig = plt.figure(figsize=(7.4, 8.0))
@@ -1332,11 +1402,12 @@ def build_paired_b_condition_cache(
     return arrays, meta
 
 
-def plot_density_forecast_summary(arrays: Dict, metadata: Dict, figures_dir: Path, dpi: int) -> None:
+def plot_density_forecast_summary(arrays: Dict, metadata: Dict, figures_dir: Path, dpi: int) -> Dict:
     frames = np.asarray(arrays["local_frames"])
     full_rows = metadata["rows"]["B_full"]
     colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
-    fig, axes = plt.subplots(2, 1, figsize=(6.4, 6.2), sharex=True)
+    fig, axes = plt.subplots(1, 2, figsize=(9.6, 3.8), sharey=True)
+    plotted = []
     for index, row in enumerate(full_rows):
         color = colors[index % len(colors)]
         history = int(row["history"])
@@ -1344,10 +1415,14 @@ def plot_density_forecast_summary(arrays: Dict, metadata: Dict, figures_dir: Pat
         for key, linestyle, alpha in (("B_full", "-", 0.18), ("B_hidden", "--", 0.08)):
             tag = f"{key}_{row['name']}"
             for ax, metric in ((axes[0], "density"), (axes[1], "jy")):
+                lo = clip_positive_for_log(arrays[f"{tag}_{metric}_p16"])
+                hi = clip_positive_for_log(arrays[f"{tag}_{metric}_p84"])
+                mid = clip_positive_for_log(arrays[f"{tag}_{metric}_median"])
+                plotted.extend([lo, hi, mid])
                 ax.fill_between(
                     frames,
-                    clip_positive_for_log(arrays[f"{tag}_{metric}_p16"]),
-                    clip_positive_for_log(arrays[f"{tag}_{metric}_p84"]),
+                    lo,
+                    hi,
                     color=color,
                     alpha=alpha,
                     linewidth=0.4,
@@ -1355,22 +1430,29 @@ def plot_density_forecast_summary(arrays: Dict, metadata: Dict, figures_dir: Pat
                 )
                 ax.plot(
                     frames,
-                    clip_positive_for_log(arrays[f"{tag}_{metric}_median"]),
+                    mid,
                     color=color,
                     linestyle=linestyle,
                     linewidth=1.7,
                     label=f"horizon={horizon}" if key == "B_full" else None,
                 )
-    axes[0].set_ylabel("Density NRMSE")
-    axes[1].set_ylabel("Jy NRMSE")
-    axes[0].set_yscale("log")
-    axes[1].set_yscale("log")
-    axes[1].set_xlabel(
-        f"Local frame in {int(metadata['context_length'])}-frame context window"
-    )
-    for ax in axes:
+    stacked = np.concatenate([np.asarray(values, dtype=np.float64).ravel() for values in plotted])
+    stacked = stacked[np.isfinite(stacked) & (stacked > 0)]
+    if stacked.size == 0:
+        ymin, ymax = LOG_Y_FLOOR, 1.0
+    else:
+        ymin = max(LOG_Y_FLOOR, float(np.min(stacked))) / 1.2
+        ymax = float(np.max(stacked)) * 1.2
+    xlabel = f"Local frame in {int(metadata['context_length'])}-frame context window"
+    titles = ("Density NRMSE", "Jy NRMSE")
+    for ax, title in zip(axes, titles):
+        ax.set_title(title, fontsize=10)
+        ax.set_yscale("log")
+        ax.set_ylim(ymin, ymax)
+        ax.set_xlabel(xlabel)
         ax.grid(alpha=0.25, linewidth=0.6)
         ax.set_axisbelow(True)
+    axes[0].set_ylabel("NRMSE")
     color_handles = [
         Line2D([0], [0], color=colors[i % len(colors)], linewidth=1.8, label=f"horizon={int(metadata['context_length']) - int(row['history'])}")
         for i, row in enumerate(full_rows)
@@ -1382,7 +1464,14 @@ def plot_density_forecast_summary(arrays: Dict, metadata: Dict, figures_dir: Pat
     axes[0].legend(handles=color_handles, frameon=False, fontsize=7, loc="upper left")
     axes[1].legend(handles=style_handles, frameon=False, fontsize=7, loc="upper left")
     fig.tight_layout()
+    ylims = (axes[0].get_ylim(), axes[1].get_ylim())
     save_png_pdf(fig, figures_dir, FIGURE_STEMS["forecast"], dpi)
+    return {
+        "layout": (1, 2),
+        "titles": list(titles),
+        "sharey": True,
+        "ylims": ylims,
+    }
 
 
 def plot_density_superres_summary(
@@ -1675,7 +1764,7 @@ def build_sliding_appendix_cache(
         predictions,
         probe_info,
     ) = reconstruct_sliding_qualitative(
-        ctx, args, [representative_step], n_frames=SLIDING_AGGREGATE_N_FRAMES
+        ctx, args, slide_steps, n_frames=SLIDING_AGGREGATE_N_FRAMES
     )
     std_density = float(ctx["std"].detach().cpu().numpy().reshape(-1)[3])
     size_x = int(target.shape[-2])
@@ -1726,8 +1815,10 @@ def build_sliding_appendix_cache(
         "x_index": int(args.x_index),
         "run_name": args.run_name,
         "plot_units": "physical",
-        "left_panel": "multi_run_framewise_rmse",
-        "right_panel": "single_run_qualitative",
+        "left_panel": "target_and_multi_run_framewise_rmse",
+        "right_panel": "single_run_qualitative_by_step",
+        "layout": "target_rmse_predictions_residuals",
+        "qualitative_steps": list(slide_steps),
         "qualitative_run": args.run_name,
         "b_conditions": ["B_full", "B_hidden"],
         "aggregate_n_runs": len(loaded_runs),
@@ -1764,24 +1855,43 @@ def plot_sliding_window_appendix(
     figures_dir: Path,
     extent: Sequence[float],
     dpi: int,
-) -> None:
+) -> Dict:
     steps = [int(step) for step in metadata["slide_steps"]]
     frame_ids = arrays["frame_ids"]
     aggregate_frames = arrays.get("aggregate_frame_ids", frame_ids)
-    fig = plt.figure(figsize=(8.4, 4.6))
+    n_runs = metadata.get("aggregate_n_runs")
+    n_frames = metadata.get("n_frames")
+    probe_count = metadata.get("density_probe_count")
+    ratio_percent = metadata.get("density_visible_ratio_percent")
+    run_phrase = (
+        f"{int(n_runs)} validation runs, first {int(n_frames)} frames"
+        if n_runs and n_frames
+        else (f"{int(n_runs)} validation runs" if n_runs else "Validation runs")
+    )
+    if probe_count is not None and ratio_percent is not None:
+        figure_title = (
+            f"{run_phrase}\n"
+            f"{int(probe_count)} fixed Density probes "
+            f"({format_visible_ratio_percent(float(ratio_percent))}% spatial visibility)"
+        )
+    else:
+        figure_title = run_phrase
+
+    fig = plt.figure(figsize=(11.4, 5.4))
     gs = gridspec.GridSpec(
         3,
-        2,
+        5,
         figure=fig,
-        width_ratios=[1.05, 1.15],
-        wspace=0.28,
-        hspace=0.08,
-        left=0.08,
-        right=0.92,
-        top=0.90,
-        bottom=0.12,
+        width_ratios=[1.18, 1.0, 0.045, 1.0, 0.045],
+        wspace=0.16,
+        hspace=0.18,
+        left=0.07,
+        right=0.95,
+        top=0.84,
+        bottom=0.10,
     )
-    ax_err = fig.add_subplot(gs[:, 0])
+    ax_target = fig.add_subplot(gs[0, 0])
+    ax_err = fig.add_subplot(gs[1:, 0])
     colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
     b_styles = (
         ("B_full", "-", 0.18),
@@ -1794,9 +1904,10 @@ def plot_sliding_window_appendix(
                 aggregate_frames,
                 arrays[f"{b_key}_step_{step}_rmse_p16"],
                 arrays[f"{b_key}_step_{step}_rmse_p84"],
-                color=color,
+                facecolor=color,
                 alpha=alpha,
-                linewidth=0,
+                linewidth=0.4,
+                edgecolor="0.35",
             )
             ax_err.plot(
                 aggregate_frames,
@@ -1809,85 +1920,148 @@ def plot_sliding_window_appendix(
     ax_err.set_ylabel("Frame RMSE")
     ax_err.grid(alpha=0.25, linewidth=0.6)
     ax_err.set_axisbelow(True)
-    color_handles = [
-        Line2D(
-            [0],
-            [0],
-            color=colors[index % len(colors)],
-            linewidth=1.6,
-            label=f"step={step}",
+    ax_err.set_title("RMSE vs global frame", fontsize=9)
+    mean_rmse_by_step = {}
+    color_handles = []
+    for index, step in enumerate(steps):
+        mean_b100 = float(
+            np.nanmean(
+                np.asarray(
+                    arrays[f"B_full_step_{step}_rmse_median"], dtype=np.float64
+                )
+            )
         )
-        for index, step in enumerate(steps)
-    ]
+        mean_b0 = float(
+            np.nanmean(
+                np.asarray(
+                    arrays[f"B_hidden_step_{step}_rmse_median"], dtype=np.float64
+                )
+            )
+        )
+        mean_rmse_by_step[int(step)] = {"B100": mean_b100, "B0": mean_b0}
+        color_handles.append(
+            Line2D(
+                [0],
+                [0],
+                color=colors[index % len(colors)],
+                linewidth=1.6,
+                label=f"step={step}   {mean_b100:.3f} / {mean_b0:.3f}",
+            )
+        )
     style_handles = [
         Line2D([0], [0], color="0.3", linestyle="-", linewidth=1.6, label="B visible 100%"),
         Line2D([0], [0], color="0.3", linestyle="--", linewidth=1.6, label="B visible 0%"),
     ]
     color_legend = ax_err.legend(
-        handles=color_handles, frameon=False, fontsize=7, loc="upper left"
+        handles=color_handles,
+        frameon=False,
+        fontsize=6.5,
+        loc="upper left",
+        title="step   mean RMSE (B100 / B0)",
+        title_fontsize=6.5,
     )
     ax_err.add_artist(color_legend)
     ax_err.legend(handles=style_handles, frameon=False, fontsize=7, loc="upper right")
-    n_runs = metadata.get("aggregate_n_runs")
-    n_frames = metadata.get("n_frames")
-    probe_count = metadata.get("density_probe_count")
-    ratio_percent = metadata.get("density_visible_ratio_percent")
-    run_phrase = (
-        f"{int(n_runs)} validation runs, first {int(n_frames)} frames"
-        if n_runs and n_frames
-        else (f"{int(n_runs)} validation runs" if n_runs else "Validation runs")
-    )
-    if probe_count is not None and ratio_percent is not None:
-        title = (
-            f"{run_phrase}\n"
-            f"{int(probe_count)} fixed Density probes "
-            f"({format_visible_ratio_percent(float(ratio_percent))}% spatial visibility)"
-        )
-    else:
-        title = run_phrase
-    ax_err.set_title(title, fontsize=9)
 
-    step = int(metadata["representative_step"])
-    panels = [
-        ("Target", arrays["target_tz"], "viridis", False),
-        (f"Recon. step={step}", arrays[f"step_{step}_tz"], "viridis", False),
-        ("Residual", arrays[f"step_{step}_tz_residual"], RESIDUAL_CMAP, True),
-    ]
     zmin, zmax, _xmin, _xmax = extent
     tmin, tmax = float(frame_ids.min()) - 0.5, float(frame_ids.max()) + 0.5
+    field_panels = [arrays["target_tz"]] + [arrays[f"step_{step}_tz"] for step in steps]
+    residual_panels = [arrays[f"step_{step}_tz_residual"] for step in steps]
     field_vmin, field_vmax = robust_limits(
-        [arrays["target_tz"], arrays[f"step_{step}_tz"]],
-        channel=3,
-        q=99.0,
-        symmetric=False,
+        field_panels, channel=3, q=99.0, symmetric=False
     )
     res_vmin, res_vmax = robust_limits(
-        [arrays[f"step_{step}_tz_residual"]],
-        channel=3,
-        q=99.0,
-        symmetric=True,
+        residual_panels, channel=3, q=99.0, symmetric=True
     )
-    for index, (title, panel, cmap, symmetric) in enumerate(panels):
-        ax = fig.add_subplot(gs[index, 1])
-        vmin, vmax = (res_vmin, res_vmax) if symmetric else (field_vmin, field_vmax)
-        im = ax.imshow(
-            panel.T,
+    target_im = ax_target.imshow(
+        arrays["target_tz"].T,
+        origin="lower",
+        aspect="auto",
+        extent=[tmin, tmax, zmin, zmax],
+        cmap=make_nan_cmap("magma"),
+        vmin=field_vmin,
+        vmax=field_vmax,
+        interpolation="nearest",
+    )
+    ax_target.set_title("Target", fontsize=9, pad=2)
+    ax_target.set_ylabel("z [cm]", fontsize=8)
+    ax_target.tick_params(labelbottom=False)
+    ensure_sliding_qualitative_nrmse_metadata(arrays, metadata)
+    nrmse_by_step = {
+        int(step): float(metadata[qualitative_density_nrmse_key(step)])
+        for step in steps
+    }
+
+    pred_axes = []
+    res_axes = []
+    pred_im = None
+    res_im = None
+    panel_titles = ["Target", "RMSE vs global frame"]
+    for index, step in enumerate(steps):
+        ax_pred = fig.add_subplot(gs[index, 1])
+        pred_im = ax_pred.imshow(
+            arrays[f"step_{step}_tz"].T,
             origin="lower",
             aspect="auto",
             extent=[tmin, tmax, zmin, zmax],
-            cmap=make_nan_cmap(cmap),
-            vmin=vmin,
-            vmax=vmax,
+            cmap=make_nan_cmap("magma"),
+            vmin=field_vmin,
+            vmax=field_vmax,
             interpolation="nearest",
         )
-        ax.set_ylabel("z [cm]", fontsize=8)
-        if index == 2:
-            ax.set_xlabel("Global frame")
+        pred_title = f"Prediction (step={step})"
+        ax_pred.set_title(pred_title, fontsize=9, pad=2)
+        ax_pred.set_ylabel("z [cm]", fontsize=8)
+        if index == len(steps) - 1:
+            ax_pred.set_xlabel("Global frame")
         else:
-            ax.tick_params(labelbottom=False)
-        ax.set_title(title, fontsize=9, pad=2)
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+            ax_pred.tick_params(labelbottom=False)
+        pred_axes.append(ax_pred)
+        panel_titles.append(pred_title)
+
+        ax_res = fig.add_subplot(gs[index, 3], sharey=ax_pred)
+        res_im = ax_res.imshow(
+            arrays[f"step_{step}_tz_residual"].T,
+            origin="lower",
+            aspect="auto",
+            extent=[tmin, tmax, zmin, zmax],
+            cmap=make_nan_cmap(RESIDUAL_CMAP),
+            vmin=res_vmin,
+            vmax=res_vmax,
+            interpolation="nearest",
+        )
+        res_title = f"Residual (step={step})"
+        ax_res.set_title(res_title, fontsize=9, pad=2)
+        ax_res.set_ylabel("z [cm]", fontsize=8)
+        ax_res.tick_params(labelleft=False)
+        if index == len(steps) - 1:
+            ax_res.set_xlabel("Global frame")
+        else:
+            ax_res.tick_params(labelbottom=False)
+        annotate_density_nrmse(ax_res, nrmse_by_step[step])
+        res_axes.append(ax_res)
+        panel_titles.append(res_title)
+    cax_pred = fig.add_subplot(gs[:, 2])
+    cax_res = fig.add_subplot(gs[:, 4])
+    fig.colorbar(pred_im, cax=cax_pred)
+    fig.colorbar(res_im, cax=cax_res)
+    pred_res_sharey = all(
+        getattr(ax_res, "_sharey", None) is ax_pred
+        for ax_pred, ax_res in zip(pred_axes, res_axes)
+    )
+    fig.suptitle(figure_title, fontsize=10, y=0.98)
     save_png_pdf(fig, figures_dir, FIGURE_STEMS["sliding"], dpi)
+    return {
+        "panel_titles": panel_titles,
+        "legend_labels": [handle.get_label() for handle in color_handles + style_handles],
+        "legend_title": "step   mean RMSE (B100 / B0)",
+        "slide_steps": list(steps),
+        "qualitative_density_nrmse": nrmse_by_step,
+        "mean_rmse": mean_rmse_by_step,
+        "target_has_colorbar": False,
+        "n_column_colorbars": 2,
+        "pred_res_sharey": bool(pred_res_sharey),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1997,8 +2171,10 @@ def main() -> None:
             "density_probe_count": int(args.density_probe_count),
             "probe_layout_semantics": "same as density_superres",
             "x_index": int(args.x_index),
-            "left_panel": "multi_run_framewise_rmse",
-            "right_panel": "single_run_qualitative",
+            "layout": "target_rmse_predictions_residuals",
+            "left_panel": "target_and_multi_run_framewise_rmse",
+            "right_panel": "single_run_qualitative_by_step",
+            "qualitative_steps": [int(step) for step in args.slide_steps],
             "statistical_unit": "run",
             "sliding_max_runs": int(args.sliding_max_runs),
             "selected_runs": select_sliding_aggregate_runs(
@@ -2144,6 +2320,12 @@ def main() -> None:
             force=args.force_recompute,
             provenance=provenance,
         )
+        if ensure_sliding_qualitative_nrmse_metadata(arrays, meta):
+            save_figure_cache(data_dir, FIGURE_STEMS["sliding"], arrays, meta)
+            print(
+                "Updated sliding qualitative Density NRMSE metadata: "
+                f"{data_dir / (FIGURE_STEMS['sliding'] + '.json')}"
+            )
         plot_sliding_window_appendix(
             arrays, meta, figures_dir, extent=args.extent, dpi=args.dpi
         )

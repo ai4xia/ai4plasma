@@ -30,6 +30,8 @@ from make_paper_figures import (  # noqa: E402
     density_nrmse_from_residual,
     density_visible_ratio,
     format_density_nrmse_label,
+    compute_sliding_qualitative_density_nrmse,
+    ensure_sliding_qualitative_nrmse_metadata,
     load_figure_cache,
     load_or_build_figure_cache,
     local_index_for_global_frame,
@@ -215,7 +217,11 @@ def test_forecast_cache_contains_both_b_conditions(tmp_path):
     assert set(meta["rows"]) == {"B_full", "B_hidden"}
     assert [row["history"] for row in meta["rows"]["B_full"]] == [23, 18, 12, 6]
     assert [row["history"] for row in meta["rows"]["B_hidden"]] == [23, 18, 12, 6]
-    plot_density_forecast_summary(arrays, meta, tmp_path, dpi=80)
+    result = plot_density_forecast_summary(arrays, meta, tmp_path, dpi=80)
+    assert result["layout"] == (1, 2)
+    assert result["titles"] == ["Density NRMSE", "Jy NRMSE"]
+    assert result["sharey"] is True
+    assert result["ylims"][0] == result["ylims"][1]
     assert (tmp_path / f"{FIGURE_STEMS['forecast']}.png").exists()
 
 
@@ -602,14 +608,14 @@ def test_sliding_probe_count_signature_invalidates_old_fraction_cache():
 
 
 def test_compatible_cache_versions_reuse_unchanged_signatures():
-    assert PAPER_CACHE_VERSION == 8
-    assert 7 in COMPATIBLE_PAPER_CACHE_VERSIONS
+    assert PAPER_CACHE_VERSION == 9
+    assert 8 in COMPATIBLE_PAPER_CACHE_VERSIONS
     for figure in ("spatial", "magnetic_ablation", "forecast", "superres"):
-        stored = {"cache_version": 7, "figure": figure, "payload": 1}
-        current = {"cache_version": 8, "figure": figure, "payload": 1}
+        stored = {"cache_version": 8, "figure": figure, "payload": 1}
+        current = {"cache_version": 9, "figure": figure, "payload": 1}
         assert paper_signatures_match(stored, current)
     stored = {"cache_version": 2, "figure": "forecast", "histories": [23]}
-    current = {"cache_version": 8, "figure": "forecast", "histories": [23]}
+    current = {"cache_version": 9, "figure": "forecast", "histories": [23]}
     assert paper_signatures_match(stored, current)
 
 
@@ -619,16 +625,19 @@ def test_sliding_plot_uses_framewise_rmse_and_both_b_conditions(tmp_path):
         "frame_ids": frames,
         "aggregate_frame_ids": frames,
         "target_tz": np.zeros((48, 6), dtype=np.float32),
-        "step_1_tz": np.zeros((48, 6), dtype=np.float32),
-        "step_1_tz_residual": np.zeros((48, 6), dtype=np.float32),
     }
     for step in (1, 12, 24):
-        median = np.linspace(0.1, 0.2, 48)
-        for b_key in ("B_full", "B_hidden"):
-            arrays[f"{b_key}_step_{step}_rmse_median"] = median
-            arrays[f"{b_key}_step_{step}_rmse_p16"] = median * 0.8
-            arrays[f"{b_key}_step_{step}_rmse_p84"] = median * 1.2
-    plot_sliding_window_appendix(
+        arrays[f"step_{step}_tz"] = np.zeros((48, 6), dtype=np.float32)
+        arrays[f"step_{step}_tz_residual"] = np.zeros((48, 6), dtype=np.float32)
+        median_full = np.linspace(0.1, 0.2, 48)
+        median_hidden = np.linspace(0.12, 0.22, 48)
+        arrays[f"B_full_step_{step}_rmse_median"] = median_full
+        arrays[f"B_full_step_{step}_rmse_p16"] = median_full * 0.8
+        arrays[f"B_full_step_{step}_rmse_p84"] = median_full * 1.2
+        arrays[f"B_hidden_step_{step}_rmse_median"] = median_hidden
+        arrays[f"B_hidden_step_{step}_rmse_p16"] = median_hidden * 0.8
+        arrays[f"B_hidden_step_{step}_rmse_p84"] = median_hidden * 1.2
+    result = plot_sliding_window_appendix(
         arrays,
         {
             "slide_steps": [1, 12, 24],
@@ -645,5 +654,72 @@ def test_sliding_plot_uses_framewise_rmse_and_both_b_conditions(tmp_path):
         extent=[-21.0, 21.0, -50.0, 50.0],
         dpi=80,
     )
+    titles = result["panel_titles"]
+    assert "Target" in titles
+    assert "RMSE vs global frame" in titles
+    for step in (1, 12, 24):
+        assert f"Prediction (step={step})" in titles
+        assert f"Residual (step={step})" in titles
+    assert result["slide_steps"] == [1, 12, 24]
+    expected_b100 = float(np.mean(np.linspace(0.1, 0.2, 48)))
+    expected_b0 = float(np.mean(np.linspace(0.12, 0.22, 48)))
+    for step in (1, 12, 24):
+        label = result["legend_labels"][result["slide_steps"].index(step)]
+        assert f"step={step}" in label
+        assert f"{expected_b100:.3f} / {expected_b0:.3f}" in label
+        assert abs(result["mean_rmse"][step]["B100"] - expected_b100) < 1e-12
+        assert abs(result["mean_rmse"][step]["B0"] - expected_b0) < 1e-12
+    assert result["legend_title"] == "step   mean RMSE (B100 / B0)"
+    assert result["target_has_colorbar"] is False
+    assert result["n_column_colorbars"] == 2
+    assert result["pred_res_sharey"] is True
+    assert "B visible 100%" in result["legend_labels"]
+    assert "B visible 0%" in result["legend_labels"]
+    for step in (1, 12, 24):
+        assert result["qualitative_density_nrmse"][step] == 0.0
     assert (tmp_path / f"{FIGURE_STEMS['sliding']}.png").exists()
     assert (tmp_path / f"{FIGURE_STEMS['sliding']}.pdf").exists()
+
+
+def test_sliding_qualitative_nrmse_uses_paper_density_definition():
+    residual = np.full((48, 6), 0.25, dtype=np.float64)
+    arrays = {
+        "target_tz": np.zeros((48, 6), dtype=np.float32),
+        "step_1_tz": np.zeros((48, 6), dtype=np.float32),
+        "step_1_tz_residual": residual,
+    }
+    nrmse = compute_sliding_qualitative_density_nrmse(arrays, 1)
+    assert abs(nrmse - density_nrmse_from_residual(residual)) < 1e-12
+    assert abs(nrmse - 0.25) < 1e-12
+
+
+def test_sliding_qualitative_nrmse_prefers_full_field_prediction_target():
+    target = np.ones((48, 3, 4), dtype=np.float64)
+    pred = target + 0.4
+    tz_target = np.ones((48, 4), dtype=np.float64)
+    tz_pred = tz_target + 0.4
+    tz_residual = np.full((48, 4), 0.2, dtype=np.float64)
+    arrays = {
+        "target_density": target,
+        "step_12_prediction": pred,
+        "target_tz": tz_target,
+        "step_12_tz": tz_pred,
+        "step_12_tz_residual": tz_residual,
+    }
+    # tz physical RMSE=0.4, tz NRMSE=0.2 => std=2; full-field NRMSE=0.4/2=0.2
+    nrmse = compute_sliding_qualitative_density_nrmse(arrays, 12)
+    assert abs(nrmse - 0.2) < 1e-12
+
+
+def test_sliding_nrmse_metadata_does_not_change_signature():
+    arrays = {"step_1_tz_residual": np.full((48, 4), 0.1)}
+    metadata = {
+        "slide_steps": [1],
+        "signature": {"cache_version": 9, "figure": "sliding", "layout": "x"},
+    }
+    signature = dict(metadata["signature"])
+    assert ensure_sliding_qualitative_nrmse_metadata(arrays, metadata)
+    assert abs(metadata["qualitative_density_nrmse_step1"] - 0.1) < 1e-12
+    assert metadata["signature"] == signature
+    assert paper_signatures_match(signature, metadata["signature"])
+    assert not ensure_sliding_qualitative_nrmse_metadata(arrays, metadata)
