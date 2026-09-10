@@ -1,0 +1,13 @@
+name: masked-recon-anonymous
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12.13
+  - numpy=2.4.4
+  - h5py=3.13.0
+  - matplotlib
+  - tqdm
+  - pytest
+  - pip
+  - pip:
+      - torch==2.13.0

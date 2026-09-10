@@ -1,0 +1,3306 @@
+# visualize_mask_patterns_unet3d.py
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import pickle
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple
+
+import matplotlib
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import numpy as np
+import torch
+
+from data.vpic_hdf5_dataset import VPICWindowDataset
+from data.masking import MASK_PATTERNS, make_fixed_validation_mask, make_visible_input, sample_mask
+from models.unet3d import LEGACY_MODEL_VERSION, UNet3D
+
+
+DEFAULT_RUN_NAME = "beta0.2_nu2_Bz0_dt2_tau70"
+DEFAULT_T0 = 28
+DEFAULT_RUN_DIR = "."
+DEFAULT_RESIDUAL_VMAX = 1.0
+RESIDUAL_CMAP = "RdBu_r"
+DEFAULT_MAGNETIC_ABLATION_VISIBLE_PERCENTS = (
+    100.0,
+    30.0,
+    10.0,
+    3.0,
+    1.0,
+    0.3,
+    0.1,
+    0.0,
+)
+DEFAULT_MAGNETIC_ABLATION_VISIBLE_FRACTIONS = tuple(
+    percent / 100.0 for percent in DEFAULT_MAGNETIC_ABLATION_VISIBLE_PERCENTS
+)
+JY_STATS_FILENAME = "jy_stats.json"
+JY_STATS_CACHE_VERSION = 3
+MU0 = 4.0 * math.pi * 1e-7
+CM_TO_M = 0.01
+JY_STATS_DEFINITION = "(1/mu0)*(dBx/dz - dBz/dx)"
+JY_STATS_PREPROCESSING = (
+    "denormalize checkpoint-standardized Bx,Bz to Tesla, convert --extent cm to m, "
+    "then multiply curl by 1/mu0"
+)
+JY_B_UNIT = "T"
+JY_B_UNITS = JY_B_UNIT
+JY_SOURCE_COORDINATE_UNIT = "cm"
+JY_DERIVATIVE_COORDINATE_UNIT = "m"
+JY_COORDINATE_UNITS = JY_SOURCE_COORDINATE_UNIT
+JY_COORDINATE_SOURCE = (
+    "visualization --extent [zmin, zmax, xmin, xmax]; default [-21, 21, -50, 50]; "
+    "plot labels z [cm], x [cm]; derivatives use meters"
+)
+JY_INCLUDES_MU0 = True
+JY_UNIT = "A/m^2"
+JY_PHYSICAL_UNITS = JY_UNIT
+JY_NRMSE_YLABEL = "Jy NRMSE"
+JY_NRMSE_DEFINITION = (
+    "RMSE(Jy_pred - Jy_target) / std(Jy over training runs), with "
+    "Jy = (1/mu0)*(dBx/dz - dBz/dx) after denormalizing Bx,Bz to Tesla "
+    "and converting x,z from cm to m"
+)
+PLOT_CACHE_FILENAME = "plot_cache.pkl"
+PLOT_CACHE_VERSION = 3
+
+
+def format_magnetic_visible_percent(visible_fraction: float) -> str:
+    return f"B visible={100.0 * float(visible_fraction):g}%"
+
+
+def magnetic_ablation_visible_count(num_sites: int, visible_fraction: float) -> int:
+    """Convert a requested visible fraction into an exact probe count."""
+    num_sites = int(num_sites)
+    visible_fraction = float(visible_fraction)
+    if not (0.0 <= visible_fraction <= 1.0):
+        raise ValueError(
+            "Magnetic visible fractions must lie in [0, 1], "
+            f"got {visible_fraction}."
+        )
+    if visible_fraction <= 0.0:
+        return 0
+    if visible_fraction >= 1.0:
+        return num_sites
+    return int(round(visible_fraction * num_sites))
+
+
+def apply_log_yscale_if_strictly_positive(
+    axis,
+    values: np.ndarray,
+    panel_name: str,
+) -> str:
+    """Use a log y-axis only when every finite drawn value is > 0."""
+    flat = np.asarray(values, dtype=np.float64).ravel()
+    finite = flat[np.isfinite(flat)]
+    if finite.size == 0:
+        print(f"{panel_name}: no finite NRMSE values; leaving linear y-scale.")
+        return "linear"
+    nonpositive = finite[finite <= 0.0]
+    if nonpositive.size:
+        print(
+            f"{panel_name}: found {int(nonpositive.size)} non-positive NRMSE "
+            f"value(s); min={float(finite.min()):.6g}. Leaving linear y-scale."
+        )
+        return "linear"
+    axis.set_yscale("log")
+    return "log"
+
+
+def save_information_suite_error_plot(
+    target_field_normalized: np.ndarray,
+    target_jy_physical: np.ndarray,
+    rows: List[Dict],
+    frame_ids: np.ndarray,
+    out_path: Path,
+    title: str,
+    experiment_name: str = "",
+    jy_std_train: float = 1.0,
+) -> Dict:
+    """Plot Density NRMSE in checkpoint-normalized units and physical-unit Jy NRMSE."""
+    fig, axes = plt.subplots(2, 1, figsize=(10.5, 7.0), sharex=True)
+    payload = []
+    density_series = []
+    jy_series = []
+    for row_index, row in enumerate(rows, start=1):
+        density_residual = normalized_residual(
+            row["pred_normalized"][3], target_field_normalized[3]
+        )
+        jy_residual = normalized_residual(
+            row["pred_jy_physical"], target_jy_physical
+        )
+        density_nrmse = np.sqrt(np.mean(np.square(density_residual), axis=(1, 2)))
+        jy_nrmse = jy_nrmse_from_residual(jy_residual, jy_std_train)
+        if experiment_name == "magnetic_ablation":
+            label = validation_statistics_legend_label(
+                experiment_name, row, context_length=0
+            )
+        else:
+            label = f"row {row_index}: {row['label']}"
+        axes[0].plot(frame_ids, density_nrmse, linewidth=1.8, label=label)
+        axes[1].plot(frame_ids, jy_nrmse, linewidth=1.8, label=label)
+        density_series.append(density_nrmse)
+        jy_series.append(jy_nrmse)
+        payload.append(
+            {
+                "row": row_index,
+                "name": row.get("name"),
+                "label": row["label"],
+                "legend_label": label,
+                "density_nrmse": density_nrmse.tolist(),
+                "jy_nrmse": jy_nrmse.tolist(),
+            }
+        )
+    axes[0].set_ylabel("Density frame NRMSE")
+    axes[1].set_ylabel(JY_NRMSE_YLABEL)
+    axes[1].set_xlabel("Global frame")
+    yscales = {"density": "linear", "jy": "linear"}
+    if experiment_name == "magnetic_ablation" and density_series:
+        yscales["density"] = apply_log_yscale_if_strictly_positive(
+            axes[0],
+            np.concatenate(density_series),
+            "magnetic_ablation named-window Density NRMSE",
+        )
+        yscales["jy"] = apply_log_yscale_if_strictly_positive(
+            axes[1],
+            np.concatenate(jy_series),
+            "magnetic_ablation named-window Jy NRMSE",
+        )
+    for ax in axes:
+        ax.grid(alpha=0.25)
+        ax.legend(fontsize=8, ncol=2)
+    fig.suptitle(title, y=0.98)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+    print(f"Saved framewise error plot: {out_path}")
+    payload_out = {
+        "frame_ids": frame_ids.tolist(),
+        "density_nrmse_yscale": yscales["density"],
+        "jy_nrmse_yscale": yscales["jy"],
+        "jy_nrmse_ylabel": JY_NRMSE_YLABEL,
+        "jy_nrmse_definition": JY_NRMSE_DEFINITION,
+        "jy_std_train": float(jy_std_train),
+        "rows": payload,
+    }
+    payload_out.update(jy_metric_metadata())
+    return payload_out
+
+
+def resolve_checkpoint_path(run_dir: Path, checkpoint: str) -> Path:
+    path = Path(checkpoint)
+    if path.is_absolute():
+        return path.expanduser().resolve()
+    return package_file(run_dir, checkpoint).expanduser().resolve()
+
+
+def checkpoint_cache_signature(checkpoint_path: Path) -> Dict:
+    stat = checkpoint_path.stat()
+    return {
+        "path": str(checkpoint_path),
+        "mtime_ns": int(stat.st_mtime_ns),
+        "size": int(stat.st_size),
+    }
+
+
+def information_suite_plot_cache_signature(
+    args: argparse.Namespace,
+    run_dir: Path,
+) -> Dict:
+    """Identity of the arrays needed to redraw, excluding figure-style options."""
+    return {
+        "version": PLOT_CACHE_VERSION,
+        "kind": "information_suite",
+        "checkpoint": checkpoint_cache_signature(
+            resolve_checkpoint_path(run_dir, args.checkpoint)
+        ),
+        "run_name": args.run_name,
+        "t0": args.t0,
+        "sample_index": args.sample_index,
+        "seed": args.seed,
+        "mask_fraction": args.mask_fraction,
+        "block_fraction": args.block_fraction,
+        "grid_stride": args.grid_stride,
+        "magnetic_grid_stride": args.magnetic_grid_stride,
+        "mask_patterns": list(args.mask_patterns),
+        "experiment": args.experiment,
+        "hide_magnetic": bool(args.hide_magnetic),
+        "density_probe_counts": list(args.density_probe_counts),
+        "magnetic_visible_fractions": [float(value) for value in args.magnetic_visible_fractions],
+        "density_forecast_visible_frames": (
+            None
+            if args.density_forecast_visible_frames is None
+            else [int(value) for value in args.density_forecast_visible_frames]
+        ),
+        "skip_validation_statistics": bool(args.skip_validation_statistics),
+        "statistics_window_stride": args.statistics_window_stride,
+        "statistics_max_windows_per_run": args.statistics_max_windows_per_run,
+        "plot_units": args.plot_units,
+        "extent": [float(value) for value in args.extent],
+        "h5_dir": args.h5_dir,
+        "jy_preprocessing": JY_STATS_PREPROCESSING,
+        "jy_stats_cache_version": JY_STATS_CACHE_VERSION,
+        "jy_includes_mu0": JY_INCLUDES_MU0,
+        "B_unit": JY_B_UNIT,
+        "jy_unit": JY_UNIT,
+    }
+
+
+def load_plot_cache(path: Path) -> Dict | None:
+    try:
+        with path.open("rb") as handle:
+            return pickle.load(handle)
+    except Exception as exc:
+        print(f"Could not load plot cache {path}: {exc}")
+        return None
+
+
+def save_plot_cache(path: Path, payload: Dict) -> None:
+    tmp_path = path.with_name(path.name + ".tmp")
+    with tmp_path.open("wb") as handle:
+        pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp_path.replace(path)
+    print(f"Saved plot cache: {path}")
+
+
+def try_reuse_plot_cache(
+    path: Path,
+    signature: Dict,
+    enabled: bool,
+) -> Dict | None:
+    if not enabled:
+        return None
+    if not path.exists():
+        print(f"No plot cache at {path}; running model inference")
+        return None
+    payload = load_plot_cache(path)
+    if payload is None:
+        return None
+    if payload.get("signature") != signature:
+        print(f"Plot cache at {path} does not match this command; recomputing")
+        return None
+    print(f"Reusing plot cache: {path}")
+    return payload
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+
+    p.add_argument(
+        "--run-dir",
+        type=str,
+        default=DEFAULT_RUN_DIR,
+        help=(
+            "Training run directory containing best.pt, stats.json, split.json. "
+            f"Default: {DEFAULT_RUN_DIR}."
+        ),
+    )
+    p.add_argument(
+        "--checkpoint",
+        type=str,
+        default="best.pt",
+        help="Checkpoint filename inside run-dir, or an absolute path.",
+    )
+    p.add_argument(
+        "--h5-dir",
+        type=str,
+        default=None,
+        help="Override HDF5 data directory. If None, use checkpoint args.",
+    )
+
+    p.add_argument(
+        "--run-name",
+        type=str,
+        default=DEFAULT_RUN_NAME,
+        help=(
+            "Validation run to visualize (default: the canonical two-plasmoid "
+            f"merger run {DEFAULT_RUN_NAME})."
+        ),
+    )
+    p.add_argument(
+        "--t0",
+        type=int,
+        default=DEFAULT_T0,
+        help=(
+            "First global frame of the temporal window selected with "
+            f"--run-name (default: {DEFAULT_T0})."
+        ),
+    )
+    p.add_argument(
+        "--sample-index",
+        type=int,
+        default=None,
+        help=(
+            "Legacy zero-based index within validation windows. When given, "
+            "it overrides --run-name and --t0."
+        ),
+    )
+    p.add_argument("--seed", type=int, default=1234)
+    p.add_argument(
+        "--mask-fraction",
+        type=float,
+        default=0.8,
+        help=(
+            "Target fraction of hidden voxels for custom spatial_random and "
+            "temporal_random rows. Multifunction uses standardized ~50% "
+            "Density masks instead of this value."
+        ),
+    )
+    p.add_argument(
+        "--block-fraction",
+        type=float,
+        default=0.5,
+        help=(
+            "Unused by the visualization spatial_block rows, which now use a "
+            "fixed centered rectangle covering about half the domain."
+        ),
+    )
+    p.add_argument(
+        "--grid-stride",
+        type=int,
+        default=4,
+        help=(
+            "Density stride for the custom spatial_grid row. Multifunction "
+            "uses a 50% checkerboard instead of this stride. The grid offset "
+            "stays random for custom. Default: 4."
+        ),
+    )
+    p.add_argument(
+        "--magnetic-grid-stride",
+        type=int,
+        default=2,
+        help=(
+            "Bx/By/Bz stride for the spatial_grid row. Default: 2, making "
+            "magnetic observations denser than Density observations."
+        ),
+    )
+
+    p.add_argument(
+        "--local-time",
+        type=int,
+        default=4,
+        help=(
+            "One local time index inside the temporal block. Ignored by plotting "
+            "when --all-times is set."
+        ),
+    )
+    p.add_argument(
+        "--all-times",
+        action="store_true",
+        help=(
+            "Plot all local time slices from the model's temporal window and "
+            "combine each figure family into an animation."
+        ),
+    )
+    p.add_argument(
+        "--animation-format",
+        choices=["quicktime", "mp4", "gif", "both"],
+        default="gif",
+        help=(
+            "Animation output written with --all-times. quicktime writes a "
+            "Motion-JPEG .mov that opens in macOS QuickTime; mp4 may use VP9 "
+            "when H.264 is unavailable. both writes QuickTime and GIF."
+        ),
+    )
+    p.add_argument(
+        "--fps",
+        type=float,
+        default=2.0,
+        help="Animation frame rate used with --all-times (default: 2).",
+    )
+    p.add_argument(
+        "--mask-patterns",
+        type=str,
+        nargs="+",
+        default=list(MASK_PATTERNS),
+        choices=list(MASK_PATTERNS),
+        help="Rows to show in the figure.",
+    )
+    p.add_argument(
+        "--experiment",
+        choices=[
+            "all",
+            "multifunction",
+            "density_superres",
+            "magnetic_ablation",
+            "density_forecast",
+            "custom",
+        ],
+        default="all",
+        help=(
+            "Visualization experiment to render. The default 'all' renders: "
+            "Density-only versions of every mask pattern, a Density "
+            "super-resolution probe-count sweep, and a magnetic-information "
+            "ablation, and a Density forecast-horizon sweep. 'custom' preserves "
+            "the original --mask-patterns behavior. With --hide-magnetic, "
+            "'all' skips magnetic_ablation and hides Bx/By/Bz in the remaining "
+            "Density experiments."
+        ),
+    )
+    p.add_argument(
+        "--hide-magnetic",
+        action="store_true",
+        help=(
+            "Hide all Bx/By/Bz observations in multifunction, "
+            "density_superres, density_forecast, and custom. Use this to see "
+            "Density-mask effects without a fully observed magnetic field."
+        ),
+    )
+    p.add_argument(
+        "--density-probe-counts",
+        type=int,
+        nargs="+",
+        default=[0, 10, 100, 1000],
+        help=(
+            "Numbers of Density probes for rows in the super-resolution sweep. "
+            "Default: 0 10 100 1000."
+        ),
+    )
+    p.add_argument(
+        "--magnetic-visible-fractions",
+        type=float,
+        nargs="+",
+        default=list(DEFAULT_MAGNETIC_ABLATION_VISIBLE_FRACTIONS),
+        help=(
+            "Magnetic visible fractions in [0, 1] for the nested spatial-random "
+            "ablation. Default percents: "
+            + " ".join(f"{percent:g}" for percent in DEFAULT_MAGNETIC_ABLATION_VISIBLE_PERCENTS)
+            + "."
+        ),
+    )
+    p.add_argument(
+        "--density-forecast-visible-frames",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "Numbers of complete leading Density frames made visible in the "
+            "density_forecast rows. All later Density frames are hidden while "
+            "Bx/By/Bz remain visible for the full temporal window. Default for "
+            "T=24: 23 18 12 6; other T values use equivalent relative lengths."
+        ),
+    )
+    p.add_argument(
+        "--skip-validation-statistics",
+        action="store_true",
+        help=(
+            "Skip the cross-validation-run median and 16th-84th percentile "
+            "error plots. By default they are generated in addition to the "
+            "selected single-window GIFs."
+        ),
+    )
+    p.add_argument(
+        "--statistics-window-stride",
+        type=int,
+        default=None,
+        help=(
+            "Stride used to crop validation runs into context windows for "
+            "aggregate statistics. Default: one context length; a final "
+            "run-end-aligned window is also included when needed."
+        ),
+    )
+    p.add_argument(
+        "--statistics-max-windows-per-run",
+        type=int,
+        default=None,
+        help=(
+            "Optional cap on aggregate-statistics windows per validation run. "
+            "Selected windows are spread evenly over each run."
+        ),
+    )
+
+    p.add_argument(
+        "--plot-units",
+        type=str,
+        default="physical",
+        choices=["physical", "normalized"],
+        help=(
+            "physical: plot original/denormalized field values. "
+            "normalized: plot channel-normalized values, matching training loss units."
+        ),
+    )
+
+    p.add_argument(
+        "--field-q",
+        type=float,
+        default=99.0,
+        help="Percentile used for robust field color limits.",
+    )
+    p.add_argument(
+        "--residual-q",
+        type=float,
+        default=99.0,
+        help="Percentile used with --auto-residual-range.",
+    )
+    p.add_argument(
+        "--residual-vmax",
+        type=float,
+        default=DEFAULT_RESIDUAL_VMAX,
+        help=(
+            "Fixed symmetric normalized-residual color limit. "
+            f"Default: {DEFAULT_RESIDUAL_VMAX}, giving "
+            f"[-{DEFAULT_RESIDUAL_VMAX}, {DEFAULT_RESIDUAL_VMAX}]."
+        ),
+    )
+    p.add_argument(
+        "--auto-residual-range",
+        action="store_const",
+        const=None,
+        dest="residual_vmax",
+        default=argparse.SUPPRESS,
+        help="Use robust percentile-based residual limits instead of a fixed range.",
+    )
+    p.add_argument(
+        "--ay-levels",
+        type=int,
+        default=15,
+        help="Number of Ay contour levels.",
+    )
+    p.add_argument(
+        "--quiver-step",
+        type=int,
+        default=20,
+        help="Spatial subsampling step for in-plane magnetic-field arrows.",
+    )
+    p.add_argument(
+        "--quiver-scale",
+        type=float,
+        default=15.0,
+        help="Matplotlib quiver scale for the in-plane magnetic field.",
+    )
+
+    p.add_argument(
+        "--out-dir",
+        type=str,
+        default=None,
+        help="Output directory for figures. If None, use run-dir/figures_mask_patterns.",
+    )
+    p.add_argument(
+        "--reuse-plot-data",
+        action="store_true",
+        help=(
+            "If out-dir/plot_cache.pkl exists and matches this command's "
+            "inference settings, skip model inference and only redraw figures."
+        ),
+    )
+
+    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--dpi", type=int, default=180)
+
+    p.add_argument(
+        "--extent",
+        type=float,
+        nargs=4,
+        default=[-21.0, 21.0, -50.0, 50.0],
+        help="imshow extent: zmin zmax xmin xmax.",
+    )
+
+    return p.parse_args()
+
+
+def expand_path(path: str | Path) -> Path:
+    return Path(os.path.expandvars(str(path))).expanduser().resolve()
+
+def package_file(run_dir: Path, name: str) -> Path:
+    """Resolve split/stats/checkpoint files in this anonymous package layout."""
+    run_dir = Path(run_dir)
+    target = Path(name)
+    roots = [run_dir]
+    if run_dir.name in {"checkpoint", "configs"}:
+        roots.append(run_dir.parent)
+    candidates = []
+    for root in roots:
+        candidates.extend(
+            [
+                root / target,
+                root / "configs" / target.name,
+                root / "checkpoint" / target.name,
+            ]
+        )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return run_dir / target
+
+
+def load_checkpoint(run_dir: Path, checkpoint_name: str, device: torch.device):
+    ckpt_path = Path(checkpoint_name)
+    if not ckpt_path.is_absolute():
+        ckpt_path = package_file(run_dir, checkpoint_name)
+
+    ckpt = torch.load(ckpt_path, map_location=device)
+    print(f"Loaded checkpoint: {ckpt_path}")
+    print(f"Checkpoint epoch: {ckpt.get('epoch', 'N/A')}")
+    print(f"Best val MSE: {ckpt.get('best_val_mse', 'N/A')}")
+    return ckpt, ckpt_path
+
+
+def normalize(y: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+    return (y - mean) / (std + 1e-8)
+
+
+def denormalize(y: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+    return y * (std + 1e-8) + mean
+
+
+def get_val_runs(run_dir: Path) -> set[str] | None:
+    split_path = package_file(run_dir, "split.json")
+    if not split_path.exists():
+        print(f"No split.json found at {split_path}. Will use all samples.")
+        return None
+
+    with open(split_path, "r") as f:
+        split = json.load(f)
+
+    val_runs = set(split["val_runs"])
+    print(f"Loaded {len(val_runs)} validation runs from split.json")
+    return val_runs
+
+
+def get_train_runs(run_dir: Path) -> set[str] | None:
+    split_path = package_file(run_dir, "split.json")
+    if not split_path.exists():
+        print(f"No split.json found at {split_path}. Cannot resolve training runs.")
+        return None
+
+    with open(split_path, "r") as f:
+        split = json.load(f)
+
+    if "train_runs" not in split:
+        print(f"No train_runs key in {split_path}.")
+        return None
+
+    train_runs = set(split["train_runs"])
+    print(f"Loaded {len(train_runs)} training runs from split.json")
+    return train_runs
+
+
+def select_sample_index(dataset: VPICWindowDataset, val_runs: set[str] | None, sample_index: int) -> int:
+    if sample_index < 0:
+        raise IndexError(f"sample_index must be non-negative, got {sample_index}")
+    if val_runs is None:
+        if sample_index >= len(dataset):
+            raise IndexError(f"sample_index={sample_index} out of range for dataset length {len(dataset)}")
+        return sample_index
+
+    val_indices: List[int] = []
+    for i, (_, run_name, _) in enumerate(dataset.samples):
+        if run_name in val_runs:
+            val_indices.append(i)
+
+    if len(val_indices) == 0:
+        raise RuntimeError("No validation samples found from split.json.")
+
+    if sample_index >= len(val_indices):
+        raise IndexError(
+            f"sample_index={sample_index} out of range for val sample count {len(val_indices)}"
+        )
+
+    return val_indices[sample_index]
+
+
+def select_run_t0_index(
+    dataset: VPICWindowDataset,
+    val_runs: set[str] | None,
+    run_name: str,
+    t0: int,
+) -> int:
+    """Resolve an exact physical run/window, independently of sample ordering."""
+    if t0 < 0:
+        raise ValueError(f"t0 must be non-negative, got {t0}")
+    if val_runs is not None and run_name not in val_runs:
+        raise ValueError(
+            f"run_name={run_name!r} is not in split.json validation runs."
+        )
+
+    run_windows = [
+        (i, int(sample_t0))
+        for i, (_, sample_run_name, sample_t0) in enumerate(dataset.samples)
+        if sample_run_name == run_name
+    ]
+    if not run_windows:
+        raise ValueError(f"run_name={run_name!r} was not found in the dataset.")
+
+    matches = [i for i, sample_t0 in run_windows if sample_t0 == t0]
+    if not matches:
+        available_t0 = [sample_t0 for _, sample_t0 in run_windows]
+        raise ValueError(
+            f"No window found for run_name={run_name!r}, t0={t0}. "
+            f"Available t0 range is {min(available_t0)}-{max(available_t0)} "
+            f"with values {available_t0}."
+        )
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"Found multiple dataset windows for run_name={run_name!r}, t0={t0}."
+        )
+    return matches[0]
+
+
+def make_nan_cmap(name: str, bad_color: str = "lightgray"):
+    cmap = plt.get_cmap(name).copy()
+    cmap.set_bad(color=bad_color)
+    return cmap
+
+
+def robust_limits(
+    arrays: Sequence[np.ndarray],
+    channel: int,
+    q: float = 99.0,
+    symmetric: bool | None = None,
+):
+    vals = []
+    for a in arrays:
+        aa = np.asarray(a)
+        aa = aa[np.isfinite(aa)]
+        if aa.size > 0:
+            vals.append(aa)
+
+    if len(vals) == 0:
+        return -1.0, 1.0
+
+    vals = np.concatenate(vals)
+
+    if symmetric is True:
+        vmax = np.nanpercentile(np.abs(vals), q)
+        if not np.isfinite(vmax) or vmax <= 0:
+            vmax = 1.0
+        return float(-vmax), float(vmax)
+
+    if symmetric is False:
+        vmin = np.nanpercentile(vals, 100.0 - q)
+        vmax = np.nanpercentile(vals, q)
+        if np.isclose(vmin, vmax):
+            vmax = vmin + 1.0
+        return float(vmin), float(vmax)
+
+    # Default behavior:
+    # Density is positive-ish, use asymmetric scale.
+    # Magnetic fields are signed, use symmetric scale.
+    if channel == 3:
+        vmin = np.nanpercentile(vals, 100.0 - q)
+        vmax = np.nanpercentile(vals, q)
+        if np.isclose(vmin, vmax):
+            vmax = vmin + 1.0
+        return float(vmin), float(vmax)
+
+    vmax = np.nanpercentile(np.abs(vals), q)
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = 1.0
+    return float(-vmax), float(vmax)
+
+
+def format_mask_label(info: Dict) -> str:
+    """
+    Short human readable description of one sampled mask layout.
+    """
+    pattern = info["pattern"]
+
+    if pattern == "spatial_random":
+        detail = "shared Bx/By/Bz mask; independent Density mask"
+    elif pattern == "spatial_grid":
+        if "magnetic_stride" in info:
+            detail = (
+                f"B stride={info['magnetic_stride']}×{info['magnetic_stride']}, "
+                f"offset=({info['magnetic_offset_x']}, {info['magnetic_offset_z']})\n"
+                f"Density stride={info['density_stride']}×{info['density_stride']}, "
+                f"offset=({info['density_offset_x']}, {info['density_offset_z']})"
+            )
+        else:
+            detail = (
+                f"stride={info['stride']}×{info['stride']}\n"
+                f"offset=({info['offset_x']}, {info['offset_z']})"
+            )
+    elif pattern == "spatial_block":
+        orientation = info.get("orientation", "inside_masked")
+        detail = (
+            f"{orientation} hole={info['rect_height']}×{info['rect_width']} "
+            f"at ({info['rect_x0']}, {info['rect_z0']})"
+        )
+    elif pattern == "temporal_random":
+        detail = f"shared B/Density frames={info['visible_frames']}"
+    elif pattern == "temporal_block":
+        detail = (
+            f"shared B/Density start={info['start']}, end={info['end']}\n"
+            f"orientation={info['orientation']}"
+        )
+    else:
+        detail = ""
+
+    return f"{pattern}\n{detail}"
+
+
+VISUALIZATION_SPATIAL_BLOCK_AREA_FRACTION = 0.5
+VISUALIZATION_SPATIAL_BLOCK_ROWS = (
+    ("spatial_block_inpainting", "inside_masked", "Spatial block — inpainting"),
+    ("spatial_block_outpainting", "inside_visible", "Spatial block — outpainting"),
+)
+
+
+def make_centered_spatial_block_mask(
+    size_x: int,
+    size_z: int,
+    area_fraction: float = VISUALIZATION_SPATIAL_BLOCK_AREA_FRACTION,
+    orientation: str = "inside_masked",
+) -> Tuple[torch.Tensor, Dict]:
+    """Deterministic centered rectangle for visualization spatial_block rows."""
+    size_x = int(size_x)
+    size_z = int(size_z)
+    area_fraction = float(area_fraction)
+    if size_x < 1 or size_z < 1:
+        raise ValueError(f"Expected positive X and Z, got {size_x} and {size_z}.")
+    if not (0.0 < area_fraction <= 1.0):
+        raise ValueError(
+            f"area_fraction must lie in (0, 1], got {area_fraction}."
+        )
+
+    scale = math.sqrt(area_fraction)
+    rect_height = min(max(int(round(size_x * scale)), 0), size_x)
+    rect_width = min(max(int(round(size_z * scale)), 0), size_z)
+    x0 = (size_x - rect_height) // 2
+    z0 = (size_z - rect_width) // 2
+    info = {
+        "orientation": orientation,
+        "rect_x0": x0,
+        "rect_z0": z0,
+        "rect_height": rect_height,
+        "rect_width": rect_width,
+        "target_area_fraction": area_fraction,
+        "actual_area_fraction": float(rect_height * rect_width) / float(size_x * size_z),
+    }
+
+    if orientation == "inside_masked":
+        plane = torch.ones(size_x, size_z)
+        plane[x0 : x0 + rect_height, z0 : z0 + rect_width] = 0.0
+    elif orientation == "inside_visible":
+        plane = torch.zeros(size_x, size_z)
+        plane[x0 : x0 + rect_height, z0 : z0 + rect_width] = 1.0
+    else:
+        raise ValueError(f"Unknown spatial_block orientation {orientation!r}.")
+    return plane, info
+
+
+def share_magnetic_channel_mask(mask: torch.Tensor) -> torch.Tensor:
+    """Make Bx, By and Bz use exactly the same observation locations."""
+    if mask.ndim != 5 or mask.shape[1] < 3:
+        raise ValueError(
+            f"Expected mask shaped (B, C>=3, T, X, Z), got {tuple(mask.shape)}"
+        )
+
+    mask = mask.clone()
+    mask[:, 1:3] = mask[:, 0:1]
+    return mask
+
+
+def build_mask_patterns(
+    block: torch.Tensor,
+    patterns: Sequence[str],
+    mask_fraction: float,
+    block_fraction: float,
+    grid_stride: int,
+    magnetic_grid_stride: int,
+    generator: torch.Generator,
+) -> List[Tuple[str, str, torch.Tensor]]:
+    """
+    Return list of:
+        (short_name, display_label, visible_mask)
+
+    Masks come from data.masking so that the figure shows the same mask family
+    the model was trained on. spatial_grid keeps a pinned probe lattice with a
+    random offset. spatial_block is a visualization-only centered rectangle
+    shown as complementary inpainting and outpainting rows.
+    """
+    rows = []
+
+    for name in patterns:
+        if name == "spatial_block":
+            _, _, _, size_x, size_z = block.shape
+            for short_name, orientation, title in VISUALIZATION_SPATIAL_BLOCK_ROWS:
+                plane, info = make_centered_spatial_block_mask(
+                    size_x,
+                    size_z,
+                    area_fraction=VISUALIZATION_SPATIAL_BLOCK_AREA_FRACTION,
+                    orientation=orientation,
+                )
+                mask = (
+                    plane.to(device=block.device, dtype=block.dtype)
+                    .view(1, 1, 1, size_x, size_z)
+                    .expand(*block.shape)
+                    .contiguous()
+                )
+                mask = share_magnetic_channel_mask(mask)
+                info["pattern"] = name
+                info["target_mask_fraction"] = float(1.0 - mask.mean().item())
+                info["actual_mask_fraction"] = float(1.0 - mask.mean().item())
+                rows.append((short_name, title, mask))
+            continue
+
+        if name == "spatial_grid":
+            # Visualization-only benchmark geometry: magnetic diagnostics are
+            # sampled more densely than Density, matching the intended probe
+            # arrangement. Training mask sampling is deliberately unchanged.
+            magnetic_mask, magnetic_info = sample_mask(
+                block.shape,
+                pattern=name,
+                mask_fraction=mask_fraction,
+                device=block.device,
+                dtype=block.dtype,
+                generator=generator,
+                grid_stride=magnetic_grid_stride,
+            )
+            density_mask, density_info = sample_mask(
+                block.shape,
+                pattern=name,
+                mask_fraction=mask_fraction,
+                device=block.device,
+                dtype=block.dtype,
+                generator=generator,
+                grid_stride=grid_stride,
+            )
+
+            mask = magnetic_mask.clone()
+            mask[:, 3:4] = density_mask[:, 3:4]
+            mask = share_magnetic_channel_mask(mask)
+            info = {
+                "pattern": name,
+                "target_mask_fraction": mask_fraction,
+                "actual_mask_fraction": float(1.0 - mask.mean().item()),
+                "magnetic_stride": magnetic_info["stride"],
+                "magnetic_offset_x": magnetic_info["offset_x"],
+                "magnetic_offset_z": magnetic_info["offset_z"],
+                "density_stride": density_info["density_stride"],
+                "density_offset_x": density_info["density_offset_x"],
+                "density_offset_z": density_info["density_offset_z"],
+            }
+            rows.append((name, format_mask_label(info), mask))
+            continue
+
+        mask, info = sample_mask(
+            block.shape,
+            pattern=name,
+            mask_fraction=mask_fraction,
+            device=block.device,
+            dtype=block.dtype,
+            generator=generator,
+        )
+        mask = share_magnetic_channel_mask(mask)
+        info["actual_mask_fraction"] = float(1.0 - mask.mean().item())
+        rows.append((name, format_mask_label(info), mask))
+
+    return rows
+
+
+def _validate_visible_fractions(
+    values: Sequence[float],
+    option_name: str,
+    allow_zero: bool = False,
+) -> List[float]:
+    lower = 0.0 if allow_zero else np.nextafter(0.0, 1.0)
+    parsed = [float(value) for value in values]
+    if not parsed:
+        raise ValueError(f"{option_name} requires at least one value.")
+    for value in parsed:
+        if not (lower <= value <= 1.0):
+            interval = "[0, 1]" if allow_zero else "(0, 1]"
+            raise ValueError(
+                f"{option_name} values must lie in {interval}, got {value}."
+            )
+    return parsed
+
+
+def _magnetic_visibility_phrase(magnetic_visible: bool) -> str:
+    return "B visible=100%" if magnetic_visible else "B visible=0%"
+
+
+def build_density_only_multifunction_rows(
+    block: torch.Tensor,
+    patterns: Sequence[str],
+    mask_fraction: float,
+    block_fraction: float,
+    grid_stride: int,
+    magnetic_grid_stride: int,
+    generator: torch.Generator,
+    magnetic_visible: bool = True,
+) -> List[Tuple[str, str, torch.Tensor]]:
+    """Apply every requested topology to Density, optionally hiding all B.
+
+    Density uses standardized ~50% geometries so the six rows compare mask
+    topology rather than observation severity. Magnetic channels stay fully
+    visible or fully hidden and are not copied from the Density layout.
+    """
+    magnetic_phrase = _magnetic_visibility_phrase(magnetic_visible)
+    magnetic_fill = 1.0 if magnetic_visible else 0.0
+    labels = {
+        "spatial_random": (
+            f"Density spatial_random\n{magnetic_phrase}; "
+            "Density 50% random spatial sites"
+        ),
+        "spatial_grid": (
+            f"Density spatial_grid\n{magnetic_phrase}; "
+            "Density 50% checkerboard"
+        ),
+        "temporal_random": (
+            f"Density temporal_random\n{magnetic_phrase}; "
+            "Density alternating frames VMVM..."
+        ),
+        "temporal_block": (
+            f"Density temporal_block\n{magnetic_phrase}; "
+            "Density first half visible"
+        ),
+    }
+
+    rows = []
+    for name in patterns:
+        if name == "spatial_block":
+            sampled_rows = build_mask_patterns(
+                block=block,
+                patterns=["spatial_block"],
+                mask_fraction=mask_fraction,
+                block_fraction=block_fraction,
+                grid_stride=grid_stride,
+                magnetic_grid_stride=magnetic_grid_stride,
+                generator=generator,
+            )
+            for short_name, old_label, mask in sampled_rows:
+                mask = mask.clone()
+                mask[:, :3] = magnetic_fill
+                rows.append(
+                    (short_name, f"{old_label}\n{magnetic_phrase}", mask)
+                )
+            continue
+
+        val_mask, _ = make_fixed_validation_mask(
+            name,
+            block.shape,
+            device=block.device,
+            dtype=block.dtype,
+        )
+        mask = val_mask.clone()
+        mask[:, :3] = magnetic_fill
+        rows.append((name, labels[name], mask))
+    return rows
+
+
+def _density_probe_grid(
+    block: torch.Tensor,
+    target_visible_fraction: float,
+    generator: torch.Generator,
+) -> Tuple[torch.Tensor, Dict[str, float | int]]:
+    """Create a near-isotropic regular grid close to a requested probe ratio."""
+    # Allow mildly rectangular cells when that materially improves the target
+    # ratio (notably 8%, for which no square integer stride exists).
+    candidates = []
+    for stride_x in range(1, 33):
+        for stride_z in range(1, 33):
+            nominal = 1.0 / float(stride_x * stride_z)
+            relative_error = abs(nominal - target_visible_fraction) / target_visible_fraction
+            anisotropy = abs(stride_x - stride_z) / max(stride_x, stride_z)
+            candidates.append(
+                (relative_error + 0.05 * anisotropy, anisotropy, stride_x, stride_z)
+            )
+    batch, _channels, time, size_x, size_z = block.shape
+    _score, _anisotropy, stride_x, stride_z = min(candidates)
+    offset_candidates = []
+    for candidate_x in range(stride_x):
+        count_x = (size_x - 1 - candidate_x) // stride_x + 1
+        for candidate_z in range(stride_z):
+            count_z = (size_z - 1 - candidate_z) // stride_z + 1
+            actual = float(count_x * count_z) / float(size_x * size_z)
+            offset_candidates.append(
+                (abs(actual - target_visible_fraction), candidate_x, candidate_z)
+            )
+    best_offset_error = min(item[0] for item in offset_candidates)
+    best_offsets = [
+        item for item in offset_candidates if np.isclose(item[0], best_offset_error)
+    ]
+    selected_offset = int(
+        torch.randint(len(best_offsets), (1,), generator=generator).item()
+    )
+    _offset_error, offset_x, offset_z = best_offsets[selected_offset]
+
+    plane = torch.zeros(
+        (1, 1, 1, size_x, size_z),
+        device=block.device,
+        dtype=block.dtype,
+    )
+    plane[..., offset_x::stride_x, offset_z::stride_z] = 1.0
+    mask = plane.expand(batch, 1, time, size_x, size_z).contiguous()
+    info = {
+        "stride_x": stride_x,
+        "stride_z": stride_z,
+        "offset_x": offset_x,
+        "offset_z": offset_z,
+        "actual_visible_fraction": float(mask.mean().item()),
+    }
+    return mask, info
+
+
+def _density_probe_count_grid(
+    block: torch.Tensor,
+    probe_count: int,
+) -> Tuple[torch.Tensor, Dict[str, int]]:
+    """Create an approximately isotropic regular grid with exactly N probes."""
+    batch, _channels, time, size_x, size_z = block.shape
+    if not (0 <= probe_count <= size_x * size_z):
+        raise ValueError(
+            f"Density probe count must lie in [0, {size_x * size_z}], "
+            f"got {probe_count}."
+        )
+
+    plane = torch.zeros(
+        (1, 1, 1, size_x, size_z),
+        device=block.device,
+        dtype=block.dtype,
+    )
+    if probe_count == 0:
+        return plane.expand(batch, 1, time, size_x, size_z).contiguous(), {
+            "count_x": 0,
+            "count_z": 0,
+        }
+
+    aspect = float(size_x) / float(size_z)
+    factor_pairs = [
+        (probe_count // count_z, count_z)
+        for count_z in range(1, probe_count + 1)
+        if probe_count % count_z == 0
+    ]
+    count_x, count_z = min(
+        factor_pairs,
+        key=lambda pair: abs(np.log((pair[0] / pair[1]) / aspect)),
+    )
+    x_indices = torch.linspace(
+        0, size_x - 1, count_x, device=block.device
+    ).round().long()
+    z_indices = torch.linspace(
+        0, size_z - 1, count_z, device=block.device
+    ).round().long()
+    plane[..., x_indices[:, None], z_indices[None, :]] = 1.0
+    mask = plane.expand(batch, 1, time, size_x, size_z).contiguous()
+    return mask, {"count_x": count_x, "count_z": count_z}
+
+
+def build_density_superres_rows(
+    block: torch.Tensor,
+    probe_counts: Sequence[int],
+    magnetic_visible: bool = True,
+) -> List[Tuple[str, str, torch.Tensor]]:
+    """Sweep exact Density probe counts, optionally hiding all B."""
+    rows = []
+    magnetic_phrase = _magnetic_visibility_phrase(magnetic_visible)
+    for probe_count in probe_counts:
+        density_mask, info = _density_probe_count_grid(
+            block=block,
+            probe_count=int(probe_count),
+        )
+        mask = torch.ones_like(block)
+        if not magnetic_visible:
+            mask[:, :3] = 0.0
+        mask[:, 3:4] = density_mask
+        label = (
+            "Density super-resolution\n"
+            f"{magnetic_phrase}; Density probes={probe_count}\n"
+            f"probe grid={info['count_x']}x{info['count_z']}"
+        )
+        rows.append((f"density_superres_{probe_count}", label, mask))
+    return rows
+
+
+def build_magnetic_ablation_rows(
+    block: torch.Tensor,
+    magnetic_visible_fractions: Sequence[float],
+    generator: torch.Generator,
+) -> List[Tuple[str, str, torch.Tensor]]:
+    """
+    Hide all Density and progressively remove nested magnetic probes.
+
+    The same spatial ranking is used for all rows, so every lower-visibility B
+    layout is a strict subset of the preceding higher-visibility layout.
+    """
+    batch, _channels, time, size_x, size_z = block.shape
+    density_mask = torch.zeros(
+        (batch, 1, time, size_x, size_z),
+        device=block.device,
+        dtype=block.dtype,
+    )
+    num_sites = int(size_x * size_z)
+    permutation = torch.randperm(num_sites, generator=generator)
+    rank = torch.empty(num_sites, dtype=torch.long)
+    rank[permutation] = torch.arange(num_sites)
+
+    rows = []
+    for visible_fraction in magnetic_visible_fractions:
+        num_visible = magnetic_ablation_visible_count(num_sites, visible_fraction)
+        magnetic_plane = (rank < num_visible).reshape(1, 1, 1, size_x, size_z)
+        magnetic_plane = magnetic_plane.to(device=block.device, dtype=block.dtype)
+        magnetic_mask = magnetic_plane.expand(batch, 3, time, size_x, size_z)
+
+        mask = torch.cat([magnetic_mask, density_mask], dim=1).contiguous()
+        percent_label = format_magnetic_visible_percent(visible_fraction)
+        label = (
+            "Magnetic information ablation\n"
+            f"{percent_label} (nested random)\n"
+            "Density probes=0 (fully hidden)"
+        )
+        rows.append((f"magnetic_ablation_{visible_fraction:g}", label, mask))
+    return rows
+
+
+def build_density_forecast_rows(
+    block: torch.Tensor,
+    visible_frame_counts: Sequence[int],
+    magnetic_visible: bool = True,
+) -> List[Tuple[str, str, torch.Tensor]]:
+    """
+    Build causal Density-prefix masks, optionally hiding all B.
+
+    Every visible Density frame is spatially complete. Density is fully hidden
+    after the prefix, so the final slice measures conditional forecast accuracy
+    at progressively longer horizons. The default keeps Bx/By/Bz visible.
+    """
+    time = int(block.shape[2])
+    counts = [int(count) for count in visible_frame_counts]
+    if not counts:
+        raise ValueError("--density-forecast-visible-frames requires at least one value.")
+    if len(set(counts)) != len(counts):
+        raise ValueError(
+            "--density-forecast-visible-frames values must be unique, "
+            f"got {counts}."
+        )
+
+    rows = []
+    for count in counts:
+        if not (1 <= count < time):
+            raise ValueError(
+                "--density-forecast-visible-frames values must be in "
+                f"[1, T-1]=[1, {time - 1}], got {count}."
+            )
+
+        mask = torch.ones_like(block)
+        if not magnetic_visible:
+            mask[:, :3] = 0.0
+        mask[:, 3:4, count:] = 0.0
+        horizon = time - count
+        magnetic_phrase = _magnetic_visibility_phrase(magnetic_visible)
+        label = (
+            "Conditional Density forecast\n"
+            f"{magnetic_phrase} for frames 1-{time}\n"
+            f"Density visible=frames 1-{count} (spatially complete)\n"
+            f"target=frame {time}; forecast horizon={horizon} step"
+            f"{'s' if horizon != 1 else ''}"
+        )
+        rows.append((f"density_forecast_history_{count}", label, mask))
+    return rows
+
+
+def default_density_forecast_visible_frames(time: int) -> List[int]:
+    """Return T=24 -> [23, 18, 12, 6], scaled sensibly for legacy windows."""
+    if time < 2:
+        raise ValueError(f"density_forecast requires at least two frames, got T={time}.")
+    candidates = [time - 1, round(0.75 * time), round(0.50 * time), round(0.25 * time)]
+    return list(dict.fromkeys(min(max(int(value), 1), time - 1) for value in candidates))
+
+
+def build_experiment_mask_rows(
+    args: argparse.Namespace,
+    block: torch.Tensor,
+    generator: torch.Generator,
+) -> List[Tuple[str, List[Tuple[str, str, torch.Tensor]]]]:
+    """Build the selected table groups in their requested display order."""
+    magnetic_fractions = _validate_visible_fractions(
+        args.magnetic_visible_fractions,
+        "--magnetic-visible-fractions",
+        allow_zero=True,
+    )
+
+    if args.experiment == "magnetic_ablation" and args.hide_magnetic:
+        raise ValueError(
+            "--hide-magnetic cannot be combined with --experiment magnetic_ablation."
+        )
+
+    if args.experiment == "all":
+        selected = [
+            "multifunction",
+            "density_superres",
+            "density_forecast",
+        ]
+        if not args.hide_magnetic:
+            selected.insert(2, "magnetic_ablation")
+    else:
+        selected = [args.experiment]
+    experiments = []
+    magnetic_visible = not args.hide_magnetic
+    for experiment in selected:
+        if experiment == "multifunction":
+            rows = build_density_only_multifunction_rows(
+                block=block,
+                patterns=args.mask_patterns,
+                mask_fraction=args.mask_fraction,
+                block_fraction=args.block_fraction,
+                grid_stride=args.grid_stride,
+                magnetic_grid_stride=args.magnetic_grid_stride,
+                generator=generator,
+                magnetic_visible=magnetic_visible,
+            )
+        elif experiment == "density_superres":
+            rows = build_density_superres_rows(
+                block=block,
+                probe_counts=args.density_probe_counts,
+                magnetic_visible=magnetic_visible,
+            )
+        elif experiment == "magnetic_ablation":
+            rows = build_magnetic_ablation_rows(
+                block=block,
+                magnetic_visible_fractions=magnetic_fractions,
+                generator=generator,
+            )
+        elif experiment == "density_forecast":
+            rows = build_density_forecast_rows(
+                block=block,
+                visible_frame_counts=args.density_forecast_visible_frames,
+                magnetic_visible=magnetic_visible,
+            )
+        elif experiment == "custom":
+            rows = build_mask_patterns(
+                block=block,
+                patterns=args.mask_patterns,
+                mask_fraction=args.mask_fraction,
+                block_fraction=args.block_fraction,
+                grid_stride=args.grid_stride,
+                magnetic_grid_stride=args.magnetic_grid_stride,
+                generator=generator,
+            )
+            if args.hide_magnetic:
+                hidden_rows = []
+                for name, label, mask in rows:
+                    mask = mask.clone()
+                    mask[:, :3] = 0.0
+                    hidden_rows.append((name, f"{label}\nB visible=0%", mask))
+                rows = hidden_rows
+        else:
+            raise ValueError(f"Unhandled experiment: {experiment}")
+        experiments.append((experiment, rows))
+    return experiments
+
+
+def normalized_residual(
+    prediction_normalized: np.ndarray,
+    target_normalized: np.ndarray,
+) -> np.ndarray:
+    """Return residuals in the fixed preprocessing-standardized space."""
+    prediction = np.asarray(prediction_normalized, dtype=np.float64)
+    target = np.asarray(target_normalized, dtype=np.float64)
+    residual = prediction - target
+    residual[~(np.isfinite(prediction) & np.isfinite(target))] = np.nan
+    return residual
+
+
+def compute_normalized_metrics(
+    residual: np.ndarray,
+    scale: float = 1.0,
+) -> Tuple[float, float]:
+    """Return RMS and mean absolute values of a residual array.
+
+    ``scale`` divides only the RMS term so Jy NRMSE can use a training-set
+    characteristic scale without changing Density or NMAE.
+    """
+    residual = np.asarray(residual, dtype=np.float64)
+    residual = residual[np.isfinite(residual)]
+
+    if residual.size == 0:
+        return float("nan"), float("nan")
+
+    scale = float(scale)
+    if scale <= 0.0:
+        raise ValueError(f"Metric scale must be positive, got {scale}.")
+
+    nrmse = float(np.sqrt(np.mean(residual**2))) / scale
+    nmae = float(np.mean(np.abs(residual)))
+    return nrmse, nmae
+
+
+def physical_coordinates(shape: Sequence[int], extent: Sequence[float]):
+    """Return x-z coordinates for an (X, Z) field and imshow extent."""
+    X, Z = int(shape[-2]), int(shape[-1])
+    zmin, zmax, xmin, xmax = (float(v) for v in extent)
+    x = np.linspace(xmin, xmax, X)
+    z = np.linspace(zmin, zmax, Z)
+    return x, z
+
+
+def compute_ay_jy(
+    field: np.ndarray,
+    extent: Sequence[float],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Derive Ay and Jy from a complete (C, T, X, Z) field.
+
+    The sign convention matches visualization.ipynb:
+        Bx = -dAy/dz, Bz = dAy/dx
+        Jy = (1/mu0)*(dBx/dz - dBz/dx)
+
+    Ay is path-integrated exactly as in the notebook and its arbitrary additive
+    constant is removed independently for every frame.  This function is only
+    called for complete target and prediction fields, never masked input.
+    """
+    if field.ndim != 4 or field.shape[0] < 3:
+        raise ValueError(f"Expected (C, T, X, Z) with Bx/Bz channels, got {field.shape}")
+
+    bx = np.asarray(field[0], dtype=np.float64)
+    bz = np.asarray(field[2], dtype=np.float64)
+    T, X, Z = bx.shape
+    x, z = physical_coordinates((X, Z), extent)
+
+    ay = np.zeros((T, X, Z), dtype=np.float64)
+    jy = compute_jy(field, extent)
+
+    for t in range(T):
+        # First integrate Bz along x at the left z boundary, then integrate
+        # -Bx along z for every x. This is the same path used in the notebook.
+        for ix in range(1, X):
+            dx = x[ix] - x[ix - 1]
+            ay[t, ix, 0] = ay[t, ix - 1, 0] + 0.5 * (
+                bz[t, ix - 1, 0] + bz[t, ix, 0]
+            ) * dx
+
+        for iz in range(1, Z):
+            dz = z[iz] - z[iz - 1]
+            ay[t, :, iz] = ay[t, :, iz - 1] - 0.5 * (
+                bx[t, :, iz - 1] + bx[t, :, iz]
+            ) * dz
+
+        ay[t] -= np.mean(ay[t])
+    return ay, jy
+
+
+def compute_jy(field: np.ndarray, extent: Sequence[float]) -> np.ndarray:
+    """Jy = (1/mu0)*(dBx/dz - dBz/dx) in A/m^2.
+
+    ``field`` Bx/Bz are Tesla. ``extent`` is ``[zmin, zmax, xmin, xmax]`` in cm
+    and is converted to meters before differentiation.
+    """
+    if field.ndim != 4 or field.shape[0] < 3:
+        raise ValueError(f"Expected (C, T, X, Z) with Bx/Bz channels, got {field.shape}")
+    bx = np.asarray(field[0], dtype=np.float64)
+    bz = np.asarray(field[2], dtype=np.float64)
+    x_cm, z_cm = physical_coordinates(bx.shape[-2:], extent)
+    x = x_cm * CM_TO_M
+    z = z_cm * CM_TO_M
+    d_bx_dz = np.gradient(bx, z, axis=2)
+    d_bz_dx = np.gradient(bz, x, axis=1)
+    return (d_bx_dz - d_bz_dx) / MU0
+
+
+def compute_physical_jy_from_normalized(
+    field_normalized: np.ndarray,
+    mean: torch.Tensor | np.ndarray | Sequence[float],
+    std: torch.Tensor | np.ndarray | Sequence[float],
+    extent: Sequence[float],
+) -> np.ndarray:
+    """Denormalize checkpoint-standardized Bx/Bz to Tesla, then SI Jy."""
+    return compute_jy(denormalize_field_np(field_normalized, mean, std), extent)
+
+
+def jy_nrmse_from_residual(jy_residual: np.ndarray, jy_std_train: float) -> np.ndarray:
+    """Framewise Jy NRMSE: residual RMS divided by training-set Jy std."""
+    scale = float(jy_std_train)
+    if scale <= 0.0:
+        raise ValueError(f"jy_std_train must be positive, got {scale}.")
+    residual = np.asarray(jy_residual, dtype=np.float64)
+    return np.sqrt(np.mean(np.square(residual), axis=(1, 2))) / scale
+
+
+def _channel_stat_vectors(
+    mean: torch.Tensor | np.ndarray | Sequence[float],
+    std: torch.Tensor | np.ndarray | Sequence[float],
+) -> Tuple[np.ndarray, np.ndarray]:
+    if torch.is_tensor(mean):
+        mean_np = mean.detach().cpu().numpy()
+    else:
+        mean_np = np.asarray(mean)
+    if torch.is_tensor(std):
+        std_np = std.detach().cpu().numpy()
+    else:
+        std_np = np.asarray(std)
+    return (
+        np.asarray(mean_np, dtype=np.float64).reshape(-1)[:4],
+        np.asarray(std_np, dtype=np.float64).reshape(-1)[:4],
+    )
+
+
+def normalize_field_np(
+    field: np.ndarray,
+    mean: torch.Tensor | np.ndarray | Sequence[float],
+    std: torch.Tensor | np.ndarray | Sequence[float],
+) -> np.ndarray:
+    """Apply the same channel mean/std used by visualization preprocessing."""
+    mean_np, std_np = _channel_stat_vectors(mean, std)
+    field_np = np.asarray(field, dtype=np.float64)
+    return (field_np - mean_np[:, None, None, None]) / (std_np[:, None, None, None] + 1e-8)
+
+
+def denormalize_field_np(
+    field: np.ndarray,
+    mean: torch.Tensor | np.ndarray | Sequence[float],
+    std: torch.Tensor | np.ndarray | Sequence[float],
+) -> np.ndarray:
+    """Invert checkpoint channel standardization back to HDF5 stored B/Density."""
+    mean_np, std_np = _channel_stat_vectors(mean, std)
+    field_np = np.asarray(field, dtype=np.float64)
+    return field_np * (std_np[:, None, None, None] + 1e-8) + mean_np[:, None, None, None]
+
+
+def jy_metric_metadata(
+    jy_stats: Dict | None = None,
+    checkpoint_path: Path | str | None = None,
+    checkpoint_epoch: int | None = None,
+) -> Dict:
+    """Provenance for physical-unit Jy metrics and training-set statistics."""
+    meta = {
+        "jy_definition": JY_STATS_DEFINITION,
+        "jy_preprocessing": JY_STATS_PREPROCESSING,
+        "preprocessing": JY_STATS_PREPROCESSING,
+        "B_unit": JY_B_UNIT,
+        "jy_b_units": JY_B_UNITS,
+        "source_coordinate_unit": JY_SOURCE_COORDINATE_UNIT,
+        "derivative_coordinate_unit": JY_DERIVATIVE_COORDINATE_UNIT,
+        "jy_coordinate_units": JY_COORDINATE_UNITS,
+        "jy_coordinate_source": JY_COORDINATE_SOURCE,
+        "jy_includes_mu0": JY_INCLUDES_MU0,
+        "jy_unit": JY_UNIT,
+        "jy_physical_units": JY_PHYSICAL_UNITS,
+        "jy_stats_cache_version": JY_STATS_CACHE_VERSION,
+        "jy_nrmse_definition": JY_NRMSE_DEFINITION,
+        "mu0": MU0,
+    }
+    if jy_stats is not None:
+        for key in ("jy_mean_train", "jy_std_train", "jy_rms_train", "count", "n_runs"):
+            if key in jy_stats:
+                meta[key] = jy_stats[key]
+        if checkpoint_path is None and jy_stats.get("source_checkpoint_path"):
+            checkpoint_path = jy_stats["source_checkpoint_path"]
+        elif checkpoint_path is None and jy_stats.get("source_checkpoint"):
+            checkpoint_path = jy_stats["source_checkpoint"]
+        if checkpoint_epoch is None and jy_stats.get("source_checkpoint_epoch") is not None:
+            checkpoint_epoch = jy_stats["source_checkpoint_epoch"]
+    if checkpoint_path is not None:
+        ckpt = Path(checkpoint_path)
+        meta["source_checkpoint"] = ckpt.name
+        meta["source_checkpoint_path"] = str(checkpoint_path)
+    if checkpoint_epoch is not None:
+        meta["source_checkpoint_epoch"] = int(checkpoint_epoch)
+    return meta
+
+
+def summarize_jy_values(jy: np.ndarray) -> Dict[str, float]:
+    flat = np.asarray(jy, dtype=np.float64).ravel()
+    if flat.size == 0:
+        raise ValueError("Cannot summarize an empty Jy array.")
+    mean = float(np.mean(flat))
+    # Population std, matching estimate_channel_stats.
+    std = float(np.sqrt(max(float(np.mean(np.square(flat))) - mean * mean, 0.0)))
+    rms = float(np.sqrt(np.mean(np.square(flat))))
+    return {
+        "jy_mean_train": mean,
+        "jy_std_train": std,
+        "jy_rms_train": rms,
+        "count": int(flat.size),
+    }
+
+
+def iter_unique_run_fields(
+    dataset: VPICWindowDataset,
+    run_names: set[str],
+):
+    """Yield each requested run's full (C, T, X, Z) field once."""
+    seen: Dict[str, int] = {}
+    for file_idx, run_name, _t0 in dataset.samples:
+        if run_name in run_names and run_name not in seen:
+            seen[run_name] = int(file_idx)
+    missing = sorted(run_names - set(seen))
+    if missing:
+        preview = ", ".join(missing[:5])
+        extra = "" if len(missing) <= 5 else f" (+{len(missing) - 5} more)"
+        raise RuntimeError(
+            "Training Jy stats requested runs that are absent from the dataset: "
+            f"{preview}{extra}"
+        )
+    for run_name, file_idx in seen.items():
+        handle = dataset._get_file(file_idx)
+        fields = np.asarray(handle["runs"][run_name]["fields"], dtype=np.float32)
+        yield run_name, np.transpose(fields, (1, 0, 2, 3))
+
+
+def compute_jy_training_stats(
+    dataset: VPICWindowDataset,
+    train_runs: set[str],
+    mean: torch.Tensor | np.ndarray | Sequence[float],
+    std: torch.Tensor | np.ndarray | Sequence[float],
+    extent: Sequence[float],
+    checkpoint_path: Path | str | None = None,
+    checkpoint_epoch: int | None = None,
+) -> Dict:
+    """Jy mean/std/rms on training-run HDF5 Bx/Bz treated as Tesla."""
+    if not train_runs:
+        raise ValueError("Cannot compute Jy training stats without training runs.")
+
+    sum_j = 0.0
+    sumsq_j = 0.0
+    count = 0
+    n_runs = 0
+    for _run_name, field in iter_unique_run_fields(dataset, train_runs):
+        jy = compute_jy(field, extent)
+        sum_j += float(jy.sum())
+        sumsq_j += float(np.square(jy).sum())
+        count += int(jy.size)
+        n_runs += 1
+        if n_runs == 1 or n_runs % 10 == 0 or n_runs == len(train_runs):
+            print(f"Jy training stats: {n_runs}/{len(train_runs)} runs")
+
+    if count == 0:
+        raise RuntimeError("Jy training stats collected no voxels.")
+
+    jy_mean = sum_j / count
+    jy_var = max(sumsq_j / count - jy_mean * jy_mean, 0.0)
+    mean_np, std_np = _channel_stat_vectors(mean, std)
+    stats = {
+        "jy_mean_train": float(jy_mean),
+        "jy_std_train": float(np.sqrt(jy_var)),
+        "jy_rms_train": float(np.sqrt(sumsq_j / count)),
+        "count": int(count),
+        "n_runs": int(n_runs),
+        "train_runs": sorted(train_runs),
+        "extent": [float(v) for v in extent],
+        "channel_mean": mean_np.tolist(),
+        "channel_std": std_np.tolist(),
+        "source": "training_runs",
+    }
+    stats.update(
+        jy_metric_metadata(
+            checkpoint_path=checkpoint_path,
+            checkpoint_epoch=checkpoint_epoch,
+        )
+    )
+    return stats
+
+
+def jy_stats_cache_matches(
+    cached: Dict,
+    train_runs: set[str],
+    mean: torch.Tensor | np.ndarray | Sequence[float],
+    std: torch.Tensor | np.ndarray | Sequence[float],
+    extent: Sequence[float],
+) -> bool:
+    if set(cached.get("train_runs", [])) != set(train_runs):
+        return False
+    if str(cached.get("jy_definition", "")) != JY_STATS_DEFINITION:
+        return False
+    recorded_preprocessing = str(
+        cached.get("jy_preprocessing", cached.get("preprocessing", ""))
+    )
+    if recorded_preprocessing != JY_STATS_PREPROCESSING:
+        return False
+    if int(cached.get("jy_stats_cache_version", -1)) != JY_STATS_CACHE_VERSION:
+        return False
+    if "jy_includes_mu0" not in cached:
+        return False
+    if bool(cached.get("jy_includes_mu0")) != JY_INCLUDES_MU0:
+        return False
+    if str(cached.get("B_unit", cached.get("jy_b_units", ""))) != JY_B_UNIT:
+        return False
+    if str(cached.get("jy_unit", cached.get("jy_physical_units", ""))) != JY_UNIT:
+        return False
+    if str(cached.get("source_coordinate_unit", "")) != JY_SOURCE_COORDINATE_UNIT:
+        return False
+    if str(cached.get("derivative_coordinate_unit", "")) != JY_DERIVATIVE_COORDINATE_UNIT:
+        return False
+    mean_np, std_np = _channel_stat_vectors(mean, std)
+    try:
+        return bool(
+            np.allclose(cached.get("extent", []), extent)
+            and np.allclose(cached.get("channel_mean", []), mean_np)
+            and np.allclose(cached.get("channel_std", []), std_np)
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def load_or_compute_jy_training_stats(
+    run_dir: Path,
+    dataset: VPICWindowDataset,
+    train_runs: set[str],
+    mean: torch.Tensor | np.ndarray | Sequence[float],
+    std: torch.Tensor | np.ndarray | Sequence[float],
+    extent: Sequence[float],
+    checkpoint_path: Path | str | None = None,
+    checkpoint_epoch: int | None = None,
+) -> Dict:
+    """Reuse run-dir/jy_stats.json when the physical-unit definition still matches."""
+    cache_path = package_file(Path(run_dir), JY_STATS_FILENAME)
+    if cache_path.exists():
+        cached = json.loads(cache_path.read_text())
+        if jy_stats_cache_matches(cached, train_runs, mean, std, extent):
+            print(f"Loaded cached Jy training stats from {cache_path}")
+            print(
+                "Jy training stats: "
+                f"mean={cached['jy_mean_train']:.6g}, "
+                f"std={cached['jy_std_train']:.6g}, "
+                f"rms={cached['jy_rms_train']:.6g}"
+            )
+            return cached
+        print(
+            f"Cached Jy stats at {cache_path} do not match the current "
+            "physical-unit Jy definition / training split / extent / channel "
+            "stats; recomputing."
+        )
+
+    stats = compute_jy_training_stats(
+        dataset=dataset,
+        train_runs=train_runs,
+        mean=mean,
+        std=std,
+        extent=extent,
+        checkpoint_path=checkpoint_path,
+        checkpoint_epoch=checkpoint_epoch,
+    )
+    cache_path.write_text(json.dumps(stats, indent=2))
+    print(f"Saved Jy training stats: {cache_path}")
+    print(
+        "Jy training stats: "
+        f"mean={stats['jy_mean_train']:.6g}, "
+        f"std={stats['jy_std_train']:.6g}, "
+        f"rms={stats['jy_rms_train']:.6g}"
+    )
+    return stats
+
+
+def select_validation_statistics_indices(
+    dataset: VPICWindowDataset,
+    val_runs: set[str],
+    window_stride: int,
+    max_windows_per_run: int | None,
+) -> List[int]:
+    """Select deterministic validation windows, optionally capped per run."""
+    if window_stride < 1:
+        raise ValueError("statistics window stride must be positive.")
+    grouped: Dict[str, List[Tuple[int, int]]] = {}
+    for index, (_file_index, run_name, t0) in enumerate(dataset.samples):
+        if run_name in val_runs:
+            grouped.setdefault(run_name, []).append((int(t0), index))
+    missing = sorted(val_runs - set(grouped))
+    if missing:
+        raise RuntimeError(
+            "Validation runs have no complete context window: " + ", ".join(missing)
+        )
+    if max_windows_per_run is not None and max_windows_per_run < 1:
+        raise ValueError("--statistics-max-windows-per-run must be positive.")
+
+    selected = []
+    for run_name in sorted(grouped):
+        t0_to_index = dict(grouped[run_name])
+        first_t0 = min(t0_to_index)
+        final_t0 = max(t0_to_index)
+        starts = list(range(first_t0, final_t0 + 1, window_stride))
+        if starts[-1] != final_t0:
+            starts.append(final_t0)
+        indices = [t0_to_index[t0] for t0 in starts]
+        if max_windows_per_run is not None and len(indices) > max_windows_per_run:
+            positions = np.linspace(
+                0, len(indices) - 1, max_windows_per_run
+            ).round().astype(int)
+            indices = [indices[position] for position in positions]
+        selected.extend(indices)
+    return selected
+
+
+def aggregate_run_window_profiles(
+    profiles_by_run: Dict[str, List[np.ndarray]],
+) -> Dict:
+    """Give every run equal weight after median-combining its windows."""
+    if not profiles_by_run:
+        raise ValueError("Cannot aggregate an empty set of validation profiles.")
+    run_names = sorted(profiles_by_run)
+    run_profiles = []
+    window_counts = {}
+    for run_name in run_names:
+        windows = np.stack(profiles_by_run[run_name], axis=0)
+        run_profiles.append(np.median(windows, axis=0))
+        window_counts[run_name] = int(windows.shape[0])
+    values = np.stack(run_profiles, axis=0)
+    return {
+        "run_names": run_names,
+        "window_counts": window_counts,
+        "run_profiles": values,
+        "median": np.median(values, axis=0),
+        "p16": np.percentile(values, 16.0, axis=0),
+        "p84": np.percentile(values, 84.0, axis=0),
+    }
+
+
+def validation_statistics_legend_label(
+    experiment_name: str,
+    row: Dict,
+    context_length: int,
+) -> str:
+    """Return a compact legend label for an aggregate validation curve."""
+    name = str(row["name"])
+    if experiment_name == "density_forecast":
+        history = int(name.rsplit("_", 1)[1])
+        return f"history={history}, horizon={context_length - history}"
+    if experiment_name == "density_superres":
+        probes = int(name.rsplit("_", 1)[1])
+        return f"Density probes={probes}"
+    if experiment_name == "magnetic_ablation":
+        visible_fraction = float(name.rsplit("_", 1)[1])
+        return format_magnetic_visible_percent(visible_fraction)
+    if experiment_name == "multifunction":
+        return name.replace("_", " ")
+    return name.replace("_", " ")
+
+
+def save_validation_statistics_plot(
+    experiment_name: str,
+    row_statistics: List[Dict],
+    context_length: int,
+    total_windows: int,
+    out_path: Path,
+) -> Dict:
+    """Plot cross-run median curves and same-color 16th-84th percentile bands."""
+    local_frames = np.arange(context_length)
+    fig, axes = plt.subplots(2, 1, figsize=(10.5, 7.0), sharex=True)
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    payload_rows = []
+    for row_index, row in enumerate(row_statistics):
+        color = colors[row_index % len(colors)]
+        label = validation_statistics_legend_label(
+            experiment_name,
+            row,
+            context_length,
+        )
+        for axis, metric_name in zip(axes, ("density", "jy")):
+            stats = row[metric_name]
+            axis.plot(
+                local_frames,
+                stats["median"],
+                color=color,
+                linewidth=2.4,
+                label=label,
+            )
+            axis.fill_between(
+                local_frames,
+                stats["p16"],
+                stats["p84"],
+                color=color,
+                alpha=0.14,
+                linewidth=0,
+            )
+        payload_rows.append(
+            {
+                "row": row_index + 1,
+                "name": row["name"],
+                "label": row["label"],
+                "legend_label": label,
+                "density_nrmse": {
+                    key: row["density"][key].tolist()
+                    for key in ("median", "p16", "p84")
+                },
+                "jy_nrmse": {
+                    key: row["jy"][key].tolist()
+                    for key in ("median", "p16", "p84")
+                },
+                "per_run": {
+                    run_name: {
+                        "density_nrmse": row["density"]["run_profiles"][run_index].tolist(),
+                        "jy_nrmse": row["jy"]["run_profiles"][run_index].tolist(),
+                    }
+                    for run_index, run_name in enumerate(row["density"]["run_names"])
+                },
+            }
+        )
+    axes[0].set_ylabel("Density frame NRMSE")
+    axes[1].set_ylabel(JY_NRMSE_YLABEL)
+    axes[1].set_xlabel(f"Local frame in {context_length}-frame context window")
+    yscales = {"density": "linear", "jy": "linear"}
+    if experiment_name == "magnetic_ablation":
+        yscales["density"] = apply_log_yscale_if_strictly_positive(
+            axes[0],
+            np.concatenate(
+                [
+                    row["density"][key]
+                    for row in row_statistics
+                    for key in ("median", "p16", "p84")
+                ]
+            ),
+            "magnetic_ablation validation Density NRMSE",
+        )
+        yscales["jy"] = apply_log_yscale_if_strictly_positive(
+            axes[1],
+            np.concatenate(
+                [
+                    row["jy"][key]
+                    for row in row_statistics
+                    for key in ("median", "p16", "p84")
+                ]
+            ),
+            "magnetic_ablation validation Jy NRMSE",
+        )
+    for axis in axes:
+        axis.grid(alpha=0.25)
+    run_count = len(row_statistics[0]["density"]["run_names"])
+    fig.suptitle(
+        f"{experiment_name}: validation-run median and 16th-84th percentile\n"
+        f"{run_count} runs, {total_windows} windows; windows median-combined per run",
+        y=0.98,
+    )
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.935),
+        ncol=min(4, len(labels)),
+        fontsize=8,
+        frameon=False,
+    )
+    fig.subplots_adjust(
+        left=0.10,
+        right=0.985,
+        bottom=0.09,
+        top=0.84,
+        hspace=0.12,
+    )
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+    print(f"Saved validation statistics plot: {out_path}")
+    payload_out = {
+        "experiment": experiment_name,
+        "local_frames": local_frames.tolist(),
+        "context_length": context_length,
+        "run_count": run_count,
+        "window_count": total_windows,
+        "density_nrmse_yscale": yscales["density"],
+        "jy_nrmse_yscale": yscales["jy"],
+        "jy_nrmse_ylabel": JY_NRMSE_YLABEL,
+        "jy_nrmse_definition": JY_NRMSE_DEFINITION,
+        "aggregation_policy": (
+            "median across windows within each run, then cross-run median and "
+            "16th-84th percentiles"
+        ),
+        "mask_policy": "reuse the corresponding canonical GIF row mask for every window",
+        "window_counts_by_run": row_statistics[0]["density"]["window_counts"],
+        "rows": payload_rows,
+    }
+    payload_out.update(jy_metric_metadata())
+    return payload_out
+
+
+@torch.no_grad()
+def collect_validation_statistics(
+    model: torch.nn.Module,
+    dataset: VPICWindowDataset,
+    sample_indices: Sequence[int],
+    args: argparse.Namespace,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    device: torch.device,
+    canonical_rows: Dict[str, List[Dict]],
+    jy_std_train: float = 1.0,
+) -> Dict[str, List[Dict]]:
+    """Evaluate all selected validation windows and aggregate by independent run."""
+    collected: Dict[str, List[Dict]] = {
+        experiment_name: [
+            {
+                "name": row["name"],
+                "label": row["label"],
+                "density_by_run": {},
+                "jy_by_run": {},
+            }
+            for row in rows
+        ]
+        for experiment_name, rows in canonical_rows.items()
+    }
+
+    for sample_number, dataset_index in enumerate(sample_indices, start=1):
+        sample = dataset[dataset_index]
+        target = sample["block"].unsqueeze(0).to(device)
+        target_normalized = normalize(target, mean, std)
+        target_np = target_normalized[0].detach().cpu().numpy()
+        target_physical = target[0].detach().cpu().numpy()
+        target_jy = compute_jy(target_physical, args.extent)
+        run_name = sample["metadata"]["run_name"]
+        for experiment_name, canonical_experiment_rows in canonical_rows.items():
+            masks = torch.stack(
+                [
+                    torch.as_tensor(
+                        row["mask"],
+                        device=device,
+                        dtype=target_normalized.dtype,
+                    )
+                    for row in canonical_experiment_rows
+                ],
+                dim=0,
+            )
+            if masks.shape[1:] != target_normalized.shape[1:]:
+                raise ValueError(
+                    f"Validation window shape {tuple(target_normalized.shape[1:])} "
+                    f"does not match canonical masks {tuple(masks.shape[1:])}."
+                )
+            targets = target_normalized.expand(
+                len(canonical_experiment_rows), -1, -1, -1, -1
+            )
+            model_input = torch.cat([targets * masks, masks], dim=1)
+            predictions = model(model_input).float().detach().cpu().numpy()
+            for row_index, canonical_row in enumerate(canonical_experiment_rows):
+                row = collected[experiment_name][row_index]
+                if canonical_row["name"] != row["name"]:
+                    raise RuntimeError("Canonical row order changed during statistics.")
+                density_residual = predictions[row_index, 3] - target_np[3]
+                density_nrmse = np.sqrt(
+                    np.mean(np.square(density_residual), axis=(1, 2))
+                )
+                prediction_jy = compute_physical_jy_from_normalized(
+                    predictions[row_index], mean, std, args.extent
+                )
+                jy_nrmse = jy_nrmse_from_residual(
+                    prediction_jy - target_jy, jy_std_train
+                )
+                row["density_by_run"].setdefault(run_name, []).append(density_nrmse)
+                row["jy_by_run"].setdefault(run_name, []).append(jy_nrmse)
+        if sample_number == 1 or sample_number % 10 == 0 or sample_number == len(sample_indices):
+            print(
+                f"Validation statistics: {sample_number}/{len(sample_indices)} windows"
+            )
+
+    aggregated = {}
+    for experiment_name, rows in collected.items():
+        aggregated[experiment_name] = []
+        for row in rows:
+            aggregated[experiment_name].append(
+                {
+                    "name": row["name"],
+                    "label": row["label"],
+                    "density": aggregate_run_window_profiles(row["density_by_run"]),
+                    "jy": aggregate_run_window_profiles(row["jy_by_run"]),
+                }
+            )
+    return aggregated
+
+
+def add_ay_contours(
+    ax,
+    ay: np.ndarray,
+    extent: Sequence[float],
+    levels: int,
+    color: str,
+) -> None:
+    """Overlay Ay contours, skipping degenerate fields cleanly."""
+    if levels <= 0 or not np.isfinite(ay).any():
+        return
+    amin = float(np.nanmin(ay))
+    amax = float(np.nanmax(ay))
+    if np.isclose(amin, amax):
+        return
+
+    x, z = physical_coordinates(ay.shape, extent)
+    zz, xx = np.meshgrid(z, x)
+    ax.contour(zz, xx, ay, levels=levels, colors=color, linewidths=0.6)
+
+
+def add_inplane_quiver(
+    ax,
+    bx: np.ndarray,
+    bz: np.ndarray,
+    extent: Sequence[float],
+    step: int,
+    scale: float,
+    visible_mask: np.ndarray | None = None,
+    color: str = "black",
+) -> None:
+    """Overlay (Bz, Bx) arrows, optionally only where both fields are visible."""
+    step = max(1, int(step))
+    x, z = physical_coordinates(bx.shape, extent)
+
+    if visible_mask is None:
+        zz, xx = np.meshgrid(z[::step], x[::step])
+        u = np.asarray(bz[::step, ::step])
+        v = np.asarray(bx[::step, ::step])
+    else:
+        # Pick at most one actually visible probe from each step x step block.
+        # Sampling a fixed [::step, ::step] lattice can miss an offset probe
+        # grid completely, which would incorrectly show no observed arrows.
+        visible = np.asarray(visible_mask) > 0.5
+        selected_x = []
+        selected_z = []
+
+        for x0 in range(0, visible.shape[0], step):
+            for z0 in range(0, visible.shape[1], step):
+                block = visible[
+                    x0 : min(x0 + step, visible.shape[0]),
+                    z0 : min(z0 + step, visible.shape[1]),
+                ]
+                candidates = np.argwhere(block)
+                if candidates.size == 0:
+                    continue
+
+                center = np.array([(block.shape[0] - 1) / 2, (block.shape[1] - 1) / 2])
+                local_ix, local_iz = candidates[
+                    np.argmin(np.sum((candidates - center) ** 2, axis=1))
+                ]
+                selected_x.append(x0 + int(local_ix))
+                selected_z.append(z0 + int(local_iz))
+
+        if not selected_x:
+            return
+
+        selected_x = np.asarray(selected_x, dtype=np.int64)
+        selected_z = np.asarray(selected_z, dtype=np.int64)
+        xx = x[selected_x]
+        zz = z[selected_z]
+        u = np.asarray(bz[selected_x, selected_z])
+        v = np.asarray(bx[selected_x, selected_z])
+
+    ax.quiver(
+        zz,
+        xx,
+        u,
+        v,
+        color=color,
+        scale=scale,
+        width=0.002,
+    )
+
+
+def _make_comparison_axes(n_rows: int):
+    """Create Target | Visible/mask | Prediction | Residual comparison axes."""
+    # Keep a nearly fixed title band in inches so extra rows do not open a
+    # growing gap between the suptitle and the first row of panels.
+    title_inches = 0.70
+    bottom_inches = 0.52
+    fig_h = 4.55 * n_rows + title_inches + bottom_inches
+    fig = plt.figure(
+        figsize=(13.0, fig_h),
+        constrained_layout=False,
+    )
+    gs = gridspec.GridSpec(
+        nrows=n_rows,
+        ncols=6,
+        figure=fig,
+        width_ratios=[1.0, 1.0, 1.0, 0.035, 1.0, 0.035],
+        wspace=0.055,
+        hspace=0.075,
+        left=0.16,
+        right=0.965,
+        bottom=bottom_inches / fig_h,
+        top=1.0 - title_inches / fig_h - 0.03,
+    )
+
+    axes = np.empty((n_rows, 4), dtype=object)
+    base_ax = None
+    for r in range(n_rows):
+        for c, gcol in enumerate([0, 1, 2, 4]):
+            if base_ax is None:
+                ax = fig.add_subplot(gs[r, gcol])
+                base_ax = ax
+            else:
+                ax = fig.add_subplot(gs[r, gcol], sharex=base_ax, sharey=base_ax)
+            axes[r, c] = ax
+
+    return fig, axes, fig.add_subplot(gs[:, 3]), fig.add_subplot(gs[:, 5])
+
+
+def _style_comparison_axis(ax, row: int, col: int, n_rows: int) -> None:
+    if row < n_rows - 1:
+        ax.tick_params(labelbottom=False)
+    if col > 0:
+        ax.tick_params(labelleft=False)
+    ax.tick_params(axis="both", which="both", labelsize=8, length=2.5)
+
+
+def _figure_context(metadata: Dict, local_time: int) -> str:
+    t0 = metadata.get("t0", "unknown")
+    global_frame = int(t0) + int(local_time)
+    return (
+        f"{metadata.get('run_name', 'unknown')}, block t0={t0}, "
+        f"local t={local_time}, global frame={global_frame}, "
+        f"beta={metadata.get('beta', 'unknown')}, "
+        f"nu={metadata.get('nu', 'unknown')}, "
+        f"Bz0={metadata.get('Bz0', 'unknown')}, "
+        f"tau={metadata.get('tau', 'unknown')}"
+    )
+
+
+def write_animation(
+    frame_paths: Sequence[Path],
+    out_path: Path,
+    fps: float,
+) -> None:
+    """Encode already-rendered PNG frames without repeating model inference."""
+    if not frame_paths:
+        raise ValueError("Cannot create an animation without frames.")
+    if fps <= 0:
+        raise ValueError(f"--fps must be positive, got {fps}")
+
+    suffix = out_path.suffix.lower()
+    if suffix in {".mp4", ".mov"}:
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            raise RuntimeError(
+                "MP4/QuickTime output requires ffmpeg on PATH. Use "
+                "`--animation-format gif` when ffmpeg is unavailable."
+            )
+
+        encoder_listing = subprocess.run(
+            [ffmpeg, "-hide_banner", "-encoders"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        if suffix == ".mov":
+            if "mjpeg" not in encoder_listing:
+                raise RuntimeError(
+                    "QuickTime output requires ffmpeg's Motion-JPEG encoder, "
+                    "but it is not enabled on this system."
+                )
+            codec_args = ["-c:v", "mjpeg", "-q:v", "2"]
+            pixel_format = "yuvj420p"
+        elif "libx264" in encoder_listing:
+            codec_args = ["-c:v", "libx264", "-crf", "20"]
+            pixel_format = "yuv420p"
+        elif "libvpx-vp9" in encoder_listing:
+            codec_args = ["-c:v", "libvpx-vp9", "-crf", "30", "-b:v", "0"]
+            pixel_format = "yuv420p"
+        else:
+            raise RuntimeError(
+                "ffmpeg is available, but neither libx264 nor libvpx-vp9 is enabled. "
+                "Use `--animation-format gif` on this system."
+            )
+
+        # Use sequential links so ffmpeg receives an unambiguous frame order,
+        # independent of the long descriptive PNG filenames.
+        with tempfile.TemporaryDirectory(
+            prefix=".animation-frames-",
+            dir=out_path.parent,
+        ) as temp_dir:
+            temp_dir_path = Path(temp_dir)
+            for i, frame_path in enumerate(frame_paths):
+                os.symlink(
+                    frame_path.resolve(),
+                    temp_dir_path / f"frame_{i:03d}.png",
+                )
+
+            command = [
+                ffmpeg,
+                "-y",
+                "-loglevel",
+                "error",
+                "-framerate",
+                str(fps),
+                "-i",
+                str(temp_dir_path / "frame_%03d.png"),
+            ]
+            command.extend(codec_args)
+            command.extend(
+                [
+                    "-pix_fmt",
+                    pixel_format,
+                    "-vf",
+                    "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                    "-movflags",
+                    "+faststart",
+                    str(out_path),
+                ]
+            )
+            subprocess.run(
+                command,
+                check=True,
+            )
+    elif suffix == ".gif":
+        try:
+            from PIL import Image
+        except ImportError as exc:
+            raise RuntimeError(
+                "GIF output requires Pillow. Install it with `pip install pillow`, "
+                "or use `--animation-format mp4`."
+            ) from exc
+
+        frames = []
+        for frame_path in frame_paths:
+            with Image.open(frame_path) as image:
+                frames.append(
+                    image.convert("RGB").convert("P", palette=Image.ADAPTIVE)
+                )
+
+        frames[0].save(
+            out_path,
+            save_all=True,
+            append_images=frames[1:],
+            duration=max(1, int(round(1000.0 / fps))),
+            loop=0,
+            optimize=False,
+            disposal=2,
+        )
+    else:
+        raise ValueError(f"Unsupported animation extension: {out_path.suffix}")
+
+    print(f"Saved animation: {out_path}")
+
+
+def combine_table_images(
+    magnetic_path: Path,
+    density_path: Path,
+    out_path: Path,
+    gap_pixels: int = 16,
+) -> None:
+    """Place the magnetic/Jy table left and the Density table right."""
+    from PIL import Image
+
+    with Image.open(magnetic_path) as magnetic_image, Image.open(density_path) as density_image:
+        magnetic_rgb = magnetic_image.convert("RGB")
+        density_rgb = density_image.convert("RGB")
+        height = max(magnetic_rgb.height, density_rgb.height)
+        canvas = Image.new(
+            "RGB",
+            (magnetic_rgb.width + gap_pixels + density_rgb.width, height),
+            color="white",
+        )
+        canvas.paste(magnetic_rgb, (0, 0))
+        canvas.paste(density_rgb, (magnetic_rgb.width + gap_pixels, 0))
+        canvas.save(out_path)
+    print(f"Saved combined 1x2 frame: {out_path}")
+
+
+def plot_jy_ay_by_mask_patterns(
+    target_ay: np.ndarray,
+    target_jy: np.ndarray,
+    target_jy_physical: np.ndarray,
+    target_field: np.ndarray,
+    rows: List[Dict],
+    metadata: Dict,
+    local_time: int,
+    out_path: Path,
+    extent: Sequence[float],
+    plot_units: str,
+    ay_levels: int,
+    field_q: float,
+    residual_q: float,
+    residual_vmax: float | None,
+    quiver_step: int,
+    quiver_scale: float,
+    dpi: int,
+    limit_times: Sequence[int] | None = None,
+    jy_std_train: float = 1.0,
+) -> None:
+    """
+    Plot Jy with Ay contours for complete target/prediction fields.
+
+    The masked-input column shows target Jy only where all three B channels are
+    observed. Jy is computed from the complete target first and then masked; it
+    is never differentiated from incomplete B observations.
+    """
+    n_rows = len(rows)
+    fig, axes, cax_field, cax_residual = _make_comparison_axes(n_rows)
+
+    target = target_jy[local_time]
+    pred_arrays = [row["pred_jy"][local_time] for row in rows]
+    color_times = [local_time] if limit_times is None else list(limit_times)
+    all_target_jy = [target_jy[t] for t in color_times]
+    all_pred_jy = [row["pred_jy"][t] for row in rows for t in color_times]
+    residual_arrays = [
+        normalized_residual(
+            row["pred_jy_physical"][local_time],
+            target_jy_physical[local_time],
+        )
+        for row in rows
+    ]
+    all_residual_jy = [
+        normalized_residual(
+            row["pred_jy_physical"][t], target_jy_physical[t]
+        )
+        for row in rows
+        for t in color_times
+    ]
+    jy_vmin, jy_vmax = robust_limits(
+        all_target_jy + all_pred_jy,
+        channel=0,
+        q=field_q,
+        symmetric=True,
+    )
+    if residual_vmax is None:
+        res_vmin, res_vmax = robust_limits(
+            all_residual_jy,
+            channel=0,
+            q=residual_q,
+            symmetric=True,
+        )
+    else:
+        res_vmin, res_vmax = -float(residual_vmax), float(residual_vmax)
+
+    jy_cmap = make_nan_cmap("seismic", bad_color="black")
+    residual_cmap = make_nan_cmap(RESIDUAL_CMAP)
+    field_im = None
+    residual_im = None
+
+    for r, row in enumerate(rows):
+        pred = pred_arrays[r]
+        residual = residual_arrays[r]
+        joint_b_mask = np.minimum.reduce(
+            [
+                row["mask"][0, local_time],
+                row["mask"][1, local_time],
+                row["mask"][2, local_time],
+            ]
+        )
+        visible_jy = target.copy()
+        visible_jy[joint_b_mask < 0.5] = np.nan
+        visible_pct = 100.0 * float(np.mean(joint_b_mask))
+        nrmse, nmae = compute_normalized_metrics(residual, scale=jy_std_train)
+        row_label = (
+            f"{row['label']}\n"
+            f"joint B visible={visible_pct:.2f}%\n"
+            f"Jy NRMSE={nrmse:.3g}\n"
+            f"Jy NMAE={nmae:.3g}"
+        )
+
+        field_im = axes[r, 0].imshow(
+            target,
+            origin="lower",
+            aspect="auto",
+            extent=extent,
+            cmap=jy_cmap,
+            vmin=jy_vmin,
+            vmax=jy_vmax,
+            interpolation="nearest",
+        )
+        add_ay_contours(
+            axes[r, 0], target_ay[local_time], extent, ay_levels, color="black"
+        )
+
+        axes[r, 1].imshow(
+            visible_jy,
+            origin="lower",
+            aspect="auto",
+            extent=extent,
+            cmap=jy_cmap,
+            vmin=jy_vmin,
+            vmax=jy_vmax,
+            interpolation="nearest",
+        )
+        if visible_pct == 0.0:
+            axes[r, 1].text(
+                0.5,
+                0.5,
+                "Frame hidden",
+                transform=axes[r, 1].transAxes,
+                ha="center",
+                va="center",
+                color="white",
+                fontsize=10,
+            )
+
+        axes[r, 2].imshow(
+            pred,
+            origin="lower",
+            aspect="auto",
+            extent=extent,
+            cmap=jy_cmap,
+            vmin=jy_vmin,
+            vmax=jy_vmax,
+            interpolation="nearest",
+        )
+        add_ay_contours(
+            axes[r, 2], row["pred_ay"][local_time], extent, ay_levels, color="black"
+        )
+
+        residual_im = axes[r, 3].imshow(
+            residual,
+            origin="lower",
+            aspect="auto",
+            extent=extent,
+            cmap=residual_cmap,
+            vmin=res_vmin,
+            vmax=res_vmax,
+            interpolation="nearest",
+        )
+        axes[r, 0].text(
+            -0.33,
+            0.5,
+            row_label,
+            transform=axes[r, 0].transAxes,
+            ha="right",
+            va="center",
+            rotation=90,
+            fontsize=8,
+            linespacing=1.05,
+        )
+
+        for c in range(4):
+            if r == 0:
+                axes[r, c].set_title(
+                    [
+                        "Target Jy + Ay",
+                        "Masked target Jy",
+                        "Prediction Jy + Ay",
+                        "Jy residual (A/m^2)",
+                    ][c],
+                    fontsize=11,
+                    pad=4,
+                )
+            _style_comparison_axis(axes[r, c], r, c, n_rows)
+
+    cb_field = fig.colorbar(field_im, cax=cax_field)
+    cb_field.set_label(
+        f"Jy ({JY_UNIT})" if plot_units == "physical" else f"Jy ({plot_units})",
+        fontsize=9,
+        labelpad=8,
+    )
+    cb_field.ax.tick_params(labelsize=8, length=2.5)
+    cb_res = fig.colorbar(residual_im, cax=cax_residual)
+    cb_res.set_label(
+        f"Prediction − target ({JY_PHYSICAL_UNITS})",
+        fontsize=9,
+        labelpad=8,
+    )
+    cb_res.ax.tick_params(labelsize=8, length=2.5)
+
+    fig.text(0.545, 0.032, "z [cm]", ha="center", va="center", fontsize=10)
+    fig.text(0.055, 0.50, "x [cm]", ha="center", va="center", rotation=90, fontsize=10)
+    fig.suptitle(
+        f"Current density Jy and magnetic-potential Ay contours ({plot_units} units)\n"
+        + _figure_context(metadata, local_time),
+        fontsize=12,
+        y=0.985,
+    )
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+
+
+def plot_density_magnetic_field_by_mask_patterns(
+    target_field: np.ndarray,
+    target_field_normalized: np.ndarray,
+    target_ay: np.ndarray,
+    rows: List[Dict],
+    metadata: Dict,
+    local_time: int,
+    out_path: Path,
+    extent: Sequence[float],
+    plot_units: str,
+    ay_levels: int,
+    quiver_step: int,
+    quiver_scale: float,
+    field_q: float,
+    residual_q: float,
+    residual_vmax: float | None,
+    dpi: int,
+    limit_times: Sequence[int] | None = None,
+) -> None:
+    """Plot Density with Ay contours and in-plane (Bz, Bx) arrows."""
+    n_rows = len(rows)
+    fig, axes, cax_field, cax_residual = _make_comparison_axes(n_rows)
+
+    target_density = target_field[3, local_time]
+    pred_arrays = [row["pred_plot"][3, local_time] for row in rows]
+    color_times = [local_time] if limit_times is None else list(limit_times)
+    all_target_density = [target_field[3, t] for t in color_times]
+    all_pred_density = [
+        row["pred_plot"][3, t] for row in rows for t in color_times
+    ]
+    residual_arrays = [
+        normalized_residual(
+            row["pred_normalized"][3, local_time],
+            target_field_normalized[3, local_time],
+        )
+        for row in rows
+    ]
+    all_residual_density = [
+        normalized_residual(
+            row["pred_normalized"][3, t],
+            target_field_normalized[3, t],
+        )
+        for row in rows
+        for t in color_times
+    ]
+    density_vmin, density_vmax = robust_limits(
+        all_target_density + all_pred_density,
+        channel=3,
+        q=field_q,
+        symmetric=False,
+    )
+    if residual_vmax is None:
+        res_vmin, res_vmax = robust_limits(
+            all_residual_density,
+            channel=3,
+            q=residual_q,
+            symmetric=True,
+        )
+    else:
+        res_vmin, res_vmax = -float(residual_vmax), float(residual_vmax)
+
+    density_cmap = make_nan_cmap("plasma", bad_color="black")
+    residual_cmap = make_nan_cmap(RESIDUAL_CMAP)
+    field_im = None
+    residual_im = None
+
+    for r, row in enumerate(rows):
+        pred_field = row["pred_plot"]
+        pred_density = pred_arrays[r]
+        residual = residual_arrays[r]
+        density_mask = row["mask"][3, local_time]
+        joint_b_mask = np.minimum.reduce(
+            [
+                row["mask"][0, local_time],
+                row["mask"][1, local_time],
+                row["mask"][2, local_time],
+            ]
+        )
+        visible_pct = 100.0 * float(np.mean(density_mask))
+        nrmse, nmae = compute_normalized_metrics(residual)
+        row_label = (
+            f"{row['label']}\n"
+            f"Density visible={visible_pct:.2f}%\n"
+            f"Density NRMSE={nrmse:.3g}\n"
+            f"Density NMAE={nmae:.3g}"
+        )
+
+        field_im = axes[r, 0].imshow(
+            target_density,
+            origin="lower",
+            aspect="auto",
+            extent=extent,
+            cmap=density_cmap,
+            vmin=density_vmin,
+            vmax=density_vmax,
+            interpolation="nearest",
+        )
+        add_ay_contours(
+            axes[r, 0], target_ay[local_time], extent, ay_levels, color="white"
+        )
+        add_inplane_quiver(
+            axes[r, 0],
+            target_field[0, local_time],
+            target_field[2, local_time],
+            extent,
+            quiver_step,
+            quiver_scale,
+        )
+
+        axes[r, 1].imshow(
+            row["visible_plot"][3, local_time],
+            origin="lower",
+            aspect="auto",
+            extent=extent,
+            cmap=density_cmap,
+            vmin=density_vmin,
+            vmax=density_vmax,
+            interpolation="nearest",
+        )
+        add_inplane_quiver(
+            axes[r, 1],
+            target_field[0, local_time],
+            target_field[2, local_time],
+            extent,
+            quiver_step,
+            quiver_scale,
+            visible_mask=joint_b_mask,
+            color="cyan",
+        )
+        if visible_pct == 0.0:
+            axes[r, 1].text(
+                0.5,
+                0.5,
+                "Frame hidden",
+                transform=axes[r, 1].transAxes,
+                ha="center",
+                va="center",
+                color="white",
+                fontsize=10,
+            )
+
+        axes[r, 2].imshow(
+            pred_density,
+            origin="lower",
+            aspect="auto",
+            extent=extent,
+            cmap=density_cmap,
+            vmin=density_vmin,
+            vmax=density_vmax,
+            interpolation="nearest",
+        )
+        add_ay_contours(
+            axes[r, 2], row["pred_ay"][local_time], extent, ay_levels, color="white"
+        )
+        add_inplane_quiver(
+            axes[r, 2],
+            pred_field[0, local_time],
+            pred_field[2, local_time],
+            extent,
+            quiver_step,
+            quiver_scale,
+        )
+
+        residual_im = axes[r, 3].imshow(
+            residual,
+            origin="lower",
+            aspect="auto",
+            extent=extent,
+            cmap=residual_cmap,
+            vmin=res_vmin,
+            vmax=res_vmax,
+            interpolation="nearest",
+        )
+
+        axes[r, 0].text(
+            -0.33,
+            0.5,
+            row_label,
+            transform=axes[r, 0].transAxes,
+            ha="right",
+            va="center",
+            rotation=90,
+            fontsize=8,
+            linespacing=1.05,
+        )
+
+        for c in range(4):
+            if r == 0:
+                axes[r, c].set_title(
+                    [
+                        "Target Density + Ay/B",
+                        "Visible Density + visible B",
+                        "Prediction Density + Ay/B",
+                        "Normalized Density residual",
+                    ][c],
+                    fontsize=11,
+                    pad=4,
+                )
+            _style_comparison_axis(axes[r, c], r, c, n_rows)
+
+    cb_field = fig.colorbar(field_im, cax=cax_field)
+    cb_field.set_label(f"Density ({plot_units})", fontsize=9, labelpad=8)
+    cb_field.ax.tick_params(labelsize=8, length=2.5)
+    cb_res = fig.colorbar(residual_im, cax=cax_residual)
+    cb_res.set_label(
+        "Prediction − target (preprocessing std units)",
+        fontsize=9,
+        labelpad=8,
+    )
+    cb_res.ax.tick_params(labelsize=8, length=2.5)
+
+    fig.text(0.545, 0.032, "z [cm]", ha="center", va="center", fontsize=10)
+    fig.text(0.055, 0.50, "x [cm]", ha="center", va="center", rotation=90, fontsize=10)
+    fig.suptitle(
+        f"Density, Ay contours and in-plane magnetic field ({plot_units} units)\n"
+        + _figure_context(metadata, local_time),
+        fontsize=12,
+        y=0.985,
+    )
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+
+
+@torch.no_grad()
+def main():
+    args = parse_args()
+    if args.residual_vmax is not None and args.residual_vmax <= 0:
+        raise ValueError("--residual-vmax must be positive.")
+
+    run_dir = expand_path(args.run_dir)
+    out_dir = (
+        expand_path(args.out_dir)
+        if args.out_dir is not None
+        else run_dir / "figures_mask_patterns"
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    images_dir = out_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    cache_path = out_dir / PLOT_CACHE_FILENAME
+    cache_signature = information_suite_plot_cache_signature(args, run_dir)
+    cached = try_reuse_plot_cache(
+        cache_path, cache_signature, args.reuse_plot_data
+    )
+
+    if cached is not None:
+        selection_stem = cached["selection_stem"]
+        metadata = cached["metadata"]
+        delta_t = int(cached["delta_t"])
+        y_plot_np = cached["y_plot_np"]
+        y_norm_np = cached["y_norm_np"]
+        target_ay = cached["target_ay"]
+        target_jy = cached["target_jy"]
+        target_jy_physical = cached["target_jy_physical"]
+        experiment_rows = cached["experiment_rows"]
+        jy_stats = cached["jy_stats"]
+        jy_std_train = float(cached["jy_std_train"])
+        validation_statistics = cached.get("validation_statistics")
+        statistics_window_stride = cached["statistics_window_stride"]
+        statistics_index_count = cached.get("statistics_index_count")
+        selected_statistics_runs = cached.get("selected_statistics_runs")
+        ckpt_path = Path(cached["ckpt_path"])
+        ckpt_epoch = cached.get("ckpt_epoch")
+        if not (0 <= args.local_time < delta_t):
+            raise ValueError(
+                f"--local-time must be in [0, {delta_t - 1}], got {args.local_time}"
+            )
+        if args.all_times and args.fps <= 0:
+            raise ValueError(f"--fps must be positive, got {args.fps}")
+        print("Redrawing figures from cached arrays")
+        print("delta_t:", delta_t)
+        print("local_time:", args.local_time)
+        print("all_times:", args.all_times)
+        if args.all_times:
+            print("animation_format:", args.animation_format)
+            print("fps:", args.fps)
+        print("plot_units:", args.plot_units)
+    else:
+        device = torch.device(
+            args.device if torch.cuda.is_available() and args.device == "cuda" else "cpu"
+        )
+        print("Device:", device)
+
+        ckpt, ckpt_path = load_checkpoint(run_dir, args.checkpoint, device=device)
+        ckpt_args = ckpt["args"]
+        ckpt_epoch = ckpt.get("epoch")
+        stats = ckpt["stats"]
+
+        h5_dir = args.h5_dir if args.h5_dir is not None else ckpt_args["h5_dir"]
+        h5_dir = expand_path(h5_dir)
+
+        betas = ckpt_args.get("betas", [0.2])
+        delta_t = int(ckpt_args.get("delta_t", ckpt_args.get("delta-t", 8)))
+        stride_t = int(ckpt_args.get("stride_t", ckpt_args.get("stride-t", 2)))
+        base_channels = int(ckpt_args.get("base_channels", ckpt_args.get("base-channels", 16)))
+        # Checkpoints created before the depth option used the original three-level
+        # architecture. Keep that fallback so their figures remain reproducible.
+        channel_mults = ckpt_args.get("channel_mults", [1, 2, 4])
+        if args.density_forecast_visible_frames is None:
+            args.density_forecast_visible_frames = default_density_forecast_visible_frames(
+                delta_t
+            )
+
+        if not (0 <= args.local_time < delta_t):
+            raise ValueError(f"--local-time must be in [0, {delta_t - 1}], got {args.local_time}")
+        if args.all_times and args.fps <= 0:
+            raise ValueError(f"--fps must be positive, got {args.fps}")
+        statistics_window_stride = (
+            delta_t
+            if args.statistics_window_stride is None
+            else int(args.statistics_window_stride)
+        )
+        if statistics_window_stride < 1:
+            raise ValueError("--statistics-window-stride must be positive.")
+        if (
+            args.statistics_max_windows_per_run is not None
+            and args.statistics_max_windows_per_run < 1
+        ):
+            raise ValueError("--statistics-max-windows-per-run must be positive.")
+        print("HDF5 dir:", h5_dir)
+        print("Betas:", betas)
+        print("delta_t:", delta_t)
+        print("stride_t:", stride_t)
+        print("base_channels:", base_channels)
+        print("channel_mults:", channel_mults)
+        print("mask_fraction:", args.mask_fraction)
+        print("block_fraction:", args.block_fraction)
+        print("density_grid_stride:", args.grid_stride)
+        print("magnetic_grid_stride:", args.magnetic_grid_stride)
+        print("mask_patterns:", args.mask_patterns)
+        print("experiment:", args.experiment)
+        print("hide_magnetic:", args.hide_magnetic)
+        if args.sample_index is None:
+            print("sample selector: run_name/t0", args.run_name, args.t0)
+        else:
+            print("sample selector: legacy validation sample_index", args.sample_index)
+        print("density_probe_counts:", args.density_probe_counts)
+        print("magnetic_visible_fractions:", args.magnetic_visible_fractions)
+        print(
+            "density_forecast_visible_frames:",
+            args.density_forecast_visible_frames,
+        )
+        print("local_time:", args.local_time)
+        print("all_times:", args.all_times)
+        if args.all_times:
+            print("animation_format:", args.animation_format)
+            print("fps:", args.fps)
+        print("plot_units:", args.plot_units)
+        print("validation_statistics:", not args.skip_validation_statistics)
+        if not args.skip_validation_statistics:
+            print("statistics_window_stride:", statistics_window_stride)
+            print(
+                "statistics_max_windows_per_run:",
+                args.statistics_max_windows_per_run,
+            )
+
+        dataset = VPICWindowDataset(
+            h5_dir=h5_dir,
+            betas=betas,
+            delta_t=delta_t,
+            stride_t=stride_t,
+            layout="C T X Z",
+            return_metadata=True,
+        )
+
+        val_runs = get_val_runs(run_dir)
+        if not args.skip_validation_statistics and val_runs is None:
+            raise FileNotFoundError(
+                "Cross-run validation statistics require run-dir/split.json. "
+                "Use --skip-validation-statistics only if aggregate plots are not needed."
+            )
+        if args.sample_index is None:
+            dataset_idx = select_run_t0_index(
+                dataset=dataset,
+                val_runs=val_runs,
+                run_name=args.run_name,
+                t0=args.t0,
+            )
+            selection_stem = "named"
+        else:
+            dataset_idx = select_sample_index(dataset, val_runs, args.sample_index)
+            selection_stem = f"sample{args.sample_index:04d}"
+
+        sample = dataset[dataset_idx]
+        y = sample["block"].unsqueeze(0).to(device)  # (1, C, T, X, Z)
+        metadata = sample["metadata"]
+
+        print("Selected dataset index:", dataset_idx)
+        print("Sample metadata:", metadata)
+        print("Block shape:", tuple(y.shape))
+
+        mean = torch.tensor(stats["mean"], dtype=torch.float32, device=device).view(1, 4, 1, 1, 1)
+        std = torch.tensor(stats["std"], dtype=torch.float32, device=device).view(1, 4, 1, 1, 1)
+        train_runs = get_train_runs(run_dir)
+        if train_runs is None:
+            raise FileNotFoundError(
+                "Jy NRMSE normalization requires run-dir/split.json with train_runs."
+            )
+        jy_stats = load_or_compute_jy_training_stats(
+            run_dir=run_dir,
+            dataset=dataset,
+            train_runs=train_runs,
+            mean=mean,
+            std=std,
+            extent=args.extent,
+            checkpoint_path=ckpt_path,
+            checkpoint_epoch=ckpt_epoch,
+        )
+        jy_std_train = float(jy_stats["jy_std_train"])
+        if jy_std_train <= 0.0:
+            raise RuntimeError(
+                f"Training-set Jy std must be positive, got {jy_std_train}."
+            )
+
+        y_norm = normalize(y, mean, std)
+
+        model = UNet3D(
+            in_channels=8,
+            out_channels=4,
+            base_channels=base_channels,
+            channel_mults=channel_mults,
+            architecture=ckpt_args.get("model_version", LEGACY_MODEL_VERSION),
+            use_attention=bool(ckpt_args.get("use_attention", False)),
+            spatial_only_pooling=bool(ckpt_args.get("spatial_only_pooling", False)),
+        ).to(device)
+
+        model.load_state_dict(ckpt["model"])
+        model.eval()
+
+        generator = torch.Generator()
+        generator.manual_seed(args.seed)
+
+        if args.plot_units == "normalized":
+            y_plot_np = y_norm[0].detach().cpu().numpy()
+        elif args.plot_units == "physical":
+            y_plot_np = y[0].detach().cpu().numpy()
+        else:
+            raise ValueError(f"Unknown plot_units: {args.plot_units}")
+
+        # Derived magnetic quantities are computed only from complete fields.
+        # In particular, no gradients or path integrations are applied to the
+        # masked Visible input arrays.
+        target_ay, target_jy = compute_ay_jy(y_plot_np, args.extent)
+        y_norm_np = y_norm[0].detach().cpu().numpy()
+        y_phys_np = y[0].detach().cpu().numpy()
+        target_jy_physical = compute_jy(y_phys_np, args.extent)
+        experiment_mask_groups = build_experiment_mask_rows(
+            args=args,
+            block=y_norm,
+            generator=generator,
+        )
+        experiment_rows = []
+        for experiment_name, mask_rows in experiment_mask_groups:
+            rows_for_plot = []
+            print(f"Running experiment: {experiment_name} ({len(mask_rows)} rows)")
+            for short_name, label, mask in mask_rows:
+                x_visible_norm = make_visible_input(y_norm, mask)
+                model_input = torch.cat([x_visible_norm, mask], dim=1)
+                pred_norm = model(model_input)
+
+                if args.plot_units == "normalized":
+                    pred_plot_tensor = pred_norm.detach()
+                    visible_plot_tensor = y_norm.detach().clone()
+                else:
+                    pred_plot_tensor = denormalize(pred_norm, mean, std).detach()
+                    visible_plot_tensor = y.detach().clone()
+                visible_plot_tensor[mask < 0.5] = float("nan")
+
+                row = {
+                    "name": short_name,
+                    "label": label,
+                    "mask": mask[0].detach().cpu().numpy(),
+                    "visible_plot": visible_plot_tensor[0].detach().cpu().numpy(),
+                    "pred_plot": pred_plot_tensor[0].detach().cpu().numpy(),
+                    "pred_normalized": pred_norm[0].detach().cpu().numpy(),
+                }
+                row["pred_ay"], row["pred_jy"] = compute_ay_jy(
+                    row["pred_plot"], args.extent
+                )
+                row["pred_jy_physical"] = compute_physical_jy_from_normalized(
+                    row["pred_normalized"], mean, std, args.extent
+                )
+                rows_for_plot.append(row)
+            experiment_rows.append((experiment_name, rows_for_plot))
+
+        validation_statistics = None
+        statistics_index_count = None
+        selected_statistics_runs = None
+        if not args.skip_validation_statistics:
+            statistics_dataset = VPICWindowDataset(
+                h5_dir=h5_dir,
+                betas=betas,
+                delta_t=delta_t,
+                stride_t=1,
+                layout="C T X Z",
+                return_metadata=True,
+            )
+            statistics_indices = select_validation_statistics_indices(
+                dataset=statistics_dataset,
+                val_runs=val_runs,
+                window_stride=statistics_window_stride,
+                max_windows_per_run=args.statistics_max_windows_per_run,
+            )
+            selected_statistics_runs = {
+                statistics_dataset.samples[index][1] for index in statistics_indices
+            }
+            print(
+                "Collecting validation statistics from "
+                f"{len(selected_statistics_runs)} runs and "
+                f"{len(statistics_indices)} windows."
+            )
+            validation_statistics = collect_validation_statistics(
+                model=model,
+                dataset=statistics_dataset,
+                sample_indices=statistics_indices,
+                args=args,
+                mean=mean,
+                std=std,
+                device=device,
+                canonical_rows=dict(experiment_rows),
+                jy_std_train=jy_std_train,
+            )
+            statistics_index_count = len(statistics_indices)
+            statistics_dataset.close()
+
+        save_plot_cache(
+            cache_path,
+            {
+                "signature": cache_signature,
+                "selection_stem": selection_stem,
+                "metadata": metadata,
+                "delta_t": delta_t,
+                "y_plot_np": y_plot_np,
+                "y_norm_np": y_norm_np,
+                "target_ay": target_ay,
+                "target_jy": target_jy,
+                "target_jy_physical": target_jy_physical,
+                "experiment_rows": experiment_rows,
+                "jy_stats": jy_stats,
+                "jy_std_train": jy_std_train,
+                "validation_statistics": validation_statistics,
+                "statistics_window_stride": statistics_window_stride,
+                "statistics_index_count": statistics_index_count,
+                "selected_statistics_runs": (
+                    None
+                    if selected_statistics_runs is None
+                    else sorted(selected_statistics_runs)
+                ),
+                "ckpt_path": str(ckpt_path),
+                "ckpt_epoch": ckpt_epoch,
+            },
+        )
+
+
+    if validation_statistics is not None:
+        for experiment_name, row_statistics in validation_statistics.items():
+            statistics_stem = (
+                f"validation-runs_stride-{statistics_window_stride}_"
+                f"experiment-{experiment_name}_error_vs_local_frame"
+            )
+            statistics_payload = save_validation_statistics_plot(
+                experiment_name=experiment_name,
+                row_statistics=row_statistics,
+                context_length=delta_t,
+                total_windows=statistics_index_count,
+                out_path=out_dir / f"{statistics_stem}.png",
+            )
+            statistics_payload.update(
+                {
+                    "checkpoint": str(ckpt_path),
+                    "checkpoint_epoch": ckpt_epoch,
+                    "validation_runs": sorted(selected_statistics_runs),
+                    "window_stride": statistics_window_stride,
+                    "max_windows_per_run": args.statistics_max_windows_per_run,
+                    "mask_seed": args.seed,
+                }
+            )
+            statistics_payload.update(
+                jy_metric_metadata(
+                    jy_stats=jy_stats,
+                    checkpoint_path=ckpt_path,
+                    checkpoint_epoch=ckpt_epoch,
+                )
+            )
+            statistics_path = out_dir / f"{statistics_stem}.json"
+            statistics_path.write_text(json.dumps(statistics_payload, indent=2))
+            print(f"Saved validation statistics data: {statistics_path}")
+
+    sample_stem = (
+        f"{selection_stem}_"
+        f"{metadata['run_name']}_"
+        f"t0-{metadata['t0']}_"
+        f"{args.plot_units}"
+    )
+    for experiment_name, rows_for_plot in experiment_rows:
+        experiment_images_dir = images_dir / experiment_name
+        experiment_images_dir.mkdir(parents=True, exist_ok=True)
+        if args.all_times:
+            local_times = list(range(delta_t))
+            limit_times = local_times
+        elif experiment_name == "density_forecast":
+            # A static forecast table is meaningful at the requested endpoint,
+            # not at the generic --local-time used by reconstruction tables.
+            local_times = [delta_t - 1]
+            limit_times = None
+            print(
+                "density_forecast static table uses final local time:",
+                delta_t - 1,
+            )
+        else:
+            local_times = [args.local_time]
+            limit_times = None
+
+        experiment_stem = f"{sample_stem}_experiment-{experiment_name}"
+        frame_ids = np.arange(
+            int(metadata["t0"]), int(metadata["t0"]) + delta_t
+        )
+        error_payload = save_information_suite_error_plot(
+            target_field_normalized=y_norm_np,
+            target_jy_physical=target_jy_physical,
+            rows=rows_for_plot,
+            frame_ids=frame_ids,
+            out_path=out_dir / f"{experiment_stem}_error_vs_frame.png",
+            title=f"{experiment_name}: error by frame",
+            experiment_name=experiment_name,
+            jy_std_train=jy_std_train,
+        )
+        error_payload.update(
+            jy_metric_metadata(
+                jy_stats=jy_stats,
+                checkpoint_path=ckpt_path,
+                checkpoint_epoch=ckpt_epoch,
+            )
+        )
+        error_path = out_dir / f"{experiment_stem}_error_vs_frame.json"
+        error_path.write_text(json.dumps(error_payload, indent=2))
+        print(f"Saved framewise error data: {error_path}")
+        combined_frame_paths = []
+        for local_time in local_times:
+            frame_stem = (
+                f"{experiment_stem}_"
+                f"localt-{local_time:03d}_"
+                f"globalt-{int(metadata['t0']) + local_time:04d}"
+            )
+            magnetic_path = experiment_images_dir / f"{frame_stem}_magnetic_table.png"
+            density_path = experiment_images_dir / f"{frame_stem}_density_table.png"
+            combined_path = experiment_images_dir / f"{frame_stem}_combined_1x2.png"
+
+            plot_jy_ay_by_mask_patterns(
+                target_ay=target_ay,
+                target_jy=target_jy,
+                target_jy_physical=target_jy_physical,
+                target_field=y_plot_np,
+                rows=rows_for_plot,
+                metadata=metadata,
+                local_time=local_time,
+                out_path=magnetic_path,
+                extent=args.extent,
+                plot_units=args.plot_units,
+                ay_levels=args.ay_levels,
+                field_q=args.field_q,
+                residual_q=args.residual_q,
+                residual_vmax=args.residual_vmax,
+                quiver_step=args.quiver_step,
+                quiver_scale=args.quiver_scale,
+                dpi=args.dpi,
+                limit_times=limit_times,
+                jy_std_train=jy_std_train,
+            )
+
+            plot_density_magnetic_field_by_mask_patterns(
+                target_field=y_plot_np,
+                target_field_normalized=y_norm_np,
+                target_ay=target_ay,
+                rows=rows_for_plot,
+                metadata=metadata,
+                local_time=local_time,
+                out_path=density_path,
+                extent=args.extent,
+                plot_units=args.plot_units,
+                ay_levels=args.ay_levels,
+                quiver_step=args.quiver_step,
+                quiver_scale=args.quiver_scale,
+                field_q=args.field_q,
+                residual_q=args.residual_q,
+                residual_vmax=args.residual_vmax,
+                dpi=args.dpi,
+                limit_times=limit_times,
+            )
+            combine_table_images(
+                magnetic_path=magnetic_path,
+                density_path=density_path,
+                out_path=combined_path,
+            )
+            combined_frame_paths.append(combined_path)
+
+        if args.all_times:
+            animation_stem = (
+                f"{experiment_stem}_"
+                f"globalt-{int(metadata['t0']):04d}-"
+                f"{int(metadata['t0']) + delta_t - 1:04d}_combined_1x2"
+            )
+            formats = (
+                ["quicktime", "gif"]
+                if args.animation_format == "both"
+                else [args.animation_format]
+            )
+            for animation_format in formats:
+                extension = (
+                    "mov" if animation_format == "quicktime" else animation_format
+                )
+                write_animation(
+                    combined_frame_paths,
+                    out_dir / f"{animation_stem}.{extension}",
+                    fps=args.fps,
+                )
+
+
+if __name__ == "__main__":
+    main()

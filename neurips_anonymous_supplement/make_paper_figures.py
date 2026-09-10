@@ -23,6 +23,7 @@ from matplotlib.lines import Line2D
 from data.vpic_hdf5_dataset import VPICWindowDataset, find_h5_files
 from models.unet3d import LEGACY_MODEL_VERSION, UNet3D
 from visualize_mask_patterns_unet3d import (
+    package_file,
     DEFAULT_MAGNETIC_ABLATION_VISIBLE_FRACTIONS,
     DEFAULT_MAGNETIC_ABLATION_VISIBLE_PERCENTS,
     DEFAULT_RESIDUAL_VMAX,
@@ -364,7 +365,7 @@ def annotate_density_nrmse(ax, nrmse: float) -> None:
 
 
 def validation_run_order(run_dir: Path) -> List[str]:
-    split_path = run_dir / "split.json"
+    split_path = package_file(run_dir, "split.json")
     if not split_path.exists():
         return []
     return [str(name) for name in json.loads(split_path.read_text()).get("val_runs", [])]
@@ -426,7 +427,7 @@ def stack_rmse_by_global_frame(
 
 
 def density_std_from_run_dir(run_dir: Path) -> float | None:
-    stats_path = run_dir / "stats.json"
+    stats_path = package_file(run_dir, "stats.json")
     if not stats_path.exists():
         return None
     payload = json.loads(stats_path.read_text())
@@ -538,7 +539,7 @@ def save_png_pdf(fig, figures_dir: Path, stem: str, dpi: int) -> None:
 
 
 def base_signature(args: argparse.Namespace, run_dir: Path, checkpoint_path: Path) -> Dict:
-    split_path = run_dir / "split.json"
+    split_path = package_file(run_dir, "split.json")
     split = json.loads(split_path.read_text()) if split_path.exists() else {}
     return {
         "cache_version": PAPER_CACHE_VERSION,
