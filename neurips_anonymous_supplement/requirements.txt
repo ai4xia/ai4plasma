@@ -1,7 +1,0 @@
-# Official training stack: PyTorch 2.13.0+cu130, CUDA 13.0, NCCL 2.29.7, cuDNN 9.20.0
-torch==2.13.0
-numpy==2.4.4
-h5py==3.13.0
-matplotlib>=3.8
-tqdm
-pytest
