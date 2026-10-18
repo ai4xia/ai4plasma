@@ -11,9 +11,54 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from data.masking import DEFAULT_PATTERN_WEIGHTS, MASK_PATTERNS  # noqa: E402
 from train_masked_unet3d import (  # noqa: E402
     build_epoch_wandb_log,
+    save_checkpoint,
     train_one_epoch,
     validate,
 )
+
+
+def test_supplied_scaler_persists_across_epochs_and_checkpoints(tmp_path):
+    from types import SimpleNamespace
+
+    model = ScaleModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scaler = torch.amp.GradScaler("cpu", init_scale=8.0, growth_interval=1)
+    mean, std = _channel_stats(torch.device("cpu"))
+    loader = DataLoader(TinyBlockDataset(n=1), batch_size=1)
+    scales = []
+    for epoch in (1, 2):
+        metrics = train_one_epoch(
+            model, loader, optimizer, torch.device("cpu"), mean, std,
+            DEFAULT_PATTERN_WEIGHTS, .05, .05, .05, .05, False, 1.0,
+            scaler=scaler,
+        )
+        scales.append((metrics["amp_scale_start"], metrics["amp_scale_end"]))
+        assert metrics["optimizer_steps"] == 1
+        assert metrics["amp_skipped_steps"] == 0
+    assert scales == [(8.0, 16.0), (16.0, 32.0)]
+    path = tmp_path / "latest.pt"
+    save_checkpoint(path, model, optimizer, epoch=2, best_val_mse=1.0,
+                    args=SimpleNamespace(), stats={}, scaler=scaler)
+    checkpoint = torch.load(path, weights_only=False)
+    restored = torch.amp.GradScaler("cpu")
+    restored.load_state_dict(checkpoint["scaler"])
+    assert restored.state_dict() == scaler.state_dict()
+
+
+def test_amp_precision_defaults_and_resume_compatibility(monkeypatch):
+    from train_masked_unet3d import parse_args, validate_resume_parameters
+    import pytest
+
+    monkeypatch.setattr(sys, "argv", ["train", "--amp"])
+    args = parse_args()
+    assert args.amp_dtype == "float16"
+    old_args = vars(args).copy()
+    old_args.pop("amp_dtype")
+    validate_resume_parameters(args, old_args)
+    args.amp_dtype = "bfloat16"
+    with pytest.raises(ValueError, match="amp_dtype"):
+        validate_resume_parameters(args, old_args)
+    validate_resume_parameters(args, dict(old_args, amp_dtype="bfloat16"))
 
 
 class TinyBlockDataset(Dataset):

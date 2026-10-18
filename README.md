@@ -124,6 +124,31 @@ prediction = visible_normalized_fields + UNet_residual([visible_fields, masks])
 
 ## 4. 训练逻辑
 
+### 可选：uncertainty-aware reconstruction
+
+默认 deterministic 模型、mask 分布、重建 loss 和旧 checkpoint 的加载方式保持不变。
+训练时添加 `--uncertainty-aware --uncertainty-loss-weight 1.0` 可开启最小扩展：
+
+- 输入仍为 8 通道，但后四通道改为连续 `v_in`，范围 `[0,1]`。
+  原有训练 mask 转为 `v_in = 1 - mask`，保留原有观测布局；真实观测为 0，完全未知为 1。
+  `make_uncertain_input` 也支持中间方差，使用
+  `sqrt(1-v_in)*X_true + sqrt(v_in)*epsilon`，其中 `epsilon ~ N(0,1)`。
+- U-Net backbone 与 field head 保持不变，仅在最终 decoder feature 上增加
+  1×1×1 squared-error head；softplus 保证 `v_out >= 0`，输出不截断。
+  模型返回 `(X_pred, v_out)`，均为四通道，单位是归一化场及其平方误差。
+- 保留原有重建 MSE，增加
+  `uncertainty_loss_weight * SmoothL1(v_out.float(), (X_pred.detach().float()-X_true.float())^2)`，
+  使用 `beta=1.0, reduction="mean"`。
+  日志及 best checkpoint 仍使用原有重建 MSE。
+- `visualize_sliding_density_reconstruction.py` 从 checkpoint flag 自动识别该模式。
+  重叠窗口和反向 refinement 直接复用上次 Density 预测，输入方差使用上次
+  `v_out.clamp(0,1)`；真实 probes 始终覆盖为测量值及方差 0。
+  未知位置（包括 padding）方差为 1，并以标准 Gaussian noise 填充；复用预测不加噪。
+- `--init-checkpoint` 可从 deterministic checkpoint 初始化，新增 error head 使用初始权重。
+  自动 resume 检查 uncertainty 模式和 loss weight；使用不同的 `--out-dir` 开始新模式。
+
+该扩展不使用 Gaussian NLL、diffusion、ensembles 或 calibration。
+
 ### 4.1 归一化
 
 每个物理通道使用训练集估计的 mean/std 做标准化。统计最多读取 50 个 training batches，不使用 validation 数据。当前 checkpoint 保存的统计量为：
@@ -191,19 +216,19 @@ ml load pytorch
 sbatch train_masked_unet3d_4n16g.sbatch
 ```
 
-如果已经位于满足 4 nodes、每节点 4 GPUs 的 allocation 中，直接执行同一文件：
+如果已经位于满足 4 nodes、每节点 4 GPUs 的 allocation 中，直接执行同一文件，无需额外参数：
 
 ```bash
-./train_masked_unet3d_4n16g.sbatch
+bash train_masked_unet3d_4n16g.sbatch
 ```
 
-两种入口最终都会由该文件启动 `srun + torchrun`。当前正式训练配置是 v15：
+两种入口最终都会由该文件启动 `srun + torchrun`。当前 launcher 仅续训已验证的多 beta Smooth L1 实验：
 
 ```text
-masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_v15_orientedSpatialBlock_independentBD_logUniformCounts_attention_spatialpool_b8_e4500
+runs/multi_beta_smoothl1_6ep_horizon20_20261018/latest.pt
 ```
 
-该 run 从随机权重训练 4500 epochs，使用 `independentBD_fiveMask_logUniformCounts_orientedSpatialBlock_v9` 的训练 mask sampler，并打开 unified spatiotemporal attention 与 spatial-only pooling。sbatch 会拒绝 `--init-checkpoint`。`--auto-resume` 默认开启：若 `out-dir/latest.pt` 已存在，则完整 resume（含 optimizer 和 epoch），并检查 masking version / attention / pooling 等关键参数。额外 CLI 参数会追加给训练脚本。
+固定配置见 launcher；对应成功实验记录为该目录下的 `config.json` 与 `TRAINING_REPORT.md`。从最新完成的 epoch 续训至 epoch 20：当前 checkpoint 为 epoch 6，因此下一轮为 epoch 7。保留原始 20-epoch cosine horizon（不重启 warmup）、model/AdamW/AMP scaler、normalization stats 和按 run 划分；不使用原来的六轮 bounded wrapper。epoch 20 已完成则直接成功退出。checkpoint 缺失、参数不兼容或 allocation 不满足要求时明确失败，不会从头训练；不接受额外 CLI 参数。重新执行同一命令即可从最新完整 checkpoint 继续。上文 v15 结果与 paper assets 保留为历史实验。
 
 ## 6. 单窗口 visualization 测试案例
 

@@ -9,7 +9,11 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 import h5py
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+
+
+TARGET_SPATIAL_SHAPE = (154, 62)
 
 
 def _beta_from_filename(path: Path) -> float:
@@ -50,7 +54,7 @@ class VPICWindowDataset(Dataset):
     """
     Pure HDF5 temporal-window dataset.
 
-    It reads full-field blocks from HDF5 and returns raw blocks only.
+    It reads physical fields from HDF5 and resamples X/Z to the beta=0.2 grid.
     No masking, no corruption, no task-specific transformation is performed here.
 
     HDF5 field layout:
@@ -82,8 +86,7 @@ class VPICWindowDataset(Dataset):
 
         betas:
             Optional list of beta values to use.
-            For first experiments, use one beta only, e.g. betas=[0.1] or [0.2],
-            because different beta files have different spatial resolutions.
+            Native spatial resolutions are resampled to a shared (154, 62) grid.
 
         delta_t:
             Temporal window length.
@@ -189,12 +192,21 @@ class VPICWindowDataset(Dataset):
         block_np = fields[t0 : t0 + self.delta_t]  # (delta_t, C, Nx, Nz)
         block_np = np.asarray(block_np, dtype=np.float32)
 
-        if self.layout == "C T X Z":
-            block_np = np.transpose(block_np, (1, 0, 2, 3))  # (C, delta_t, Nx, Nz)
-        elif self.layout == "C X Z T":
-            block_np = np.transpose(block_np, (1, 2, 3, 0))  # (C, Nx, Nz, delta_t)
-
         block = torch.from_numpy(block_np)
+        if block.shape[-2:] != TARGET_SPATIAL_SHAPE:
+            # Treat time as the 2D batch axis: interpolate X/Z independently
+            # for every frame and physical channel, before normalization/masks.
+            # VPIC averaged B/density diagnostics are cell-centered, so align
+            # cell extents rather than the first/last sample centers.
+            block = F.interpolate(
+                block, size=TARGET_SPATIAL_SHAPE, mode="bicubic",
+                antialias=True, align_corners=False,
+            )
+
+        if self.layout == "C T X Z":
+            block = block.permute(1, 0, 2, 3)
+        elif self.layout == "C X Z T":
+            block = block.permute(1, 2, 3, 0)
 
         if not self.return_metadata:
             return block
@@ -273,9 +285,7 @@ def make_vpic_dataloader(
     """
     Convenience function.
 
-    For first experiments, use one beta at a time:
-        betas=[0.1]
-    because different beta files have different Nx, Nz.
+    All selected betas use the shared spatial grid, allowing ordinary batches.
     """
     dataset = VPICWindowDataset(
         h5_dir=h5_dir,

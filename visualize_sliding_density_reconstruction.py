@@ -16,6 +16,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+
+from data.masking import make_uncertain_input
 from matplotlib.patches import Rectangle
 
 from data.vpic_hdf5_dataset import find_h5_files, parse_run_name
@@ -128,7 +130,9 @@ def sliding_plot_cache_signature(
 
 
 def plottable_slide_result(result: Dict) -> Dict:
-    ignored = {"raw_state_normalized", "conditioning_state_normalized"}
+    ignored = {
+        "raw_state_normalized", "conditioning_state_normalized", "variance_state_normalized"
+    }
     return {key: value for key, value in result.items() if key not in ignored}
 
 
@@ -495,6 +499,8 @@ def reconstruct_with_slide_step(
         dtype=target_normalized.dtype,
     )
     conditioning_reconstruction = raw_reconstruction.clone()
+    uncertainty_aware = bool(getattr(model, "uncertainty_aware", False))
+    variance_state = torch.ones_like(raw_reconstruction) if uncertainty_aware else None
     probe_bool = probe_mask > 0.5
     target_density_normalized = target_normalized[3].detach().cpu().numpy()
     snapshots = []
@@ -535,18 +541,35 @@ def reconstruct_with_slide_step(
         density_values[:, probe_bool] = density_target[:, probe_bool]
         values[0, 3, :valid_length] = density_values
 
-        model_input = torch.cat([values * mask, mask], dim=1)
+        if uncertainty_aware:
+            input_variance = 1.0 - mask
+            if overlap_length > 0:
+                input_variance[0, 3, :overlap_length] = variance_state[
+                    start:overlap_end
+                ].clamp(0.0, 1.0)
+            input_variance[0, 3, :valid_length, probe_bool] = 0.0
+            # Generate noise only for unknown slots. The binary availability
+            # mask preserves reused fields exactly, regardless of their variance.
+            model_input = torch.cat(
+                [make_uncertain_input(values, 1.0 - mask), input_variance], dim=1
+            )
+        else:
+            model_input = torch.cat([values * mask, mask], dim=1)
         with torch.autocast(
             device_type=target_normalized.device.type,
             enabled=(amp and target_normalized.device.type == "cuda"),
         ):
             prediction = model(model_input)
+            if uncertainty_aware:
+                prediction, output_variance = prediction
 
         # Preserve the raw prediction everywhere, including at true probes, for
         # figures and residual metrics. Use a separately clamped copy only as
         # pseudo-visible conditioning for later overlapping windows.
         raw_window = prediction[0, 3, :valid_length].float()
         raw_reconstruction[start:valid_end] = raw_window
+        if uncertainty_aware:
+            variance_state[start:valid_end] = output_variance[0, 3, :valid_length].float()
         conditioned_window = raw_window.clone()
         conditioned_window[:, probe_bool] = density_target[:, probe_bool]
         conditioning_reconstruction[start:valid_end] = conditioned_window
@@ -666,6 +689,10 @@ def reconstruct_with_slide_step(
         result["conditioning_state_normalized"] = (
             conditioning_reconstruction.detach().clone()
         )
+        if uncertainty_aware:
+            result["variance_state_normalized"] = variance_state.detach().clone()
+    if uncertainty_aware:
+        result["predicted_squared_error_normalized"] = variance_state.detach().cpu().numpy()
     return result
 
 
@@ -749,8 +776,9 @@ def refine_reconstruction_pass(
     include_boundary_padding: bool = False,
     max_updates: int | None = None,
     hide_magnetic: bool = False,
+    variance_state_normalized: torch.Tensor | None = None,
 ) -> Dict:
-    """Apply one full-visible repeated sweep and update the state in place."""
+    """Apply one repeated sweep using the latest fields and optional error state."""
     if direction not in {"forward", "reverse"}:
         raise ValueError(f"Unknown direction {direction!r}.")
     channels, run_length, size_x, size_z = target_normalized.shape
@@ -762,6 +790,14 @@ def refine_reconstruction_pass(
         raise ValueError("conditioning and raw reconstruction states must match.")
     if not torch.isfinite(conditioning_state_normalized).all():
         raise ValueError("Repeated sweeps require a complete initial reconstruction.")
+    uncertainty_aware = bool(getattr(model, "uncertainty_aware", False))
+    if uncertainty_aware and (
+        variance_state_normalized is None
+        or variance_state_normalized.shape != raw_state_normalized.shape
+    ):
+        raise ValueError(
+            "Uncertainty-aware sweeps require the previous squared-error state."
+        )
 
     starts = shifted_window_starts(
         run_length=run_length,
@@ -794,8 +830,8 @@ def refine_reconstruction_pass(
 
         # Magnetic fields remain complete true observations unless
         # --hide-magnetic is set. Every valid Density position uses the latest
-        # conditioning reconstruction and is marked visible; only padded
-        # future slots remain invisible.
+        # conditioning reconstruction. Deterministic inputs mark it visible;
+        # uncertainty-aware inputs carry its predicted squared error instead.
         if not hide_magnetic:
             values[0, :3, local_start:local_end] = target_normalized[
                 :3, valid_start:valid_end
@@ -811,18 +847,34 @@ def refine_reconstruction_pass(
         density_values[:, probe_bool] = density_target[:, probe_bool]
         values[0, 3, local_start:local_end] = density_values
 
-        model_input = torch.cat([values * mask, mask], dim=1)
+        if uncertainty_aware:
+            input_variance = 1.0 - mask
+            input_variance[0, 3, local_start:local_end] = variance_state_normalized[
+                valid_start:valid_end
+            ].clamp(0.0, 1.0)
+            input_variance[0, 3, local_start:local_end, probe_bool] = 0.0
+            model_input = torch.cat(
+                [make_uncertain_input(values, 1.0 - mask), input_variance], dim=1
+            )
+        else:
+            model_input = torch.cat([values * mask, mask], dim=1)
         with torch.autocast(
             device_type=target_normalized.device.type,
             enabled=(amp and target_normalized.device.type == "cuda"),
         ):
             prediction = model(model_input)
+            if uncertainty_aware:
+                prediction, output_variance = prediction
 
         # The raw output replaces the entire valid window, including regions
         # used as fully visible input. Only the separate conditioning state is
         # clamped at real probes before the next update.
         raw_window = prediction[0, 3, local_start:local_end].float()
         raw_state_normalized[valid_start:valid_end] = raw_window
+        if uncertainty_aware:
+            variance_state_normalized[valid_start:valid_end] = output_variance[
+                0, 3, local_start:local_end
+            ].float()
         conditioned_window = raw_window.clone()
         conditioned_window[:, probe_bool] = density_target[:, probe_bool]
         conditioning_state_normalized[valid_start:valid_end] = conditioned_window
@@ -1001,6 +1053,8 @@ def build_bidirectional_rows(
     small_initial = initial_result(refinement_step)
     small_raw = small_initial["raw_state_normalized"].clone()
     small_conditioning = small_initial["conditioning_state_normalized"].clone()
+    small_variance = small_initial.get("variance_state_normalized")
+    small_variance = small_variance.clone() if small_variance is not None else None
     small_history = [
         {
             "direction": "forward",
@@ -1027,6 +1081,7 @@ def build_bidirectional_rows(
             target_normalized=target_normalized,
             raw_state_normalized=small_raw,
             conditioning_state_normalized=small_conditioning,
+            variance_state_normalized=small_variance,
             probe_mask=probe_mask,
             window_size=window_size,
             slide_step=refinement_step,
@@ -1058,6 +1113,10 @@ def build_bidirectional_rows(
     independent_conditioning = independent_initial[
         "conditioning_state_normalized"
     ].clone()
+    independent_variance = independent_initial.get("variance_state_normalized")
+    independent_variance = (
+        independent_variance.clone() if independent_variance is not None else None
+    )
     independent_history = [
         {
             "direction": "forward",
@@ -1078,6 +1137,7 @@ def build_bidirectional_rows(
             target_normalized=target_normalized,
             raw_state_normalized=independent_raw,
             conditioning_state_normalized=independent_conditioning,
+            variance_state_normalized=independent_variance,
             probe_mask=probe_mask,
             window_size=window_size,
             slide_step=window_size,
@@ -1114,6 +1174,8 @@ def build_bidirectional_rows(
     shifted_conditioning = independent_initial[
         "conditioning_state_normalized"
     ].clone()
+    shifted_variance = independent_initial.get("variance_state_normalized")
+    shifted_variance = shifted_variance.clone() if shifted_variance is not None else None
     shifted_history = [independent_history[0]]
     shifted_offsets = [0]
     shifted_directions = ["forward"]
@@ -1130,6 +1192,7 @@ def build_bidirectional_rows(
             target_normalized=target_normalized,
             raw_state_normalized=shifted_raw,
             conditioning_state_normalized=shifted_conditioning,
+            variance_state_normalized=shifted_variance,
             probe_mask=probe_mask,
             window_size=window_size,
             slide_step=window_size,
@@ -2168,6 +2231,7 @@ def main() -> None:
             base_channels=base_channels,
             channel_mults=channel_mults,
             architecture=checkpoint_args.get("model_version", LEGACY_MODEL_VERSION),
+            uncertainty_aware=bool(checkpoint_args.get("uncertainty_aware", False)),
             use_attention=bool(checkpoint_args.get("use_attention", False)),
             spatial_only_pooling=bool(
                 checkpoint_args.get("spatial_only_pooling", False)

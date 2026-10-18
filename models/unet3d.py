@@ -253,6 +253,9 @@ class UNet3D(nn.Module):
 
     Output:
         (B, out_channels, T, X, Z)
+        With uncertainty_aware=True, return (field, predicted_squared_error),
+        each with the same shape. The final input channels then hold variance
+        (0=observation, 1=unknown) instead of the deterministic visibility mask.
     """
 
     def __init__(
@@ -264,6 +267,7 @@ class UNet3D(nn.Module):
         architecture: str = MODEL_VERSION,
         use_attention: bool = False,
         spatial_only_pooling: bool = False,
+        uncertainty_aware: bool = False,
     ):
         super().__init__()
 
@@ -281,6 +285,7 @@ class UNet3D(nn.Module):
         self.architecture = architecture
         self.use_attention = bool(use_attention)
         self.spatial_only_pooling = bool(spatial_only_pooling)
+        self.uncertainty_aware = bool(uncertainty_aware)
 
         if architecture == MODEL_VERSION:
             block_cls = ResidualConvBlock3D
@@ -328,6 +333,12 @@ class UNet3D(nn.Module):
         )
 
         self.out = nn.Conv3d(c0, out_channels, kernel_size=1)
+        # Extend only the final head; deterministic parameter names and shapes
+        # stay unchanged. Squared error is nonnegative and may exceed one.
+        self.variance_out = (
+            nn.Conv3d(c0, out_channels, kernel_size=1)
+            if self.uncertainty_aware else None
+        )
         if self.residual_output:
             # Start from identity on visible normalized fields and zero (the
             # physical channel mean) in missing regions. The network learns a
@@ -335,7 +346,7 @@ class UNet3D(nn.Module):
             nn.init.zeros_(self.out.weight)
             nn.init.zeros_(self.out.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         visible_fields = x[:, : self.out_channels] if self.residual_output else None
         s0 = self.enc0(x)
         s1 = self.enc1(s0)
@@ -357,9 +368,10 @@ class UNet3D(nn.Module):
         x = self.up0(x, s0)
 
         correction = self.out(x)
-        if self.residual_output:
-            return visible_fields + correction
-        return correction
+        prediction = visible_fields + correction if self.residual_output else correction
+        if self.variance_out is not None:
+            return prediction, F.softplus(self.variance_out(x))
+        return prediction
 
 
 if __name__ == "__main__":

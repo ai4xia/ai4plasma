@@ -8,6 +8,7 @@ import json
 import math
 import os
 import random
+import time
 from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
@@ -28,6 +29,8 @@ from data.masking import (
     PROBE_COUNT_PATTERNS,
     full_mse_loss,
     make_visible_input,
+    make_uncertain_input,
+    predicted_error_mse_loss,
     parse_pattern_weights,
     sample_independent_batch_masks,
     sample_patterns,
@@ -119,6 +122,14 @@ def parse_args():
     p.add_argument("--weight-decay", type=float, default=1e-4)
 
     p.add_argument("--base-channels", type=int, default=24)
+    p.add_argument(
+        "--uncertainty-aware", action="store_true",
+        help="Use input variance and predict per-element squared reconstruction error.",
+    )
+    p.add_argument(
+        "--uncertainty-loss-weight", type=float, default=1.0,
+        help="Weight of squared-error prediction MSE (default: 1).",
+    )
     p.add_argument(
         "--channel-mults",
         type=int,
@@ -248,6 +259,10 @@ def parse_args():
         help="Output directory. By default it is generated from the training parameters.",
     )
     p.add_argument("--amp", action="store_true")
+    p.add_argument(
+        "--amp-dtype", choices=("float16", "bfloat16"), default="float16",
+        help="AMP precision; float16 preserves existing runs, bfloat16 avoids FP16 range overflow.",
+    )
 
     wandb_group = p.add_mutually_exclusive_group()
     wandb_group.add_argument(
@@ -315,6 +330,12 @@ def parse_args():
         args.mask_pattern_weights = parse_pattern_weights(args.mask_patterns)
     args.masking_version = MASKING_VERSION
     args.model_version = MODEL_VERSION
+
+    if (
+        not math.isfinite(args.uncertainty_loss_weight)
+        or args.uncertainty_loss_weight < 0
+    ):
+        p.error("--uncertainty-loss-weight must be finite and nonnegative")
 
     if args.epochs <= 0:
         p.error(f"--epochs must be positive, got {args.epochs}")
@@ -585,6 +606,21 @@ def validate_resume_parameters(args, checkpoint_args: Dict[str, Any]) -> None:
         )
 
     mismatches = []
+    # Missing flags in deterministic checkpoints retain the original behavior.
+    for key, default in (
+        ("uncertainty_aware", False), ("uncertainty_loss_weight", 1.0),
+        ("amp_dtype", "float16"),
+    ):
+        if key == "amp_dtype" and not getattr(args, "amp", False):
+            continue
+        if key == "uncertainty_loss_weight" and not getattr(
+            args, "uncertainty_aware", False
+        ):
+            continue
+        old_value = checkpoint_args.get(key, default)
+        new_value = getattr(args, key, default)
+        if old_value != new_value:
+            mismatches.append(f"{key}: checkpoint={old_value!r}, current={new_value!r}")
     for key in RESUME_PARAMETER_KEYS:
         if key in {"use_attention", "spatial_only_pooling"}:
             # Checkpoints created before either optional architecture extension
@@ -731,6 +767,10 @@ def train_one_epoch(
     postfix_every: int = 50,
     epoch_number: Optional[int] = None,
     epoch_progress: Optional[Any] = None,
+    uncertainty_aware: bool = False,
+    uncertainty_loss_weight: float = 1.0,
+    scaler: Optional[Any] = None,
+    amp_dtype: torch.dtype = torch.float16,
 ) -> Dict[str, Any]:
     model.train()
 
@@ -739,6 +779,7 @@ def train_one_epoch(
     # Accumulate on device and read back once per epoch. Training patterns are
     # independent marginals, so no ambiguous 5x5 combination loss is logged.
     sum_mse = torch.zeros((), device=device)
+    sum_uncertainty_mse = torch.zeros((), device=device)
     magnetic_pattern_counts = torch.zeros(n_patterns, device=device)
     density_pattern_counts = torch.zeros(n_patterns, device=device)
     sum_actual_fraction = torch.zeros((), device=device)
@@ -756,11 +797,31 @@ def train_one_epoch(
     magnetic_full_sample_count = 0
     spatial_sites = 0
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(amp and device.type == "cuda"))
+    if scaler is None:
+        scaler = torch.cuda.amp.GradScaler(enabled=(amp and device.type == "cuda"))
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    epoch_started = time.perf_counter()
+    last_batch_end = epoch_started
+    data_wait_seconds = 0.0
+    applied_steps = 0
+    beta_sample_counts = {}
+    scale_start = scaler.get_scale()
+
+    def count_optimizer_step(_optimizer, _args, _kwargs):
+        nonlocal applied_steps
+        applied_steps += 1
+
+    step_counter = optimizer.register_step_post_hook(count_optimizer_step)
 
     batches_per_epoch = max(len(loader), 1)
 
     for step, batch in enumerate(loader):
+        data_wait_seconds += time.perf_counter() - last_batch_end
+        for beta in batch.get("metadata", {}).get("beta", []):
+            key = str(float(beta))
+            beta_sample_counts[key] = beta_sample_counts.get(key, 0) + 1
         y = batch["block"].to(device, non_blocking=True)
         y = normalize(y, mean, std)
 
@@ -829,15 +890,28 @@ def train_one_epoch(
             magnetic_visible_counts=magnetic_visible_counts,
         )
 
-        x_visible = make_visible_input(y, mask)
-
-        model_input = torch.cat([x_visible, mask], dim=1)  # (B, 8, T, X, Z)
+        if uncertainty_aware:
+            input_variance = 1.0 - mask
+            model_input = torch.cat(
+                [make_uncertain_input(y, input_variance), input_variance], dim=1
+            )
+        else:
+            x_visible = make_visible_input(y, mask)
+            model_input = torch.cat([x_visible, mask], dim=1)  # (B, 8, T, X, Z)
 
         optimizer.zero_grad(set_to_none=True)
 
-        with torch.cuda.amp.autocast(enabled=(amp and device.type == "cuda")):
+        with torch.cuda.amp.autocast(enabled=(amp and device.type == "cuda"), dtype=amp_dtype):
             pred = model(model_input)
-            loss = full_mse_loss(pred, y, mask)
+            if uncertainty_aware:
+                pred, output_variance = pred
+            reconstruction_loss = full_mse_loss(pred, y, mask)
+            loss = reconstruction_loss
+            if uncertainty_aware:
+                uncertainty_loss = predicted_error_mse_loss(
+                    output_variance, pred, y
+                )
+                loss = loss + uncertainty_loss_weight * uncertainty_loss
 
         scaler.scale(loss).backward()
 
@@ -863,7 +937,9 @@ def train_one_epoch(
             density_pattern_counts.index_add_(0, density_pattern_ids, ones)
             sum_actual_fraction += per_sample_actual.sum()
 
-            sum_mse += loss.detach().float()
+            sum_mse += reconstruction_loss.detach().float()
+            if uncertainty_aware:
+                sum_uncertainty_mse += uncertainty_loss.detach().float()
 
         # temporal_block samples two boundaries directly, so its requested
         # random fraction is intentionally ignored; use the realized fraction
@@ -893,6 +969,12 @@ def train_one_epoch(
                 phase="train",
                 mse=float(sum_mse) / total_batches,
             )
+        last_batch_end = time.perf_counter()
+
+    step_counter.remove()
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    train_seconds = time.perf_counter() - epoch_started
 
     if epoch_progress is not None and epoch_number is not None:
         # Eliminate floating-point accumulation drift at every epoch boundary.
@@ -913,6 +995,8 @@ def train_one_epoch(
             float(magnetic_sample_count),
             float(magnetic_zero_sample_count),
             float(magnetic_full_sample_count),
+            float(sum_uncertainty_mse),
+            float(applied_steps),
         ],
         dtype=torch.float64,
         device=device,
@@ -936,6 +1020,8 @@ def train_one_epoch(
         global_magnetic_sample_count,
         global_magnetic_zero_sample_count,
         global_magnetic_full_sample_count,
+        global_uncertainty_mse,
+        global_applied_steps,
     ) = totals.tolist()
     total_count = max(global_samples, 1)
     probe_count = max(global_probe_sample_count, 1)
@@ -943,7 +1029,7 @@ def train_one_epoch(
     magnetic_count = max(global_magnetic_sample_count, 1)
     mean_magnetic_visible = global_magnetic_visible_sum / magnetic_count
 
-    return {
+    metrics = {
         "mse": global_mse / max(global_batches, 1),
         "target_mask_fraction": global_target / total_count,
         "actual_mask_fraction": float(sum_actual_fraction.cpu()) / total_count,
@@ -967,7 +1053,24 @@ def train_one_epoch(
             name: float(density_pattern_counts[i].cpu()) / total_count
             for i, name in enumerate(MASK_PATTERNS)
         },
+        "optimizer_steps": global_applied_steps,
+        "amp_skipped_steps": global_batches - global_applied_steps,
+        "amp_scale_start": scale_start,
+        "amp_scale_end": scaler.get_scale(),
+        "train_seconds": train_seconds,
+        "data_wait_seconds": data_wait_seconds,
     }
+    if uncertainty_aware:
+        metrics["uncertainty_mse"] = global_uncertainty_mse / max(global_batches, 1)
+    if distributed_is_initialized():
+        rank_counts = [None] * dist.get_world_size()
+        dist.all_gather_object(rank_counts, beta_sample_counts)
+        beta_sample_counts = {}
+        for counts in rank_counts:
+            for beta, count in counts.items():
+                beta_sample_counts[beta] = beta_sample_counts.get(beta, 0) + count
+    metrics["beta_sample_counts"] = beta_sample_counts
+    return metrics
 
 
 def val_mask_seed(base_seed: int, pattern: str, batch_index: int) -> int:
@@ -994,6 +1097,8 @@ def validate(
     density_probe_max: int,
     amp: bool,
     epoch_progress: Optional[Any] = None,
+    uncertainty_aware: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
 ) -> Dict[str, Dict[str, float]]:
     """
     Evaluate every mask pattern on the same validation blocks.
@@ -1007,6 +1112,7 @@ def validate(
     _ = (mask_seed, density_probe_min, density_probe_max)
 
     sums = torch.zeros(len(patterns), device=device)
+    uncertainty_sums = torch.zeros_like(sums)
     counts = torch.zeros(len(patterns), device=device)
 
     if epoch_progress is not None:
@@ -1026,18 +1132,32 @@ def validate(
                 dtype=y.dtype,
             )
 
-            model_input = torch.cat([make_visible_input(y, mask), mask], dim=1)
+            if uncertainty_aware:
+                input_variance = 1.0 - mask
+                model_input = torch.cat(
+                    [make_uncertain_input(y, input_variance), input_variance], dim=1
+                )
+            else:
+                model_input = torch.cat([make_visible_input(y, mask), mask], dim=1)
 
-            with torch.cuda.amp.autocast(enabled=(amp and device.type == "cuda")):
+            with torch.cuda.amp.autocast(enabled=(amp and device.type == "cuda"), dtype=amp_dtype):
                 pred = model(model_input)
+                if uncertainty_aware:
+                    pred, output_variance = pred
                 loss_mse = full_mse_loss(pred, y, mask)
+                if uncertainty_aware:
+                    uncertainty_loss = predicted_error_mse_loss(output_variance, pred, y)
 
             sums[i] += loss_mse.detach().float() * batch_size
             counts[i] += batch_size
+            if uncertainty_aware:
+                uncertainty_sums[i] += uncertainty_loss.detach().float() * batch_size
 
     if distributed_is_initialized():
         dist.all_reduce(sums, op=dist.ReduceOp.SUM)
         dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+        if uncertainty_aware:
+            dist.all_reduce(uncertainty_sums, op=dist.ReduceOp.SUM)
 
     sums = sums.cpu()
     counts = counts.cpu().clamp(min=1.0)
@@ -1052,6 +1172,13 @@ def validate(
     metrics["mean"] = {
         "mse": sum(metrics[pattern]["mse"] for pattern in patterns) / len(patterns),
     }
+    if uncertainty_aware:
+        uncertainty_sums = uncertainty_sums.cpu()
+        for i, pattern in enumerate(patterns):
+            metrics[pattern]["uncertainty_mse"] = float(uncertainty_sums[i] / counts[i])
+        metrics["mean"]["uncertainty_mse"] = sum(
+            metrics[p]["uncertainty_mse"] for p in patterns
+        ) / len(patterns)
 
     return metrics
 
@@ -1120,6 +1247,7 @@ def save_checkpoint(
     args,
     stats: Dict[str, List[float]],
     wandb_run_id: Optional[str] = None,
+    scaler: Optional[Any] = None,
 ) -> None:
     model_to_save = model.module if isinstance(model, DistributedDataParallel) else model
     ckpt = {
@@ -1131,6 +1259,8 @@ def save_checkpoint(
         "stats": stats,
         "wandb_run_id": wandb_run_id,
     }
+    if scaler is not None and scaler.is_enabled():
+        ckpt["scaler"] = scaler.state_dict()
     torch.save(ckpt, path)
 
 
@@ -1334,6 +1464,7 @@ def main():
         architecture=args.model_version,
         use_attention=args.use_attention,
         spatial_only_pooling=args.spatial_only_pooling,
+        uncertainty_aware=args.uncertainty_aware,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -1344,22 +1475,33 @@ def main():
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
+    scaler = torch.cuda.amp.GradScaler(enabled=(args.amp and device.type == "cuda"))
 
     start_epoch = 1
     best_val_mse = float("inf")
     if resume_checkpoint is not None:
         model.load_state_dict(resume_checkpoint["model"])
         optimizer.load_state_dict(resume_checkpoint["optimizer"])
+        if resume_checkpoint.get("scaler"):
+            scaler.load_state_dict(resume_checkpoint["scaler"])
         start_epoch = int(resume_checkpoint["epoch"]) + 1
         best_val_mse = float(resume_checkpoint.get("best_val_mse", float("inf")))
     elif init_checkpoint is not None:
+        # Allow deterministic weights to initialize the extended head. Only
+        # its new parameters retain their initialization; all old keys stay strict.
+        source_state = dict(init_checkpoint["model"])
+        if args.uncertainty_aware and not init_checkpoint.get("args", {}).get(
+            "uncertainty_aware", False
+        ):
+            for key, value in model.state_dict().items():
+                if key.startswith("variance_out."):
+                    source_state[key] = value
         source_uses_attention = bool(
             init_checkpoint.get("args", {}).get("use_attention", False)
         )
         if source_uses_attention == args.use_attention:
-            model.load_state_dict(init_checkpoint["model"])
+            model.load_state_dict(source_state)
         else:
-            source_state = init_checkpoint["model"]
             if args.use_attention:
                 incompatible = model.load_state_dict(source_state, strict=False)
                 invalid_missing = [
@@ -1470,6 +1612,9 @@ def main():
             rank_print(message)
 
     for epoch in range(start_epoch, args.epochs + 1):
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+        epoch_started = time.perf_counter()
         epoch_lr = learning_rate_for_epoch(
             epoch=epoch,
             total_epochs=args.epochs,
@@ -1500,8 +1645,13 @@ def main():
             grad_clip=args.grad_clip,
             epoch_number=epoch,
             epoch_progress=epoch_progress,
+            uncertainty_aware=args.uncertainty_aware,
+            uncertainty_loss_weight=args.uncertainty_loss_weight,
+            scaler=scaler,
+            amp_dtype=getattr(torch, args.amp_dtype),
         )
 
+        validation_started = time.perf_counter()
         val_metrics = validate(
             model=(model.module if isinstance(model, DistributedDataParallel) else model),
             loader=val_loader,
@@ -1514,7 +1664,10 @@ def main():
             density_probe_max=args.density_probe_max,
             amp=args.amp,
             epoch_progress=epoch_progress,
+            uncertainty_aware=args.uncertainty_aware,
+            amp_dtype=getattr(torch, args.amp_dtype),
         )
+        validation_seconds = time.perf_counter() - validation_started
 
         row = {
             "epoch": epoch,
@@ -1557,6 +1710,13 @@ def main():
                 pattern: val_metrics[pattern] for pattern in args.val_patterns
             },
         }
+        row.update({key: train_metrics[key] for key in (
+            "optimizer_steps", "amp_skipped_steps", "amp_scale_start", "amp_scale_end",
+            "beta_sample_counts",
+        )})
+        if args.uncertainty_aware:
+            row["train_uncertainty_mse"] = train_metrics["uncertainty_mse"]
+            row["val_uncertainty_mse"] = val_metrics["mean"]["uncertainty_mse"]
         if is_main_process():
             history.append(row)
 
@@ -1594,10 +1754,6 @@ def main():
             )
         )
 
-        if is_main_process():
-            with open(out_dir / "history.json", "w") as f:
-                json.dump(history, f, indent=2)
-
         if row["val_mse"] < best_val_mse:
             best_val_mse = row["val_mse"]
             if is_main_process():
@@ -1610,6 +1766,7 @@ def main():
                     args=args,
                     stats=stats,
                     wandb_run_id=wandb_run.id if wandb_run is not None else None,
+                    scaler=scaler,
                 )
                 epoch_log(f"Saved best checkpoint: val_mse={best_val_mse:.6f}")
 
@@ -1623,9 +1780,31 @@ def main():
                 args=args,
                 stats=stats,
                 wandb_run_id=wandb_run.id if wandb_run is not None else None,
+                scaler=scaler,
             )
         if distributed_is_initialized():
             dist.barrier()
+
+        performance = torch.tensor([
+            time.perf_counter() - epoch_started, train_metrics["train_seconds"],
+            train_metrics["data_wait_seconds"], validation_seconds,
+            torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else 0,
+            torch.cuda.max_memory_reserved(device) / 2**30 if device.type == "cuda" else 0,
+        ], dtype=torch.float64, device=device)
+        if distributed_is_initialized():
+            dist.all_reduce(performance, op=dist.ReduceOp.MAX)
+        row.update(zip(("epoch_seconds", "train_seconds", "data_wait_seconds",
+                        "validation_seconds", "peak_allocated_gib", "peak_reserved_gib"),
+                       performance.cpu().tolist()))
+        if args.uncertainty_aware:
+            epoch_log(f"  uncertainty MSE: train={row['train_uncertainty_mse']:.6f} "
+                      f"val={row['val_uncertainty_mse']:.6f}")
+        epoch_log(f"  epoch_seconds={row['epoch_seconds']:.2f} "
+                  f"AMP skipped rank-steps={row['amp_skipped_steps']:.0f} "
+                  f"scale={row['amp_scale_start']:g}->{row['amp_scale_end']:g}")
+        if is_main_process():
+            with open(out_dir / "history.json", "w") as f:
+                json.dump(history, f, indent=2)
 
     if epoch_progress is not None:
         epoch_progress.close()

@@ -6,6 +6,7 @@ import math
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
+import torch.nn.functional as F
 
 
 # Five basic mask topologies. Super-resolution, probe arrays, temporal
@@ -1019,6 +1020,32 @@ def make_visible_input(
     mask: torch.Tensor,
 ) -> torch.Tensor:
     return block * mask
+
+
+def make_uncertain_input(
+    block: torch.Tensor,
+    input_variance: torch.Tensor,
+    noise: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Corrupt normalized truth using continuous variance in [0, 1].
+
+    Existing observation masks map to input_variance = 1 - mask. This is
+    for truth-based input generation, never for corrupting reused predictions.
+    """
+    variance = input_variance.clamp(0.0, 1.0)
+    if noise is None:
+        noise = torch.randn_like(block)
+    return (1.0 - variance).sqrt() * block + variance.sqrt() * noise
+
+
+def predicted_error_mse_loss(
+    output_variance: torch.Tensor,
+    pred: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """Smooth L1 regression of detached squared error; retain the legacy name."""
+    squared_error = (pred.detach().float() - target.float()).square()
+    return F.smooth_l1_loss(output_variance.float(), squared_error, beta=1.0, reduction="mean")
 
 
 # ---------------------------------------------------------------------------
