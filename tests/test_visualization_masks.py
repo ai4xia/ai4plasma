@@ -6,12 +6,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from data.masking import _spatial_block_plane, sample_mask  # noqa: E402
+from data.masking import _spatial_block_plane, make_uncertain_input, sample_mask  # noqa: E402
 
 from visualize_mask_patterns_unet3d import (  # noqa: E402
     DEFAULT_MAGNETIC_ABLATION_VISIBLE_FRACTIONS,
@@ -46,6 +47,8 @@ from visualize_mask_patterns_unet3d import (  # noqa: E402
     jy_stats_cache_matches,
     normalize_field_np,
     normalized_residual,
+    plot_density_magnetic_field_by_mask_patterns,
+    predict_masked_fields,
     save_information_suite_error_plot,
     save_plot_cache,
     save_validation_statistics_plot,
@@ -896,4 +899,83 @@ def test_plot_cache_roundtrip_and_signature_mismatch(tmp_path):
     mismatched = dict(signature)
     mismatched["t0"] = 0
     assert try_reuse_plot_cache(cache_path, mismatched, enabled=True) is None
+
+
+@pytest.mark.parametrize("uncertainty", [False, True])
+def test_visualization_inference_preserves_input_semantics(uncertainty):
+    class RecordingModel(torch.nn.Module):
+        uncertainty_aware = uncertainty
+
+        def forward(self, inputs):
+            self.inputs = inputs.clone()
+            prediction = inputs[:, :4] + 0.5
+            return (prediction, torch.full_like(prediction, 2.5)) if uncertainty else prediction
+
+    model = RecordingModel()
+    target = torch.full((1, 4, 2, 4, 3), 2.0)
+    mask = torch.ones_like(target)
+    mask[..., 0] = 0.0
+    mask[..., 1] = 0.75
+    torch.manual_seed(345)
+    noise = torch.randn_like(target)
+    torch.manual_seed(345)
+    before = torch.random.get_rng_state()
+    prediction, variance = predict_masked_fields(model, target, mask)
+    assert model.inputs.shape == (1, 8, 2, 4, 3)
+    assert prediction.shape == target.shape
+    if uncertainty:
+        torch.testing.assert_close(model.inputs[:, :4], make_uncertain_input(target, 1 - mask, noise))
+        torch.testing.assert_close(model.inputs[:, 4:], 1 - mask)
+        assert torch.all(variance == 2.5)  # Output error is never clipped to one.
+    else:
+        torch.testing.assert_close(model.inputs[:, :4], target * mask)
+        torch.testing.assert_close(model.inputs[:, 4:], mask)
+        assert variance is None
+        assert torch.equal(before, torch.random.get_rng_state())
+
+
+@pytest.mark.parametrize("uncertainty", [False, True])
+def test_density_panels_use_standardized_errors_and_preserve_legacy_layout(
+    uncertainty, monkeypatch, tmp_path
+):
+    from matplotlib.figure import Figure
+
+    normalized = np.arange(4 * 2 * 4 * 3, dtype=np.float32).reshape(4, 2, 4, 3) / 100
+    physical = normalized * 3 + 10
+    prediction = normalized + 2
+    extent = [-2, 2, -3, 3]
+    target_ay, _ = compute_ay_jy(physical, extent)
+    prediction_ay, _ = compute_ay_jy(prediction * 3 + 10, extent)
+    row = dict(label="test", mask=np.ones_like(normalized), visible_plot=physical,
+               pred_plot=prediction * 3 + 10, pred_normalized=prediction, pred_ay=prediction_ay)
+    if uncertainty:
+        row["predicted_squared_error_normalized"] = np.full_like(normalized, 12.5)
+    figures = []
+    monkeypatch.setattr(Figure, "savefig", lambda self, *a, **kw: figures.append(self))
+    plot_density_magnetic_field_by_mask_patterns(
+        physical, normalized, target_ay, [row], {"run_name": "held_out", "t0": 0},
+        0, tmp_path / "density.png", extent, "physical", 3, 2, 15, 99, 99, 1.0, 40,
+    )
+    panels = [ax for ax in figures[0].axes if ax.images]
+    assert len(panels) == (5 if uncertainty else 4)
+    np.testing.assert_allclose(panels[3].images[0].get_array(), 4 if uncertainty else 2)
+    if uncertainty:
+        np.testing.assert_allclose(panels[4].images[0].get_array(), 12.5)
+        assert panels[3].images[0].get_clim() == panels[4].images[0].get_clim() == (0, 12.5)
+        assert panels[4].get_title() == "Predicted squared error"
+
+
+def test_single_window_jy_without_training_stats_is_labeled_physical_rmse(tmp_path):
+    target = np.zeros((4, 2, 3, 4))
+    row = dict(name="test", label="test", pred_normalized=target,
+               pred_jy_physical=np.full((2, 3, 4), 3.0))
+    payload = save_information_suite_error_plot(
+        target, np.zeros((2, 3, 4)), [row], np.arange(2),
+        tmp_path / "errors.png", "test", jy_std_train=None,
+    )
+    assert payload["jy_std_train"] is None
+    assert payload["jy_nrmse_definition"] is None
+    assert payload["jy_rmse_ylabel"] == "Jy RMSE (A/m^2)"
+    assert "jy_nrmse" not in payload["rows"][0]
+    np.testing.assert_allclose(payload["rows"][0]["jy_rmse"], 3.0)
 

@@ -30,7 +30,9 @@ from data.masking import (
     full_mse_loss,
     make_visible_input,
     make_uncertain_input,
+    make_rollout_input,
     predicted_error_mse_loss,
+    GAUSSIAN_NLL_VARIANCE_FLOOR,
     parse_pattern_weights,
     sample_independent_batch_masks,
     sample_patterns,
@@ -105,7 +107,12 @@ def parse_args():
 
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--num-workers", type=int, default=4)
-    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--epochs", type=int, default=20,
+                   help="Cosine LR horizon and default final epoch; curriculum can continue at min LR using --stop-after-epochs.")
+    p.add_argument("--stop-after-epochs", type=int, default=None,
+                   help="Stop after this completed epoch without changing --epochs LR horizon; may exceed the horizon in curriculum mode.")
+    p.add_argument("--reference-run-dir", default=None,
+                   help="Reuse channel statistics and verify the run split against this experiment; no weights loaded.")
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument(
         "--warmup-epochs",
@@ -127,9 +134,34 @@ def parse_args():
         help="Use input variance and predict per-element squared reconstruction error.",
     )
     p.add_argument(
-        "--uncertainty-loss-weight", type=float, default=1.0,
-        help="Weight of squared-error prediction MSE (default: 1).",
+        "--uncertainty-loss", choices=("smooth_l1", "gaussian_nll"), default="smooth_l1",
+        help="Variance objective; gaussian_nll enables controlled binary-input Stage-1 checks.",
     )
+    p.add_argument(
+        "--uncertainty-loss-weight", type=float, default=1.0,
+        help="Weight of the selected variance objective (default: 1).",
+    )
+    p.add_argument("--curriculum-training", action="store_true",
+                   help="Opt-in reconstruction / detached variance / two-pass curriculum.")
+    p.add_argument("--variance-ramp-start-epoch", type=float, default=None,
+                   help="Optional legacy scheduled start (completed epochs); omit to leave the ramp unarmed.")
+    p.add_argument("--variance-ramp-epochs", type=float, default=40.0)
+    p.add_argument("--rollout-ramp-start-epoch", type=float, default=None,
+                   help="Optional legacy scheduled start (completed epochs); omit to leave the ramp unarmed.")
+    p.add_argument("--rollout-ramp-epochs", type=float, default=40.0)
+    arm_group = p.add_mutually_exclusive_group()
+    arm_group.add_argument("--arm-variance-ramp", action="store_true",
+                           help="Resume only: arm the unarmed variance ramp at the saved successful update count.")
+    arm_group.add_argument("--arm-rollout-ramp", action="store_true",
+                           help="Resume only: arm rollout after the variance ramp has completed.")
+    p.add_argument("--curriculum-log-every", type=int, default=50,
+                   help="Batch interval for curriculum component logs; lambdas update every successful step.")
+    p.add_argument("--transition-ema-half-life", type=float, default=5.0,
+                   help="Advisory convergence EMA half-life in epochs (MSE: log space; NLL: direct).")
+    p.add_argument("--transition-rate-window", type=int, default=5)
+    p.add_argument("--transition-rate-threshold", type=float, default=0.005,
+                   help="Advisory absolute smoothed relative change per epoch (default: 0.005 = 0.5%); never arms a ramp.")
+    p.add_argument("--transition-patience", type=int, default=4)
     p.add_argument(
         "--channel-mults",
         type=int,
@@ -339,6 +371,40 @@ def parse_args():
 
     if args.epochs <= 0:
         p.error(f"--epochs must be positive, got {args.epochs}")
+    if not math.isfinite(args.transition_ema_half_life) or args.transition_ema_half_life <= 0:
+        p.error("--transition-ema-half-life must be finite and positive")
+    if args.transition_rate_window < 1 or args.transition_patience < 1:
+        p.error("--transition-rate-window and --transition-patience must be positive")
+    if not math.isfinite(args.transition_rate_threshold) or args.transition_rate_threshold < 0:
+        p.error("--transition-rate-threshold must be finite and nonnegative")
+    if args.stop_after_epochs is not None and (args.stop_after_epochs < 1 or
+            (not args.curriculum_training and args.stop_after_epochs > args.epochs)):
+        p.error("--stop-after-epochs must be positive; only curriculum runs may exceed --epochs")
+    if (args.arm_variance_ramp or args.arm_rollout_ramp) and (not args.curriculum_training or not args.auto_resume):
+        p.error("Ramp arming requires --curriculum-training and --auto-resume")
+    if args.uncertainty_loss == "gaussian_nll" and not args.uncertainty_aware:
+        p.error("--uncertainty-loss gaussian_nll requires --uncertainty-aware")
+    if args.uncertainty_loss == "gaussian_nll":
+        args.variance_floor = GAUSSIAN_NLL_VARIANCE_FLOOR
+    if args.curriculum_training:
+        if not args.uncertainty_aware or args.uncertainty_loss != "gaussian_nll":
+            p.error("--curriculum-training requires --uncertainty-aware --uncertainty-loss gaussian_nll")
+        if args.uncertainty_loss_weight != 1.0:
+            p.error("Curriculum variance weighting is controlled by lambda_v; --uncertainty-loss-weight must be 1")
+        for name in ("variance_ramp_start_epoch", "rollout_ramp_start_epoch",
+                     "variance_ramp_epochs", "rollout_ramp_epochs"):
+            value = getattr(args, name)
+            if value is None and name.endswith("start_epoch"):
+                continue
+            if value is None or not math.isfinite(value) or value < 0:
+                p.error(f"--{name.replace('_', '-')} must be finite and nonnegative")
+        if min(args.variance_ramp_epochs, args.rollout_ramp_epochs) <= 0:
+            p.error("Curriculum ramp durations must be positive")
+        if args.rollout_ramp_start_epoch is not None and (args.variance_ramp_start_epoch is None or
+                args.rollout_ramp_start_epoch < args.variance_ramp_start_epoch + args.variance_ramp_epochs):
+            p.error("Rollout ramp must start at or after the variance ramp ends; overlapping ramps are not supported")
+        if args.curriculum_log_every <= 0:
+            p.error("--curriculum-log-every must be positive")
     if not (0 <= args.warmup_epochs < args.epochs):
         p.error(
             "--warmup-epochs must lie in [0, epochs), got "
@@ -493,6 +559,12 @@ def default_run_name(args) -> str:
         key: getattr(args, key)
         for key in RESUME_PARAMETER_KEYS
     }
+    if getattr(args, "uncertainty_loss", "smooth_l1") != "smooth_l1":
+        signature_data["uncertainty_loss"] = args.uncertainty_loss
+    if getattr(args, "curriculum_training", False):
+        signature_data.update({key: getattr(args, key) for key in (
+            "curriculum_training", "variance_ramp_start_epoch", "variance_ramp_epochs",
+            "rollout_ramp_start_epoch", "rollout_ramp_epochs")})
     signature = hashlib.sha1(
         json.dumps(signature_data, sort_keys=True).encode("utf-8")
     ).hexdigest()[:8]
@@ -609,11 +681,13 @@ def validate_resume_parameters(args, checkpoint_args: Dict[str, Any]) -> None:
     # Missing flags in deterministic checkpoints retain the original behavior.
     for key, default in (
         ("uncertainty_aware", False), ("uncertainty_loss_weight", 1.0),
+        ("uncertainty_loss", "smooth_l1"),
         ("amp_dtype", "float16"),
+        ("curriculum_training", False),
     ):
         if key == "amp_dtype" and not getattr(args, "amp", False):
             continue
-        if key == "uncertainty_loss_weight" and not getattr(
+        if key in {"uncertainty_loss_weight", "uncertainty_loss"} and not getattr(
             args, "uncertainty_aware", False
         ):
             continue
@@ -621,6 +695,11 @@ def validate_resume_parameters(args, checkpoint_args: Dict[str, Any]) -> None:
         new_value = getattr(args, key, default)
         if old_value != new_value:
             mismatches.append(f"{key}: checkpoint={old_value!r}, current={new_value!r}")
+    if getattr(args, "curriculum_training", False):
+        for key in ("variance_ramp_start_epoch", "variance_ramp_epochs",
+                    "rollout_ramp_start_epoch", "rollout_ramp_epochs"):
+            if checkpoint_args.get(key) != getattr(args, key):
+                mismatches.append(f"{key}: checkpoint={checkpoint_args.get(key)!r}, current={getattr(args, key)!r}")
     for key in RESUME_PARAMETER_KEYS:
         if key in {"use_attention", "spatial_only_pooling"}:
             # Checkpoints created before either optional architecture extension
@@ -750,6 +829,320 @@ def _apply_training_visible_counts(
         fractions[i] = 1.0 - count / maximum
 
 
+def check_stage1(condition: torch.Tensor, message: str, synchronize: bool = True) -> None:
+    """Stop all training ranks before an invalid optimizer update."""
+    bad = (~condition).to(dtype=torch.int32)
+    if synchronize and distributed_is_initialized():
+        dist.all_reduce(bad, op=dist.ReduceOp.MAX)
+    if bad.item():
+        raise FloatingPointError(message)
+
+
+def cosine_continuation(step: int, start: float, duration: float) -> float:
+    """Smooth continuation at successful-optimizer-update resolution."""
+    u = min(max((step - start) / duration, 0.0), 1.0)
+    return 0.5 * (1.0 - math.cos(math.pi * u))
+
+
+def make_curriculum_state(args, updates_per_epoch: int, checkpoint=None) -> Dict[str, Any]:
+    """Restore immutable ramps, optionally arming one at the saved update count.
+
+    Missing start epochs mean unarmed. Explicit starts and older checkpoints
+    retain the original prescheduled curriculum behavior.
+    """
+    if updates_per_epoch < 1:
+        raise ValueError("Curriculum requires at least one training update per epoch")
+    state = {"updates_per_epoch": updates_per_epoch}
+    for prefix in ("variance", "rollout"):
+        start_epoch = getattr(args, f"{prefix}_ramp_start_epoch", None)
+        state[f"{prefix}_ramp_start_step"] = start_epoch * updates_per_epoch if start_epoch is not None else None
+        state[f"{prefix}_ramp_armed"] = start_epoch is not None
+        state[f"{prefix}_ramp_steps"] = getattr(args, f"{prefix}_ramp_epochs") * updates_per_epoch
+        if not math.isfinite(state[f"{prefix}_ramp_steps"]) or state[f"{prefix}_ramp_steps"] <= 0:
+            raise ValueError("Curriculum ramp durations must be positive")
+    state["successful_optimizer_steps"] = 0
+    if checkpoint is not None:
+        saved = checkpoint.get("curriculum_state")
+        if saved is None:
+            raise ValueError("Curriculum resume requires saved schedule and successful optimizer step")
+        for key in ("updates_per_epoch", "variance_ramp_steps", "rollout_ramp_steps"):
+            if state[key] != saved.get(key):
+                raise ValueError(f"Curriculum resume changed {key}: {saved.get(key)!r} -> {state[key]!r}")
+        count = saved.get("successful_optimizer_steps")
+        if not isinstance(count, int) or count < 0:
+            raise ValueError("Invalid saved curriculum successful optimizer step")
+        state["successful_optimizer_steps"] = count
+        for prefix in ("variance", "rollout"):
+            key = f"{prefix}_ramp_start_step"
+            start = saved.get(key)
+            armed = saved.get(f"{prefix}_ramp_armed", start is not None)
+            if not isinstance(armed, bool) or armed != (start is not None):
+                raise ValueError(f"Invalid saved {prefix} armed/start state")
+            if start is not None and (not math.isfinite(start) or start < 0):
+                raise ValueError(f"Invalid saved {prefix} ramp start")
+            if state[key] is not None and state[key] != start:
+                raise ValueError(f"Curriculum resume changed {key}: {start!r} -> {state[key]!r}")
+            state[key], state[f"{prefix}_ramp_armed"] = start, armed
+
+    # Validate the restored state before accepting any manual transition.
+    if state["rollout_ramp_armed"] and (not state["variance_ramp_armed"] or
+            state["rollout_ramp_start_step"] < state["variance_ramp_start_step"] + state["variance_ramp_steps"]):
+        raise ValueError("Curriculum ramps must not overlap; rollout requires an armed variance ramp")
+    for prefix in ("variance", "rollout"):
+        if not getattr(args, f"arm_{prefix}_ramp", False):
+            continue
+        if checkpoint is None:
+            raise ValueError("Ramp arming requires resuming an existing curriculum checkpoint")
+        if state[f"{prefix}_ramp_armed"]:
+            raise ValueError(f"The {prefix} ramp is already armed; its start is immutable")
+        if prefix == "rollout" and (not state["variance_ramp_armed"] or
+                state["successful_optimizer_steps"] < state["variance_ramp_start_step"] + state["variance_ramp_steps"] or
+                curriculum_weights(state)[0] != 1.0):
+            raise ValueError("Rollout arming requires a fully completed variance ramp (lambda_v == 1)")
+        state[f"{prefix}_ramp_start_step"] = state["successful_optimizer_steps"]
+        state[f"{prefix}_ramp_armed"] = True
+    return state
+
+
+def curriculum_weights(state: Dict[str, Any]) -> Tuple[float, float]:
+    return tuple(cosine_continuation(state["successful_optimizer_steps"],
+                                    state[f"{prefix}_ramp_start_step"], state[f"{prefix}_ramp_steps"])
+                 if state.get(f"{prefix}_ramp_armed", state[f"{prefix}_ramp_start_step"] is not None) else 0.0
+                 for prefix in ("variance", "rollout"))
+
+
+def positive_metric_convergence(
+    history, metric="val_mse", half_life=5.0, window=5, threshold=0.005, patience=4,
+    segment_start_epoch=None,
+):
+    """Reconstruct advisory log-EMA diagnostics; never use with signed NLL.
+
+    Initialize m at the first log-loss in the selected segment. Callers can
+    select a new segment after an LR regime change or a completed lambda ramp.
+    A slope needs K+1 consecutive valid epochs; gaps and invalid values reset it.
+    Readiness burn-in uses elapsed epochs since initialization (first epoch = 0).
+    """
+    if (not math.isfinite(half_life) or half_life <= 0 or window < 1 or patience < 1
+            or not math.isfinite(threshold) or threshold < 0):
+        raise ValueError("Invalid positive-metric convergence settings")
+    alpha = 1.0 - 2.0 ** (-1.0 / half_life)
+    logs, diagnostics = [], []
+    stable_count, previous_epoch = 0, None
+    for index, row in enumerate(history):
+        epoch = row.get("epoch", index + 1)
+        value = row.get(metric)
+        if previous_epoch is not None and epoch != previous_epoch + 1:
+            logs, stable_count = [], 0
+        previous_epoch = epoch
+        ema, rate = None, None
+        if ((segment_start_epoch is not None and epoch < segment_start_epoch)
+                or value is None or not math.isfinite(value) or value <= 0):
+            logs, stable_count = [], 0
+        else:
+            m = math.log(value)
+            if logs:
+                m = alpha * m + (1.0 - alpha) * logs[-1]
+            logs.append(m)
+            ema = math.exp(m)
+            if len(logs) > window:
+                delta = (m - logs[-window - 1]) / window
+                # An extreme finite loss ratio must not stop training via this monitor.
+                try:
+                    rate = math.expm1(delta)
+                except OverflowError:
+                    rate = None
+                stable_count = stable_count + 1 if rate is not None and abs(rate) < threshold else 0
+        segment_age = len(logs) - 1 if logs else None
+        diagnostics.append(dict(epoch=epoch, ema_value=ema, smoothed_rate_per_epoch=rate,
+                                stable_count=stable_count, converged=stable_count >= patience,
+                                segment_age=segment_age, minimum_segment_age=2.0 * half_life,
+                                burn_in_complete=segment_age is not None and segment_age >= 2.0 * half_life))
+    return diagnostics
+
+
+def phase_a_convergence(history, args, curriculum_state):
+    """Advisory only: start fresh in the current contiguous fixed-LR regime."""
+    def at_floor(row):
+        lr = row.get("learning_rate")
+        return bool(row["epoch"] >= args.epochs and lr is not None and math.isfinite(lr)
+                    and math.isclose(lr, args.min_lr, rel_tol=1e-9, abs_tol=0.0))
+
+    segment_start = None
+    for row in history:
+        if not at_floor(row):
+            segment_start = None
+        elif segment_start is None:
+            segment_start = row["epoch"]
+    diagnostics = positive_metric_convergence(
+        history, half_life=getattr(args, "transition_ema_half_life", 5.0),
+        window=getattr(args, "transition_rate_window", 5),
+        threshold=getattr(args, "transition_rate_threshold", 0.005),
+        patience=getattr(args, "transition_patience", 4),
+        segment_start_epoch=segment_start if segment_start is not None else history[-1]["epoch"] + 1)[-1]
+    phase_a = bool(getattr(args, "curriculum_training", False) and curriculum_state is not None
+                   and not curriculum_state.get("variance_ramp_armed", curriculum_state.get("variance_ramp_start_step") is not None)
+                   and not curriculum_state.get("rollout_ramp_armed", curriculum_state.get("rollout_ramp_start_step") is not None)
+                   and curriculum_weights(curriculum_state) == (0.0, 0.0))
+    floor_reached = at_floor(history[-1])
+    diagnostics["ema_val_mse"] = diagnostics.pop("ema_value")
+    diagnostics.update(phase_a=phase_a, lr_floor_reached=floor_reached, segment_start_epoch=segment_start,
+                       ready_for_variance_ramp=phase_a and floor_reached and diagnostics["converged"]
+                       and diagnostics["burn_in_complete"])
+    return diagnostics
+
+
+def nll_metric_convergence(history, half_life=5.0, window=5, segment_start_epoch=None):
+    """Direct signed-NLL EMA; expm1 of its K-epoch slope measures exp(NLL) change."""
+    if not math.isfinite(half_life) or half_life <= 0 or window < 1:
+        raise ValueError("Invalid NLL convergence settings")
+    alpha = 1.0 - 2.0 ** (-1.0 / half_life)
+    values, diagnostics = [], []
+    previous_epoch = None
+    for index, row in enumerate(history):
+        epoch = row.get("epoch", index + 1)
+        if previous_epoch is not None and epoch != previous_epoch + 1:
+            values = []
+        previous_epoch = epoch
+        value = row.get("val_gaussian_nll")
+        ema, rate = None, None
+        if ((segment_start_epoch is not None and epoch < segment_start_epoch)
+                or value is None or not math.isfinite(value)):
+            values = []
+        else:
+            ema = alpha * value + (1.0 - alpha) * values[-1] if values else value
+            values.append(ema)
+            if len(values) > window:
+                try:
+                    rate = math.expm1((ema - values[-window - 1]) / window)
+                except OverflowError:
+                    rate = None
+        age = len(values) - 1 if values else None
+        diagnostics.append(dict(epoch=epoch, ema_value=ema, smoothed_rate_per_epoch=rate,
+                                segment_age=age, burn_in_complete=age is not None and age >= 2.0 * half_life))
+    return diagnostics
+
+
+def phase_b_convergence(history, args, curriculum_state):
+    """Advisory joint stability after variance-ramp completion; never arms rollout."""
+    state = curriculum_state or {}
+    start = state.get("variance_ramp_start_step")
+    duration = state.get("variance_ramp_steps")
+    variance_armed = state.get("variance_ramp_armed", start is not None)
+    rollout_armed = state.get("rollout_ramp_armed", state.get("rollout_ramp_start_step") is not None)
+    completed = bool(variance_armed and start is not None and duration is not None and duration > 0
+                     and state.get("successful_optimizer_steps", -1) >= start + duration)
+    candidate = bool(getattr(args, "curriculum_training", False) and completed and not rollout_armed
+                     and curriculum_weights(state)[1] == 0.0)
+    segment_start = None
+    if candidate:
+        for row in history:
+            count = row.get("curriculum", {}).get("successful_optimizer_steps", -1)
+            if count < start + duration:
+                segment_start = None
+            elif segment_start is None:
+                segment_start = row["epoch"]
+    half_life = getattr(args, "transition_ema_half_life", 5.0)
+    window = getattr(args, "transition_rate_window", 5)
+    threshold = getattr(args, "transition_rate_threshold", 0.005)
+    patience = getattr(args, "transition_patience", 4)
+    cutoff = segment_start if segment_start is not None else history[-1]["epoch"] + 1
+    mse_rows = positive_metric_convergence(history, half_life=half_life, window=window,
+                                          threshold=threshold, patience=patience, segment_start_epoch=cutoff)
+    nll_rows = nll_metric_convergence(history, half_life=half_life, window=window, segment_start_epoch=cutoff)
+    stable_count, previous_epoch = 0, None
+    for mse, nll in zip(mse_rows, nll_rows):
+        if previous_epoch is not None and mse["epoch"] != previous_epoch + 1:
+            stable_count = 0
+        previous_epoch = mse["epoch"]
+        burn_in_complete = mse["burn_in_complete"] and nll["burn_in_complete"]
+        rates = (mse["smoothed_rate_per_epoch"], nll["smoothed_rate_per_epoch"])
+        stable = burn_in_complete and all(rate is not None and math.isfinite(rate) and abs(rate) < threshold for rate in rates)
+        stable_count = stable_count + 1 if stable else 0
+    ages = (mse["segment_age"], nll["segment_age"])
+    phase_b = candidate and segment_start is not None
+    return dict(epoch=history[-1]["epoch"], phase_b=phase_b, variance_ramp_complete=completed,
+                segment_start_epoch=segment_start, ema_val_mse=mse["ema_value"], ema_val_nll=nll["ema_value"],
+                mse_rate_per_epoch=rates[0], nll_rate_per_epoch=rates[1], stable_count=stable_count,
+                segment_age=min(ages) if all(age is not None for age in ages) else None,
+                minimum_segment_age=2.0 * half_life, burn_in_complete=burn_in_complete,
+                ready_for_rollout_ramp=phase_b and burn_in_complete and stable_count >= patience)
+
+
+def sample_training_mask(y, pattern_weights, density_p_zero, density_p_full,
+                         magnetic_p_zero, magnetic_p_full):
+    """Shared existing mask sampling for the ordinary pass and rollout pass."""
+    batch_size, _, time_steps, nx, nz = y.shape
+    spatial_sites = nx * nz
+    magnetic_patterns = sample_patterns(pattern_weights, batch_size)
+    density_patterns = sample_patterns(pattern_weights, batch_size)
+    magnetic_fractions = torch.rand(batch_size).tolist()
+    density_fractions = torch.rand(batch_size).tolist()
+    density_counts = sample_training_severity_counts(
+        density_patterns, spatial_sites=spatial_sites, time_steps=time_steps,
+        p_zero=density_p_zero, p_full=density_p_full)
+    magnetic_counts = sample_training_severity_counts(
+        magnetic_patterns, spatial_sites=spatial_sites, time_steps=time_steps,
+        p_zero=magnetic_p_zero, p_full=magnetic_p_full)
+    for patterns, counts, fractions, modality in (
+        (density_patterns, density_counts, density_fractions, "Density"),
+        (magnetic_patterns, magnetic_counts, magnetic_fractions, "magnetic"),
+    ):
+        _apply_training_visible_counts(patterns, counts, fractions,
+                                       spatial_sites=spatial_sites, time_steps=time_steps, modality=modality)
+    mask, infos = sample_independent_batch_masks(
+        y.shape, magnetic_patterns=magnetic_patterns, density_patterns=density_patterns,
+        magnetic_mask_fractions=magnetic_fractions, density_mask_fractions=density_fractions,
+        device=y.device, dtype=y.dtype, density_probe_counts=density_counts,
+        magnetic_visible_counts=magnetic_counts)
+    return (mask, infos, magnetic_patterns, density_patterns, magnetic_fractions,
+            density_fractions, magnetic_counts, density_counts)
+
+
+def curriculum_forward_loss(model, model_input, target, mask, lambda_v, lambda_r, reuse_mask=None):
+    """One/two passes with the original balanced reconstruction MSE and FP32 NLL."""
+    pred, variance = model(model_input, detach_variance_features=True)
+    mu_loss = full_mse_loss(pred, target, mask)
+    var_loss = (predicted_error_mse_loss(variance, pred, target, "gaussian_nll")
+                if lambda_v > 0 else mu_loss.new_zeros(()))
+    check_stage1(torch.isfinite(pred).all() & torch.isfinite(variance).all() & (variance > 0).all()
+                 & torch.isfinite(mu_loss) & (mu_loss <= 100) & torch.isfinite(var_loss),
+                 "Invalid curriculum first-pass prediction/variance/loss or catastrophic reconstruction MSE (>100)")
+    loss = mu_loss + lambda_v * var_loss
+    components = {"L_mu_1": mu_loss, "L_var_1": var_loss, "forwards": 1}
+    if lambda_r > 0:
+        if reuse_mask is None:
+            raise ValueError("Positive rollout weight requires a new mask")
+        second_input, exact_mask = make_rollout_input(target, pred, variance, mask, reuse_mask)
+        pred2, variance2 = model(second_input, detach_variance_features=True)
+        mu_loss2 = full_mse_loss(pred2, target, exact_mask)
+        var_loss2 = predicted_error_mse_loss(variance2, pred2, target, "gaussian_nll")
+        check_stage1(torch.isfinite(pred2).all() & torch.isfinite(variance2).all() & (variance2 > 0).all()
+                     & torch.isfinite(mu_loss2) & (mu_loss2 <= 100) & torch.isfinite(var_loss2),
+                     "Invalid curriculum second-pass prediction/variance/loss or catastrophic reconstruction MSE (>100)")
+        loss = loss + lambda_r * (mu_loss2 + lambda_v * var_loss2)
+        components.update(L_mu_2=mu_loss2, L_var_2=var_loss2, forwards=2)
+    components["total_loss"] = loss
+    return loss, pred, variance, components
+
+
+def variance_statistics(totals, samples):
+    """Exact streaming means/fractions; quantiles from 64 fixed sites/window/mask."""
+    quantiles = np.quantile(samples, [0.5, 0.9, 0.99], axis=1)
+    result = {}
+    for i, channel in enumerate(("Bx", "By", "Bz", "Density")):
+        count = totals[i, 1]
+        result[channel] = dict(
+            count=int(count), mean=float(totals[i, 0] / count),
+            median=float(quantiles[0, i]), p90=float(quantiles[1, i]), p99=float(quantiles[2, i]),
+            fraction_near_floor=float(totals[i, 2] / count),
+            fraction_gt_one=float(totals[i, 3] / count),
+            near_floor_threshold=10 * GAUSSIAN_NLL_VARIANCE_FLOOR,
+            quantile_sample_count=int(samples.shape[1]),
+            quantile_method="approximate: up to 64 evenly spaced voxels per window and mask",
+        )
+    return result
+
+
 def train_one_epoch(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -771,8 +1164,13 @@ def train_one_epoch(
     uncertainty_loss_weight: float = 1.0,
     scaler: Optional[Any] = None,
     amp_dtype: torch.dtype = torch.float16,
+    uncertainty_loss: str = "smooth_l1",
+    curriculum_state: Optional[Dict[str, Any]] = None,
+    curriculum_log_every: int = 50,
 ) -> Dict[str, Any]:
     model.train()
+    stage1 = uncertainty_aware and uncertainty_loss == "gaussian_nll"
+    uncertainty_key = "gaussian_nll" if stage1 else "uncertainty_mse"
 
     n_patterns = len(MASK_PATTERNS)
 
@@ -798,7 +1196,7 @@ def train_one_epoch(
     spatial_sites = 0
 
     if scaler is None:
-        scaler = torch.cuda.amp.GradScaler(enabled=(amp and device.type == "cuda"))
+        scaler = torch.cuda.amp.GradScaler(enabled=(amp and device.type == "cuda" and amp_dtype == torch.float16))
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -808,6 +1206,11 @@ def train_one_epoch(
     applied_steps = 0
     beta_sample_counts = {}
     scale_start = scaler.get_scale()
+    gradient_norm_sum = torch.zeros((), device=device, dtype=torch.float64)
+    gradient_norm_max = torch.zeros_like(gradient_norm_sum)
+    curriculum_totals = (torch.zeros(8, device=device, dtype=torch.float64)
+                         if curriculum_state is not None else None)
+    lambda_start = lambda_end = None
 
     def count_optimizer_step(_optimizer, _args, _kwargs):
         nonlocal applied_steps
@@ -829,24 +1232,10 @@ def train_one_epoch(
         time_steps = int(y.shape[-3])
         spatial_sites = int(y.shape[-2] * y.shape[-1])
 
-        magnetic_patterns = sample_patterns(pattern_weights, batch_size)
-        density_patterns = sample_patterns(pattern_weights, batch_size)
-        magnetic_fractions = torch.rand(batch_size).tolist()
-        density_fractions = torch.rand(batch_size).tolist()
-        density_visible_counts = sample_training_severity_counts(
-            density_patterns,
-            spatial_sites=spatial_sites,
-            time_steps=time_steps,
-            p_zero=density_visible_p_zero,
-            p_full=density_visible_p_full,
-        )
-        magnetic_visible_counts = sample_training_severity_counts(
-            magnetic_patterns,
-            spatial_sites=spatial_sites,
-            time_steps=time_steps,
-            p_zero=magnetic_visible_p_zero,
-            p_full=magnetic_visible_p_full,
-        )
+        (mask, mask_infos, magnetic_patterns, density_patterns, magnetic_fractions,
+         density_fractions, magnetic_visible_counts, density_visible_counts) = sample_training_mask(
+            y, pattern_weights, density_visible_p_zero, density_visible_p_full,
+            magnetic_visible_p_zero, magnetic_visible_p_full)
         for pattern, count in zip(density_patterns, density_visible_counts):
             if pattern not in PROBE_COUNT_PATTERNS:
                 continue
@@ -861,37 +1250,11 @@ def train_one_epoch(
             magnetic_sample_count += 1
             magnetic_zero_sample_count += int(count == 0)
             magnetic_full_sample_count += int(count == spatial_sites)
-        _apply_training_visible_counts(
-            density_patterns,
-            density_visible_counts,
-            density_fractions,
-            spatial_sites=spatial_sites,
-            time_steps=time_steps,
-            modality="Density",
-        )
-        _apply_training_visible_counts(
-            magnetic_patterns,
-            magnetic_visible_counts,
-            magnetic_fractions,
-            spatial_sites=spatial_sites,
-            time_steps=time_steps,
-            modality="magnetic",
-        )
-
-        mask, mask_infos = sample_independent_batch_masks(
-            y.shape,
-            magnetic_patterns=magnetic_patterns,
-            density_patterns=density_patterns,
-            magnetic_mask_fractions=magnetic_fractions,
-            density_mask_fractions=density_fractions,
-            device=device,
-            dtype=y.dtype,
-            density_probe_counts=density_visible_counts,
-            magnetic_visible_counts=magnetic_visible_counts,
-        )
-
         if uncertainty_aware:
             input_variance = 1.0 - mask
+            if stage1:
+                check_stage1(((input_variance == 0) | (input_variance == 1)).all(),
+                             f"Nonbinary input variance: epoch {epoch_number}, batch {step + 1}")
             model_input = torch.cat(
                 [make_uncertain_input(y, input_variance), input_variance], dim=1
             )
@@ -900,27 +1263,88 @@ def train_one_epoch(
             model_input = torch.cat([x_visible, mask], dim=1)  # (B, 8, T, X, Z)
 
         optimizer.zero_grad(set_to_none=True)
+        if stage1:
+            check_stage1(torch.isfinite(model_input).all() & torch.isfinite(y).all(),
+                         f"Nonfinite input/target: epoch {epoch_number}, batch {step + 1}")
+
+        if curriculum_state is not None:
+            lambda_v, lambda_r = curriculum_weights(curriculum_state)
+            lambda_start = lambda_start or (lambda_v, lambda_r)
+            lambda_end = (lambda_v, lambda_r)
+            # Do not even sample a rollout mask until the second pass is active.
+            reuse_mask = (sample_training_mask(
+                y, pattern_weights, density_visible_p_zero, density_visible_p_full,
+                magnetic_visible_p_zero, magnetic_visible_p_full)[0] if lambda_r > 0 else None)
 
         with torch.cuda.amp.autocast(enabled=(amp and device.type == "cuda"), dtype=amp_dtype):
-            pred = model(model_input)
-            if uncertainty_aware:
-                pred, output_variance = pred
-            reconstruction_loss = full_mse_loss(pred, y, mask)
-            loss = reconstruction_loss
-            if uncertainty_aware:
-                uncertainty_loss = predicted_error_mse_loss(
-                    output_variance, pred, y
-                )
-                loss = loss + uncertainty_loss_weight * uncertainty_loss
+            if curriculum_state is not None:
+                loss, pred, output_variance, components = curriculum_forward_loss(
+                    model, model_input, y, mask, lambda_v, lambda_r, reuse_mask)
+                reconstruction_loss, variance_loss = components["L_mu_1"], components["L_var_1"]
+            else:
+                pred = model(model_input)
+                if uncertainty_aware:
+                    pred, output_variance = pred
+                reconstruction_loss = full_mse_loss(pred, y, mask)
+                loss = reconstruction_loss
+                if uncertainty_aware:
+                    variance_loss = predicted_error_mse_loss(
+                        output_variance, pred, y, objective=uncertainty_loss
+                    ) if stage1 else predicted_error_mse_loss(output_variance, pred, y)
+                    loss = loss + uncertainty_loss_weight * variance_loss
+
+        if stage1:
+            check_stage1(torch.isfinite(pred).all() & torch.isfinite(output_variance).all()
+                         & (output_variance > 0).all() & torch.isfinite(loss)
+                         & torch.isfinite(reconstruction_loss) & torch.isfinite(variance_loss)
+                         & (reconstruction_loss <= 100),
+                         f"Invalid prediction/variance/loss or catastrophic reconstruction MSE (>100): "
+                         f"epoch {epoch_number}, batch {step + 1}, metadata={batch.get('metadata')}")
 
         scaler.scale(loss).backward()
 
-        if grad_clip is not None and grad_clip > 0:
+        if stage1 or (grad_clip is not None and grad_clip > 0):
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            gradient_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), grad_clip if grad_clip and grad_clip > 0 else float("inf"))
+            if stage1:
+                check_stage1(torch.isfinite(gradient_norm),
+                             f"Nonfinite synchronized preclip gradient norm: epoch {epoch_number}, batch {step + 1}")
+                gradient_norm_sum += gradient_norm.detach().double()
+                gradient_norm_max = torch.maximum(gradient_norm_max, gradient_norm.detach().double())
 
+        applied_before = applied_steps
         scaler.step(optimizer)
         scaler.update()
+
+        if curriculum_state is not None:
+            applied = applied_steps - applied_before
+            if distributed_is_initialized():
+                bounds = torch.tensor([applied, -applied], device=device)
+                dist.all_reduce(bounds, op=dist.ReduceOp.MAX)
+                if bounds[0].item() != -bounds[1].item():
+                    raise RuntimeError("Curriculum optimizer updates disagree across ranks; stopping")
+            coordinate = curriculum_state["successful_optimizer_steps"]
+            curriculum_state["successful_optimizer_steps"] += applied
+            with torch.no_grad():
+                curriculum_totals += torch.stack([
+                    components["L_mu_1"], components["L_var_1"],
+                    components.get("L_mu_2", loss.new_zeros(())),
+                    components.get("L_var_2", loss.new_zeros(())), loss,
+                    loss.new_tensor(lambda_v), loss.new_tensor(lambda_r),
+                    loss.new_tensor(components["forwards"] == 2),
+                ]).detach().double()
+            if step % curriculum_log_every == 0 or step + 1 == len(loader):
+                region = "A" if lambda_v == 0 else ("B" if lambda_r == 0 else "C")
+                message = (f"Curriculum {region}: successful_step={coordinate} "
+                           f"next_successful_step={curriculum_state['successful_optimizer_steps']} "
+                           f"lambda_v={lambda_v:.9g} lambda_r={lambda_r:.9g} "
+                           f"forwards={components['forwards']} applied={applied} "
+                           + " ".join(f"{k}={float(v.detach()):.8g}" for k, v in components.items() if k != "forwards"))
+                if epoch_progress is not None:
+                    epoch_progress.write(message)
+                else:
+                    rank_print(message)
 
         with torch.no_grad():
             magnetic_pattern_ids = torch.tensor(
@@ -939,7 +1363,7 @@ def train_one_epoch(
 
             sum_mse += reconstruction_loss.detach().float()
             if uncertainty_aware:
-                sum_uncertainty_mse += uncertainty_loss.detach().float()
+                sum_uncertainty_mse += variance_loss.detach().float()
 
         # temporal_block samples two boundaries directly, so its requested
         # random fraction is intentionally ignored; use the realized fraction
@@ -1061,7 +1485,24 @@ def train_one_epoch(
         "data_wait_seconds": data_wait_seconds,
     }
     if uncertainty_aware:
-        metrics["uncertainty_mse"] = global_uncertainty_mse / max(global_batches, 1)
+        metrics[uncertainty_key] = global_uncertainty_mse / max(global_batches, 1)
+    if curriculum_state is not None:
+        if distributed_is_initialized():
+            dist.all_reduce(curriculum_totals, op=dist.ReduceOp.SUM)
+        names = ("L_mu_1", "L_var_1", "L_mu_2", "L_var_2", "total_loss",
+                 "lambda_v_mean", "lambda_r_mean", "two_forward_fraction")
+        metrics["curriculum"] = dict(zip(names, (curriculum_totals / max(global_batches, 1)).cpu().tolist()))
+        metrics["curriculum"].update(lambda_v_start=lambda_start[0], lambda_r_start=lambda_start[1],
+                                     lambda_v_end=lambda_end[0], lambda_r_end=lambda_end[1],
+                                     successful_optimizer_steps=curriculum_state["successful_optimizer_steps"])
+    if stage1:
+        if distributed_is_initialized():
+            dist.all_reduce(gradient_norm_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(gradient_norm_max, op=dist.ReduceOp.MAX)
+        metrics.update(gradient_norm_mean=float(gradient_norm_sum.cpu()) / max(global_batches, 1),
+                       gradient_norm_max=float(gradient_norm_max.cpu()),
+                       binary_input_variance_verified=True, nonfinite_events=0,
+                       optimizer_updates=global_applied_steps / (dist.get_world_size() if distributed_is_initialized() else 1))
     if distributed_is_initialized():
         rank_counts = [None] * dist.get_world_size()
         dist.all_gather_object(rank_counts, beta_sample_counts)
@@ -1099,6 +1540,7 @@ def validate(
     epoch_progress: Optional[Any] = None,
     uncertainty_aware: bool = False,
     amp_dtype: torch.dtype = torch.float16,
+    uncertainty_loss: str = "smooth_l1",
 ) -> Dict[str, Dict[str, float]]:
     """
     Evaluate every mask pattern on the same validation blocks.
@@ -1109,6 +1551,9 @@ def validate(
     patterns.
     """
     model.eval()
+    stage1 = uncertainty_aware and uncertainty_loss == "gaussian_nll"
+    uncertainty_key = "gaussian_nll" if stage1 else "uncertainty_mse"
+    beta_details = {}
     _ = (mask_seed, density_probe_min, density_probe_max)
 
     sums = torch.zeros(len(patterns), device=device)
@@ -1134,6 +1579,9 @@ def validate(
 
             if uncertainty_aware:
                 input_variance = 1.0 - mask
+                if stage1:
+                    check_stage1(((input_variance == 0) | (input_variance == 1)).all(),
+                                 "Nonbinary validation input variance", synchronize=False)
                 model_input = torch.cat(
                     [make_uncertain_input(y, input_variance), input_variance], dim=1
                 )
@@ -1146,12 +1594,42 @@ def validate(
                     pred, output_variance = pred
                 loss_mse = full_mse_loss(pred, y, mask)
                 if uncertainty_aware:
-                    uncertainty_loss = predicted_error_mse_loss(output_variance, pred, y)
+                    variance_loss = (predicted_error_mse_loss(output_variance, pred, y, objective=uncertainty_loss)
+                                     if stage1 else predicted_error_mse_loss(output_variance, pred, y))
+
+            if stage1:
+                # Validation shards have unequal lengths: no per-batch collectives.
+                check_stage1(torch.isfinite(model_input).all() & torch.isfinite(y).all()
+                             & torch.isfinite(pred).all() & torch.isfinite(output_variance).all()
+                             & (output_variance > 0).all() & torch.isfinite(variance_loss)
+                             & torch.isfinite(loss_mse) & (loss_mse <= 100),
+                             f"Invalid validation values or catastrophic reconstruction MSE (>100): {batch.get('metadata')}",
+                             synchronize=False)
+                betas = batch.get("metadata", {}).get("beta", ["all"] * batch_size)
+                names = [str(float(b)) if b != "all" else "all" for b in betas]
+                for beta in sorted(set(names)):
+                    keep = torch.tensor([name == beta for name in names], device=device)
+                    v = output_variance[keep].detach().float()
+                    detail = beta_details.setdefault(beta, dict(
+                        totals=torch.zeros(4, 4, device=device, dtype=torch.float64), samples=[],
+                        reconstruction=torch.zeros(len(patterns), device=device, dtype=torch.float64),
+                        counts=torch.zeros(len(patterns), device=device, dtype=torch.float64)))
+                    n = v.shape[0]
+                    detail["reconstruction"][i] += full_mse_loss(pred[keep], y[keep], mask[keep]).double() * n
+                    detail["counts"][i] += n
+                    axes = (0, 2, 3, 4)
+                    detail["totals"][:, 0] += v.sum(axes, dtype=torch.float64)
+                    detail["totals"][:, 1] += v[:, 0].numel()
+                    detail["totals"][:, 2] += (v <= 10 * GAUSSIAN_NLL_VARIANCE_FLOOR).sum(axes)
+                    detail["totals"][:, 3] += (v > 1).sum(axes)
+                    flat = v.flatten(2)
+                    sites = torch.linspace(0, flat.shape[2] - 1, min(64, flat.shape[2]), device=device).long()
+                    detail["samples"].append(flat[:, :, sites].transpose(0, 1).reshape(4, -1).cpu().numpy())
 
             sums[i] += loss_mse.detach().float() * batch_size
             counts[i] += batch_size
             if uncertainty_aware:
-                uncertainty_sums[i] += uncertainty_loss.detach().float() * batch_size
+                uncertainty_sums[i] += variance_loss.detach().float() * batch_size
 
     if distributed_is_initialized():
         dist.all_reduce(sums, op=dist.ReduceOp.SUM)
@@ -1175,10 +1653,34 @@ def validate(
     if uncertainty_aware:
         uncertainty_sums = uncertainty_sums.cpu()
         for i, pattern in enumerate(patterns):
-            metrics[pattern]["uncertainty_mse"] = float(uncertainty_sums[i] / counts[i])
-        metrics["mean"]["uncertainty_mse"] = sum(
-            metrics[p]["uncertainty_mse"] for p in patterns
+            metrics[pattern][uncertainty_key] = float(uncertainty_sums[i] / counts[i])
+        metrics["mean"][uncertainty_key] = sum(
+            metrics[p][uncertainty_key] for p in patterns
         ) / len(patterns)
+
+    if stage1:
+        local = {beta: {key: (np.concatenate(value, axis=1) if key == "samples" else value.cpu().numpy())
+                        for key, value in detail.items()} for beta, detail in beta_details.items()}
+        gathered = [local]
+        if distributed_is_initialized():
+            gathered = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered, local)
+        combined = {}
+        for shard in gathered:
+            for beta, detail in shard.items():
+                if beta not in combined:
+                    combined[beta] = detail
+                else:
+                    for key in detail:
+                        combined[beta][key] = (np.concatenate([combined[beta][key], detail[key]], axis=1)
+                                               if key == "samples" else combined[beta][key] + detail[key])
+        metrics["per_beta"] = {
+            beta: dict(mse=float(np.mean(detail["reconstruction"] / detail["counts"])),
+                       variance=variance_statistics(detail["totals"], detail["samples"]))
+            for beta, detail in combined.items() if beta != "all"}
+        metrics["variance_statistics"] = variance_statistics(
+            sum(d["totals"] for d in combined.values()),
+            np.concatenate([d["samples"] for d in combined.values()], axis=1))
 
     return metrics
 
@@ -1234,6 +1736,20 @@ def build_epoch_wandb_log(
 
     for pattern in val_patterns:
         log_data[f"val/{pattern}/mse"] = val_metrics[pattern]["mse"]
+    if "train_gaussian_nll" in row:
+        log_data["train/gaussian_nll"] = row["train_gaussian_nll"]
+        log_data["val/gaussian_nll"] = row["val_gaussian_nll"]
+    elif "train_uncertainty_mse" in row:
+        log_data["train/uncertainty_smooth_l1"] = row["train_uncertainty_mse"]
+        log_data["val/uncertainty_smooth_l1"] = row["val_uncertainty_mse"]
+    if "curriculum" in row:
+        log_data.update({f"curriculum/{key}": value for key, value in row["curriculum"].items()})
+    if "phase_convergence" in row:
+        log_data.update({f"phase_convergence/{key}": value for key, value in row["phase_convergence"].items()
+                         if value is not None})
+    if "phase_b_convergence" in row:
+        log_data.update({f"phase_b_convergence/{key}": value for key, value in row["phase_b_convergence"].items()
+                         if value is not None})
 
     return log_data
 
@@ -1248,6 +1764,7 @@ def save_checkpoint(
     stats: Dict[str, List[float]],
     wandb_run_id: Optional[str] = None,
     scaler: Optional[Any] = None,
+    curriculum_state: Optional[Dict[str, Any]] = None,
 ) -> None:
     model_to_save = model.module if isinstance(model, DistributedDataParallel) else model
     ckpt = {
@@ -1261,6 +1778,12 @@ def save_checkpoint(
     }
     if scaler is not None and scaler.is_enabled():
         ckpt["scaler"] = scaler.state_dict()
+    if curriculum_state is not None:
+        ckpt["curriculum_state"] = dict(curriculum_state)
+        ckpt["curriculum_state"].update(zip(("lambda_v", "lambda_r"), curriculum_weights(curriculum_state)))
+        ckpt["lr_schedule"] = dict(horizon_epochs=args.epochs, warmup_epochs=args.warmup_epochs,
+                                   base_lr=args.lr, min_lr=args.min_lr,
+                                   current_lr=[group["lr"] for group in optimizer.param_groups])
     torch.save(ckpt, path)
 
 
@@ -1271,6 +1794,8 @@ def main():
 
     automatic_out_dir = Path("runs") / default_run_name(args)
     out_dir = expand_path(args.out_dir or str(automatic_out_dir))
+    if (args.arm_variance_ramp or args.arm_rollout_ramp) and not (out_dir / "latest.pt").is_file():
+        raise ValueError("Ramp arming requires an existing out-dir/latest.pt curriculum checkpoint")
     if is_main_process():
         out_dir.mkdir(parents=True, exist_ok=True)
     if distributed_is_initialized():
@@ -1302,6 +1827,14 @@ def main():
     )
     rank_print("Mask pattern weights:", args.mask_pattern_weights)
     rank_print("Validation mask patterns:", args.val_patterns)
+    if args.uncertainty_aware:
+        rank_print("Uncertainty objective:", args.uncertainty_loss)
+        if args.uncertainty_loss == "gaussian_nll":
+            input_label = "Curriculum first pass" if args.curriculum_training else "Stage-1"
+            rank_print(f"{input_label}: binary input variance checked every batch; FP32 NLL floor={GAUSSIAN_NLL_VARIANCE_FLOOR:g}; no upper cap")
+    if args.curriculum_training:
+        rank_print("Curriculum: binary first pass; detached variance features; direct, unclipped rollout reuse; "
+                   "no calibration scale. Validation retains the standard single-pass benchmark.")
     rank_print(
         f"Distributed: world_size={world_size}, rank={rank}, "
         f"local_rank={local_rank}, device={device}"
@@ -1325,6 +1858,13 @@ def main():
         val_frac=args.val_frac,
         seed=args.seed,
     )
+    reference_dir = expand_path(args.reference_run_dir) if args.reference_run_dir else None
+    if reference_dir is not None:
+        reference_split = json.loads((reference_dir / "split.json").read_text())
+        if (set(train_runs) != set(reference_split["train_runs"])
+                or set(val_runs) != set(reference_split["val_runs"])):
+            raise ValueError("Run split differs from the reference experiment; refusing comparison.")
+        rank_print("Verified identical run split against", reference_dir)
 
     rank_print("Total windows:", len(dataset))
     rank_print("Train windows:", len(train_idx))
@@ -1423,6 +1963,11 @@ def main():
     if state_checkpoint is not None and "stats" in state_checkpoint:
         stats = state_checkpoint["stats"]
         rank_print("Reusing channel statistics from checkpoint")
+        if reference_dir is not None and stats != json.loads((reference_dir / "stats.json").read_text()):
+            raise ValueError("Checkpoint channel statistics differ from the reference experiment.")
+    elif reference_dir is not None:
+        stats = json.loads((reference_dir / "stats.json").read_text())
+        rank_print("Reusing reference channel statistics; model starts from random initialization")
     else:
         stats = None
         if is_main_process():
@@ -1475,10 +2020,14 @@ def main():
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.amp and device.type == "cuda"))
+    scaler = torch.cuda.amp.GradScaler(enabled=(args.amp and device.type == "cuda" and args.amp_dtype == "float16"))
 
     start_epoch = 1
     best_val_mse = float("inf")
+    curriculum_state = (make_curriculum_state(args, len(train_loader), resume_checkpoint)
+                        if args.curriculum_training else None)
+    if curriculum_state is not None:
+        rank_print("Curriculum schedule (successful optimizer updates):", curriculum_state)
     if resume_checkpoint is not None:
         model.load_state_dict(resume_checkpoint["model"])
         optimizer.load_state_dict(resume_checkpoint["optimizer"])
@@ -1540,16 +2089,20 @@ def main():
             model,
             device_ids=[local_rank],
             output_device=local_rank,
+            find_unused_parameters=args.curriculum_training,
         )
 
     if is_main_process():
         with open(out_dir / "config.json", "w") as f:
             json.dump(vars(args), f, indent=2)
 
-    if start_epoch > args.epochs:
+    final_epoch = args.stop_after_epochs or args.epochs
+    if (args.arm_variance_ramp or args.arm_rollout_ramp) and start_epoch > final_epoch:
+        raise ValueError("Arming requires --stop-after-epochs beyond the completed checkpoint epoch")
+    if start_epoch > final_epoch:
         rank_print(
             f"Training is already complete at epoch {start_epoch - 1}; "
-            f"requested epochs={args.epochs}. Increase --epochs to continue."
+            f"requested final epoch={final_epoch}. Extend --stop-after-epochs to continue curriculum training."
         )
         if distributed_is_initialized():
             dist.destroy_process_group()
@@ -1594,7 +2147,7 @@ def main():
     epoch_progress = None
     if is_main_process():
         epoch_progress = tqdm(
-            total=float(args.epochs),
+            total=float(final_epoch),
             initial=float(start_epoch - 1),
             desc="Training",
             unit="epoch",
@@ -1611,12 +2164,12 @@ def main():
         else:
             rank_print(message)
 
-    for epoch in range(start_epoch, args.epochs + 1):
+    for epoch in range(start_epoch, final_epoch + 1):
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         epoch_started = time.perf_counter()
         epoch_lr = learning_rate_for_epoch(
-            epoch=epoch,
+            epoch=min(epoch, args.epochs) if args.curriculum_training else epoch,
             total_epochs=args.epochs,
             base_lr=args.lr,
             warmup_epochs=args.warmup_epochs,
@@ -1649,6 +2202,9 @@ def main():
             uncertainty_loss_weight=args.uncertainty_loss_weight,
             scaler=scaler,
             amp_dtype=getattr(torch, args.amp_dtype),
+            uncertainty_loss=args.uncertainty_loss,
+            curriculum_state=curriculum_state,
+            curriculum_log_every=args.curriculum_log_every,
         )
 
         validation_started = time.perf_counter()
@@ -1666,6 +2222,7 @@ def main():
             epoch_progress=epoch_progress,
             uncertainty_aware=args.uncertainty_aware,
             amp_dtype=getattr(torch, args.amp_dtype),
+            uncertainty_loss=args.uncertainty_loss,
         )
         validation_seconds = time.perf_counter() - validation_started
 
@@ -1714,11 +2271,57 @@ def main():
             "optimizer_steps", "amp_skipped_steps", "amp_scale_start", "amp_scale_end",
             "beta_sample_counts",
         )})
+        if curriculum_state is not None:
+            row["curriculum"] = train_metrics["curriculum"]
+            epoch_log("  curriculum (second-pass losses averaged over all batches, inactive = 0): "
+                      + json.dumps(row["curriculum"]))
         if args.uncertainty_aware:
-            row["train_uncertainty_mse"] = train_metrics["uncertainty_mse"]
-            row["val_uncertainty_mse"] = val_metrics["mean"]["uncertainty_mse"]
+            row["uncertainty_objective"] = args.uncertainty_loss
+            key = "gaussian_nll" if args.uncertainty_loss == "gaussian_nll" else "uncertainty_mse"
+            row[f"train_{key}"] = train_metrics[key]
+            row[f"val_{key}"] = val_metrics["mean"][key]
+            if args.uncertainty_loss == "gaussian_nll":
+                row.update({key: train_metrics[key] for key in (
+                    "gradient_norm_mean", "gradient_norm_max", "binary_input_variance_verified",
+                    "nonfinite_events", "optimizer_updates")})
+                row["val_variance_statistics"] = val_metrics["variance_statistics"]
+                row["val_per_beta"] = val_metrics["per_beta"]
         if is_main_process():
             history.append(row)
+            if curriculum_state is not None:
+                diagnostic = phase_a_convergence(history, args, curriculum_state)
+                if diagnostic["phase_a"]:
+                    row["phase_convergence"] = diagnostic
+                    ema = diagnostic["ema_val_mse"]
+                    rate = diagnostic["smoothed_rate_per_epoch"]
+                    ema_text = f"{ema:.8g}" if ema is not None else "n/a"
+                    rate_text = f"{100 * rate:+.3f}%" if rate is not None else "n/a"
+                    epoch_log(f"Phase convergence: ema_val_mse={ema_text} smoothed_rate_per_epoch={rate_text} "
+                              f"threshold={100 * args.transition_rate_threshold:.3f}% "
+                              f"stable_count={diagnostic['stable_count']}/{args.transition_patience} "
+                              f"segment_age={diagnostic['segment_age'] if diagnostic['segment_age'] is not None else 'n/a'}"
+                              f"/{diagnostic['minimum_segment_age']:g} "
+                              f"lr_floor_reached={'yes' if diagnostic['lr_floor_reached'] else 'no'} "
+                              f"ready_for_variance_ramp={'yes' if diagnostic['ready_for_variance_ramp'] else 'no'}")
+                    if diagnostic["ready_for_variance_ramp"]:
+                        epoch_log("READY_FOR_VARIANCE_RAMP=true")
+                else:
+                    diagnostic = phase_b_convergence(history, args, curriculum_state)
+                    if diagnostic["phase_b"]:
+                        row["phase_b_convergence"] = diagnostic
+                        fields = []
+                        for name in ("ema_val_mse", "mse_rate_per_epoch", "ema_val_nll", "nll_rate_per_epoch"):
+                            value = diagnostic[name]
+                            text = (f"{100 * value:+.3f}%" if "rate" in name else f"{value:.8g}") if value is not None else "n/a"
+                            fields.append(f"{name}={text}")
+                        epoch_log("Phase B convergence: " + " ".join(fields)
+                                  + f" threshold={100 * args.transition_rate_threshold:.3f}% "
+                                  f"stable_count={diagnostic['stable_count']}/{args.transition_patience} "
+                                  f"segment_age={diagnostic['segment_age'] if diagnostic['segment_age'] is not None else 'n/a'}"
+                                  f"/{diagnostic['minimum_segment_age']:g} "
+                                  f"ready_for_rollout_ramp={'yes' if diagnostic['ready_for_rollout_ramp'] else 'no'}")
+                        if diagnostic["ready_for_rollout_ramp"]:
+                            epoch_log("READY_FOR_ROLLOUT_RAMP=true")
 
         if wandb_run is not None:
             wandb_run.log(
@@ -1731,7 +2334,7 @@ def main():
             )
 
         epoch_log(
-            f"Epoch {epoch}/{args.epochs}  lr={epoch_lr:.8g}  "
+            f"Epoch {epoch}/{final_epoch if args.curriculum_training else args.epochs}  lr={epoch_lr:.8g}  "
             f"train_mse={row['train_mse']:.6f} "
             f"val_mse={row['val_mse']:.6f} "
             f"density_probes="
@@ -1767,6 +2370,7 @@ def main():
                     stats=stats,
                     wandb_run_id=wandb_run.id if wandb_run is not None else None,
                     scaler=scaler,
+                    curriculum_state=curriculum_state,
                 )
                 epoch_log(f"Saved best checkpoint: val_mse={best_val_mse:.6f}")
 
@@ -1781,6 +2385,7 @@ def main():
                 stats=stats,
                 wandb_run_id=wandb_run.id if wandb_run is not None else None,
                 scaler=scaler,
+                curriculum_state=curriculum_state,
             )
         if distributed_is_initialized():
             dist.barrier()
@@ -1797,8 +2402,13 @@ def main():
                         "validation_seconds", "peak_allocated_gib", "peak_reserved_gib"),
                        performance.cpu().tolist()))
         if args.uncertainty_aware:
-            epoch_log(f"  uncertainty MSE: train={row['train_uncertainty_mse']:.6f} "
-                      f"val={row['val_uncertainty_mse']:.6f}")
+            label = "Gaussian NLL" if args.uncertainty_loss == "gaussian_nll" else "uncertainty Smooth L1"
+            epoch_log(f"  {label}: train={row[f'train_{key}']:.6f} val={row[f'val_{key}']:.6f}")
+            if args.uncertainty_loss == "gaussian_nll":
+                epoch_log(f"  synchronized preclip gradient norm: mean={row['gradient_norm_mean']:.6g} "
+                          f"max={row['gradient_norm_max']:.6g}; binary v_in verified; nonfinite_events=0")
+                epoch_log("  validation variance statistics: " + json.dumps(row["val_variance_statistics"]))
+                epoch_log("  validation per beta: " + json.dumps(row["val_per_beta"]))
         epoch_log(f"  epoch_seconds={row['epoch_seconds']:.2f} "
                   f"AMP skipped rank-steps={row['amp_skipped_steps']:.0f} "
                   f"scale={row['amp_scale_start']:g}->{row['amp_scale_end']:g}")
@@ -1808,6 +2418,9 @@ def main():
 
     if epoch_progress is not None:
         epoch_progress.close()
+    if args.stop_after_epochs is not None:
+        rank_print(f"Completed bounded training through epoch {final_epoch}; "
+                   f"LR horizon remains {args.epochs}; no further optimizer updates.")
 
     if wandb_run is not None:
         wandb_run.summary["best_val_mse"] = best_val_mse

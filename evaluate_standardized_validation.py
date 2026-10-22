@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import time
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
@@ -18,7 +19,6 @@ from data.masking import (
     MASKING_VERSION,
     full_mse_loss,
     make_fixed_validation_mask,
-    make_visible_input,
 )
 from data.vpic_hdf5_dataset import VPICWindowDataset
 from models.unet3d import LEGACY_MODEL_VERSION, UNet3D
@@ -36,6 +36,7 @@ from visualize_mask_patterns_unet3d import (
     load_checkpoint,
     load_or_compute_jy_training_stats,
     normalize,
+    predict_masked_fields,
     resolve_checkpoint_path,
 )
 
@@ -63,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Evaluate latest.pt on the five standardized 50% validation masks "
-            "and write a paper numerical table. Does not plot."
+            "and write a paper numerical table, or a bounded density calibration plot."
         )
     )
     parser.add_argument("--run-dir", default=DEFAULT_RUN_DIR)
@@ -78,7 +79,24 @@ def parse_args() -> argparse.Namespace:
         default=[-21.0, 21.0, -50.0, 50.0],
     )
     parser.add_argument("--h5-dir", default=None)
-    return parser.parse_args()
+    parser.add_argument("--density-calibration", action="store_true",
+                        help="Bounded density analysis; automatic for uncertainty-aware checkpoints.")
+    parser.add_argument("--calibration-runs-per-beta", type=int, default=2)
+    parser.add_argument("--calibration-windows-per-run", type=int, default=1)
+    parser.add_argument("--calibration-voxels-per-pattern", type=int, default=2048)
+    parser.add_argument("--calibration-bins", type=int, default=10)
+    parser.add_argument("--calibration-seed", type=int, default=1234)
+    parser.add_argument("--fit-global-scale", action="store_true",
+                        help="Fit one scale on half the selected runs per beta; assess the other half.")
+    args = parser.parse_args()
+    if args.calibration_runs_per_beta < 2 or min(
+        args.calibration_windows_per_run, args.calibration_voxels_per_pattern,
+        args.calibration_bins,
+    ) < 1:
+        parser.error("Calibration needs at least two runs per beta and positive window/voxel/bin limits.")
+    if args.fit_global_scale and args.calibration_runs_per_beta % 2:
+        parser.error("Global scaling requires an even number of selected runs per beta.")
+    return args
 
 
 def json_ready(value):
@@ -385,6 +403,260 @@ def select_val_window_indices(dataset: VPICWindowDataset, val_runs: set[str]) ->
     return indices
 
 
+def select_calibration_indices(dataset, val_runs, betas, runs_per_beta, windows_per_run, seed):
+    """Read only the existing window index; sample independent held-out runs by beta."""
+    grouped = {float(beta): {} for beta in betas}
+    for index, (file_index, run_name, _t0) in enumerate(dataset.samples):
+        beta = float(dataset.file_infos[file_index]["beta_file"])
+        if run_name in val_runs and beta in grouped:
+            grouped[beta].setdefault(run_name, []).append(index)
+    rng = np.random.default_rng(seed)
+    selected = []
+    for beta, runs in sorted(grouped.items()):
+        eligible = sorted(name for name, indices in runs.items() if len(indices) >= windows_per_run)
+        if len(eligible) < runs_per_beta:
+            raise ValueError(f"Beta {beta}: need {runs_per_beta} eligible validation runs, got {len(eligible)}")
+        for name in sorted(rng.choice(eligible, runs_per_beta, replace=False)):
+            selected.extend(sorted(rng.choice(runs[name], windows_per_run, replace=False).tolist()))
+    return selected
+
+
+def split_calibration_runs(dataset, indices, seed):
+    """Assign whole simulations to disjoint, beta-balanced fit/evaluation subsets."""
+    grouped = {}
+    for index in indices:
+        file_index, run_name, _t0 = dataset.samples[index]
+        grouped.setdefault(float(dataset.file_infos[file_index]["beta_file"]), set()).add(run_name)
+    rng = np.random.default_rng(seed)
+    split = dict(seed=seed, by_beta={}, calibration_runs=[], evaluation_runs=[])
+    for beta, names in sorted(grouped.items()):
+        names = np.array(sorted(names))
+        if len(names) < 2 or len(names) % 2:
+            raise ValueError(f"Beta {beta}: global calibration needs an even number of independent runs.")
+        rng.shuffle(names)
+        fit, evaluation = sorted(names[:len(names) // 2].tolist()), sorted(names[len(names) // 2:].tolist())
+        split["by_beta"][str(beta)] = dict(calibration=fit, evaluation=evaluation)
+        split["calibration_runs"].extend(fit)
+        split["evaluation_runs"].extend(evaluation)
+    return split
+
+
+def summarize_density_calibration(predicted, actual, n_bins=10):
+    """Mean calibration and descriptive medians; do not clip or discard extremes."""
+    predicted = np.asarray(predicted, dtype=np.float64).ravel()
+    actual = np.asarray(actual, dtype=np.float64).ravel()
+    if (not predicted.size or predicted.shape != actual.shape
+            or not np.isfinite(predicted).all() or not np.isfinite(actual).all()
+            or (predicted < 0).any() or (actual < 0).any() or n_bins < 1):
+        raise ValueError("Calibration requires matching, finite, nonnegative squared-error arrays.")
+    edges = np.unique(np.quantile(predicted, np.linspace(0, 1, n_bins + 1)))
+    groups = np.searchsorted(edges[1:-1], predicted, side="right")
+    bins = []
+    for group in np.unique(groups):
+        keep = groups == group
+        bins.append(dict(bin=len(bins) + 1, count=int(keep.sum()),
+                         predicted_min=float(predicted[keep].min()),
+                         predicted_max=float(predicted[keep].max()),
+                         mean_predicted=float(predicted[keep].mean()),
+                         mean_actual=float(actual[keep].mean()),
+                         median_actual=float(np.median(actual[keep]))))
+    p_mean, a_mean = float(predicted.mean()), float(actual.mean())
+    tail_threshold = float(np.quantile(actual, 0.99))
+    tail = actual >= tail_threshold
+    upper = bins[-1]
+    return dict(
+        bins=bins, quantile_edges=edges.tolist(), count=int(actual.size),
+        mean_predicted=p_mean, mean_actual=a_mean, median_actual=float(np.median(actual)),
+        mean_bias_predicted_minus_actual=p_mean - a_mean,
+        relative_mean_bias=(p_mean - a_mean) / a_mean if a_mean > 0 else None,
+        increasing_mean_transitions=int(np.sum(np.diff([b["mean_actual"] for b in bins]) > 0)),
+        total_mean_transitions=len(bins) - 1,
+        upper_prediction_bin_actual_over_predicted=(
+            upper["mean_actual"] / upper["mean_predicted"] if upper["mean_predicted"] > 0 else None),
+        actual_error_top_one_percent=dict(
+            threshold=tail_threshold, count=int(tail.sum()),
+            mean_actual=float(actual[tail].mean()), mean_predicted=float(predicted[tail].mean()),
+            fraction_underpredicted=float(np.mean(actual[tail] > predicted[tail])),
+            note="Selection on actual extremes alone is not a test of conditional mean calibration."),
+    )
+
+
+def fit_global_calibration_scale(predicted, actual):
+    """Fit only calibration-run means; a zero predictor cannot fit positive error."""
+    stats = summarize_density_calibration(predicted, actual, 1)
+    if stats["mean_predicted"] == 0:
+        if stats["mean_actual"] == 0:
+            return 1.0
+        raise ValueError("Cannot fit a multiplicative scale: zero predicted mean with positive actual error.")
+    factor = stats["mean_actual"] / stats["mean_predicted"]
+    if not np.isfinite(factor):
+        raise ValueError("Nonfinite global calibration factor.")
+    return factor
+
+
+def mean_calibration_comparison(predicted, actual, factor):
+    p, y = np.asarray(predicted, dtype=float), np.asarray(actual, dtype=float)
+    p_mean, y_mean = float(p.mean()), float(y.mean())
+    calibrated_mean = factor * p_mean
+    return dict(mean_predicted=p_mean, mean_actual=y_mean, median_actual=float(np.median(y)),
+                mean_calibrated_predicted=calibrated_mean,
+                raw_mean_bias=p_mean - y_mean, calibrated_mean_bias=calibrated_mean - y_mean,
+                raw_actual_over_predicted=y_mean / p_mean if p_mean > 0 else None,
+                calibrated_actual_over_predicted=y_mean / calibrated_mean if calibrated_mean > 0 else None)
+
+
+def posthoc_calibration_summary(arrays, run_split, n_bins):
+    fit_names, eval_names = set(run_split["calibration_runs"]), set(run_split["evaluation_runs"])
+    if (not fit_names or not eval_names or fit_names & eval_names
+            or fit_names | eval_names != set(arrays["run_name"])):
+        raise ValueError("Calibration/evaluation runs must be disjoint and cover the selected simulations.")
+    fit = np.isin(arrays["run_name"], list(fit_names))
+    evaluation = np.isin(arrays["run_name"], list(eval_names))
+    # No evaluation errors enter fitting. Raw model predictions remain untouched.
+    factor = fit_global_calibration_scale(
+        arrays["predicted_squared_error"][fit], arrays["actual_squared_error"][fit])
+    p = arrays["predicted_squared_error"][evaluation].astype(float)
+    y = arrays["actual_squared_error"][evaluation].astype(float)
+    summary = summarize_density_calibration(p, y, n_bins)
+    summary.pop("actual_error_top_one_percent")
+    for row in summary["bins"]:
+        row["mean_calibrated_predicted"] = factor * row["mean_predicted"]
+    groups = []
+    for beta in [None, *sorted(np.unique(arrays["beta"]))]:
+        for pattern in [None, *FIXED_VALIDATION_PATTERNS]:
+            if beta is None and pattern is None:
+                continue
+            keep = evaluation.copy()
+            if beta is not None:
+                keep &= arrays["beta"] == beta
+            if pattern is not None:
+                keep &= arrays["pattern"] == pattern
+            if not keep.any():
+                continue
+            groups.append(dict(beta=beta, pattern=pattern,
+                               n_runs=len(np.unique(arrays["run_name"][keep])), n_voxels=int(keep.sum()),
+                               **mean_calibration_comparison(arrays["predicted_squared_error"][keep],
+                                                             arrays["actual_squared_error"][keep], factor)))
+    summary.update(
+        global_scale=factor, scale_formula="mean(actual)/mean(predicted), calibration runs only",
+        summary_scope="Evaluation runs only; bins defined using raw predicted uncertainty",
+        collected_voxel_count=len(fit),
+        calibration=dict(n_runs=len(fit_names), n_voxels=int(fit.sum()),
+                         **mean_calibration_comparison(arrays["predicted_squared_error"][fit],
+                                                       arrays["actual_squared_error"][fit], factor)),
+        evaluation=dict(n_runs=len(eval_names), n_voxels=len(p), **mean_calibration_comparison(p, y, factor)),
+        ranking=dict(positive_scale=factor > 0,
+                     unchanged=bool(factor > 0 and np.array_equal(np.argsort(p, kind="stable"),
+                                                                np.argsort(factor * p, kind="stable"))),
+                     increasing_mean_transitions=summary["increasing_mean_transitions"],
+                     total_mean_transitions=summary["total_mean_transitions"],
+                     top_over_bottom_bin_mean_actual=(summary["bins"][-1]["mean_actual"] /
+                         summary["bins"][0]["mean_actual"] if summary["bins"][0]["mean_actual"] > 0 else None)),
+        groups=groups,
+    )
+    return summary
+
+
+def save_calibration_heatmap(groups, out_dir):
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import TwoSlopeNorm
+
+    betas = sorted({row["beta"] for row in groups if row["beta"] is not None})
+    cells = {(row["beta"], row["pattern"]): row for row in groups
+             if row["beta"] is not None and row["pattern"] is not None}
+    keys = ["raw_actual_over_predicted", "calibrated_actual_over_predicted"]
+    matrices = [np.array([[cells[b, p][key] if cells[b, p][key] is not None else np.nan
+                          for p in FIXED_VALIDATION_PATTERNS] for b in betas]) for key in keys]
+    maximum = max([2.0, *[float(v) for m in matrices for v in m.ravel() if np.isfinite(v)]])
+    norm = TwoSlopeNorm(vmin=0, vcenter=1, vmax=maximum)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6), sharey=True, layout="constrained")
+    for ax, matrix, title in zip(axes, matrices, ["Raw", "Global multiplicative calibration"]):
+        im = ax.imshow(np.ma.masked_invalid(matrix), cmap="coolwarm", norm=norm, aspect="auto")
+        ax.set(xticks=range(5), xticklabels=[p.replace("_", "\n") for p in FIXED_VALIDATION_PATTERNS],
+               yticks=range(len(betas)), yticklabels=[f"{b:g}" for b in betas], title=title, xlabel="Mask pattern")
+        for i, j in np.ndindex(matrix.shape):
+            ax.text(j, i, f"{matrix[i, j]:.2f}" if np.isfinite(matrix[i, j]) else "N/A",
+                    ha="center", va="center", fontsize=9)
+    axes[0].set_ylabel("Plasma beta")
+    fig.colorbar(im, ax=axes, label="Mean actual / mean predicted squared error (1 = agreement)")
+    fig.suptitle("Evaluation simulations only: density mean-error ratios")
+    fig.savefig(out_dir / "density_calibration_heatmap.png", dpi=160)
+    plt.close(fig)
+
+
+def save_density_calibration(samples, records, metadata, out_dir, n_bins, run_split=None):
+    """Save sampled voxels, bin statistics and one reliability diagram in this evaluator."""
+    import matplotlib.pyplot as plt
+
+    arrays = {key: np.concatenate([part[key] for part in samples]) for key in samples[0]}
+    summary = (posthoc_calibration_summary(arrays, run_split, n_bins) if run_split is not None
+               else summarize_density_calibration(
+                   arrays["predicted_squared_error"], arrays["actual_squared_error"], n_bins))
+    if run_split is not None:
+        arrays["subset"] = np.where(np.isin(arrays["run_name"], run_split["calibration_runs"]),
+                                    "calibration", "evaluation")
+        (out_dir / "calibration_run_split.json").write_text(json.dumps(run_split, indent=2))
+        with (out_dir / "density_calibration_groups.csv").open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(summary["groups"][0]))
+            writer.writeheader()
+            writer.writerows(summary["groups"])
+        save_calibration_heatmap(summary["groups"], out_dir)
+    summary.update(metadata)
+    summary["per_run_pattern"] = records
+    summary["units"] = "squared standardized Density units"
+    summary["interpretation"] = (
+        "Only unobserved voxels; equal capped samples per selected window/pattern. "
+        "Voxel errors are correlated within simulations. The median is descriptive; "
+        "y=x tests mean calibration, not median agreement. This pilot cannot establish calibration."
+    )
+    if run_split is not None:
+        summary["interpretation"] += (
+            " Held-out-run post-hoc calibration evaluation, not an independent test set: "
+            "the checkpoint was selected using this validation population. Runs are the independent "
+            "sampling units; no voxel-level uncertainty intervals are reported. Positive scaling "
+            "preserves discrimination but global mean correction does not guarantee conditional "
+            "calibration. "
+        )
+        summary["interpretation"] += (
+            "Gaussian NLL with reconstruction detached targets conditional expected squared residual; "
+            "finite-sample training does not guarantee calibrated variance."
+            if summary.get("uncertainty_objective") == "gaussian_nll" else
+            "Smooth L1 targets a robust conditional location of squared error, "
+            "which need not equal its conditional mean."
+        )
+    np.savez_compressed(out_dir / "density_calibration_voxels.npz", **arrays)
+    (out_dir / "density_calibration.json").write_text(json.dumps(json_ready(summary), indent=2))
+    with (out_dir / "density_calibration_bins.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(summary["bins"][0]))
+        writer.writeheader()
+        writer.writerows(summary["bins"])
+    bins = summary["bins"]
+    means, medians = [b["mean_actual"] for b in bins], [b["median_actual"] for b in bins]
+    keys = ["mean_predicted"] + (["mean_calibrated_predicted"] if run_split is not None else [])
+    limit = max([1e-12, *means, *medians, *[b[key] for key in keys for b in bins]]) * 1.05
+    fig, axes = plt.subplots(1, len(keys), figsize=(7.5 if len(keys) == 1 else 12, 6),
+                             squeeze=False, sharex=True, sharey=True)
+    for ax, key in zip(axes[0], keys):
+        x = [b[key] for b in bins]
+        ax.plot(x, means, "o-", label="Mean actual squared error")
+        ax.plot(x, medians, "s--", label="Median actual squared error (descriptive)")
+        ax.plot([0, limit], [0, limit], "k:", label="y=x: mean calibration")
+        ax.set(xlabel="Mean predicted density squared error (standardized units²)",
+               ylabel="Actual density squared error (standardized units²)",
+               xlim=(0, limit), ylim=(0, limit),
+               title=("Held-out density reliability: unobserved voxels" if run_split is None else
+                      "Raw" if key == "mean_predicted" else f"Scaled: a={summary['global_scale']:.4g}"))
+        ax.grid(alpha=0.25)
+        ax.legend(fontsize=8)
+    if run_split is not None:
+        fig.suptitle("Held-out-run post-hoc evaluation: same raw-uncertainty bins in both panels")
+    fig.tight_layout()
+    fig.savefig(out_dir / "density_calibration.png", dpi=160)
+    plt.close(fig)
+    print(json.dumps({k: v for k, v in summary.items()
+                      if k not in {"bins", "per_run_pattern", "split", "groups"}}, indent=2))
+
+
 @torch.no_grad()
 def evaluate_windows(
     model: torch.nn.Module,
@@ -394,10 +666,14 @@ def evaluate_windows(
     std: torch.Tensor,
     device: torch.device,
     extent: Sequence[float],
-    jy_std_train: float,
+    jy_std_train: float | None,
+    calibration_samples: List[Dict] | None = None,
+    calibration_voxels_per_pattern: int = 2048,
+    calibration_seed: int = 1234,
 ) -> Tuple[List[Dict], List[Dict]]:
     records: List[Dict] = []
     pattern_infos: List[Dict] | None = None
+    rng = np.random.default_rng(calibration_seed)
     model.eval()
     for sample_number, dataset_index in enumerate(sample_indices, start=1):
         sample = dataset[dataset_index]
@@ -412,13 +688,22 @@ def evaluate_windows(
             pattern_infos = infos
         stacked_mask = torch.cat(masks, dim=0)
         stacked_target = target_norm.expand(len(FIXED_VALIDATION_PATTERNS), -1, -1, -1, -1)
-        visible = make_visible_input(stacked_target, stacked_mask)
-        prediction = model(torch.cat([visible, stacked_mask], dim=1)).float()
+        prediction, output_variance = predict_masked_fields(model, stacked_target, stacked_mask)
+        prediction = prediction.float()
         target_np = stacked_target[0].detach().cpu().numpy()
         pred_np = prediction.detach().cpu().numpy()
         target_phys_np = target[0].detach().cpu().numpy()
-        pred_phys_np = denormalize(prediction, mean, std).detach().cpu().numpy()
+        pred_phys_np = (denormalize(prediction, mean, std).detach().cpu().numpy()
+                        if jy_std_train is not None else None)
         metadata = sample["metadata"]
+        if calibration_samples is not None:
+            if output_variance is None:
+                raise ValueError("Density calibration requires an uncertainty-aware checkpoint.")
+            if (not torch.isfinite(prediction).all() or not torch.isfinite(output_variance).all()
+                    or (output_variance < 0).any()):
+                raise ValueError("Nonfinite fields or invalid predicted squared errors; calibration stopped.")
+            predicted_error = output_variance[:, 3].detach().cpu().numpy()
+            actual_error = (prediction[:, 3] - stacked_target[:, 3]).square().detach().cpu().numpy()
         for pattern_index, pattern in enumerate(FIXED_VALIDATION_PATTERNS):
             pred_i = pred_np[pattern_index]
             mask_i = stacked_mask[pattern_index : pattern_index + 1]
@@ -436,12 +721,25 @@ def evaluate_windows(
                         target_phys_np,
                         extent,
                         jy_std_train,
-                    ),
+                    ) if jy_std_train is not None else None,
                     "validate_style_mse": float(
                         full_mse_loss(pred_i_t, target_i, mask_i).detach().cpu()
                     ),
                 }
             )
+            if calibration_samples is not None:
+                observation_mask = mask_i[0, 3].detach().cpu().numpy().ravel()
+                hidden = np.flatnonzero(observation_mask == 0)
+                chosen = rng.choice(hidden, min(len(hidden), calibration_voxels_per_pattern), replace=False)
+                calibration_samples.append(dict(
+                    predicted_squared_error=predicted_error[pattern_index].ravel()[chosen],
+                    actual_squared_error=actual_error[pattern_index].ravel()[chosen],
+                    observed=observation_mask[chosen].astype(bool), voxel_index=chosen,
+                    beta=np.full(len(chosen), float(metadata["beta"])),
+                    pattern=np.full(len(chosen), pattern), run_name=np.full(len(chosen), metadata["run_name"]),
+                    t0=np.full(len(chosen), int(metadata["t0"])),
+                ))
+                records[-1]["beta"] = float(metadata["beta"])
         if (
             sample_number == 1
             or sample_number % 10 == 0
@@ -459,13 +757,6 @@ def main() -> None:
     checkpoint_path = resolve_checkpoint_path(run_dir, args.checkpoint)
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    out_dir = (
-        expand_path(args.out_dir)
-        if args.out_dir is not None
-        else run_dir / OUTPUT_DIRNAME
-    )
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     split_path = run_dir / "split.json"
     if not split_path.exists():
         raise FileNotFoundError(f"Missing {split_path}")
@@ -477,24 +768,35 @@ def main() -> None:
     stats = ckpt["stats"]
     mean_list = [float(value) for value in stats["mean"]]
     std_list = [float(value) for value in stats["std"]]
+    uncertainty_aware = bool(ckpt_args.get("uncertainty_aware", False))
+    calibration = args.density_calibration or args.fit_global_scale or uncertainty_aware
+    if calibration and not uncertainty_aware:
+        raise ValueError("Density calibration requires an uncertainty-aware checkpoint.")
+    out_dir = (expand_path(args.out_dir) if args.out_dir is not None else run_dir /
+               ("density_calibration" if calibration else OUTPUT_DIRNAME))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if calibration and (out_dir / "density_calibration.json").exists() and not args.force_recompute:
+        raise FileExistsError("Calibration output already exists; choose --out-dir or explicitly --force-recompute.")
 
-    jy_path = run_dir / "jy_stats.json"
-    if not jy_path.exists():
-        raise FileNotFoundError(
-            f"Missing {jy_path}; standardized evaluation reuses existing Jy stats."
+    payload = None
+    if not calibration:
+        jy_path = run_dir / "jy_stats.json"
+        if not jy_path.exists():
+            raise FileNotFoundError(
+                f"Missing {jy_path}; standardized evaluation reuses existing Jy stats."
+            )
+        jy_stats = json.loads(jy_path.read_text())
+        signature = cache_signature(
+            checkpoint_path=checkpoint_path,
+            checkpoint_epoch=checkpoint_epoch,
+            split=split,
+            mean=mean_list,
+            std=std_list,
+            jy_stats=jy_stats,
+            extent=args.extent,
         )
-    jy_stats = json.loads(jy_path.read_text())
-    signature = cache_signature(
-        checkpoint_path=checkpoint_path,
-        checkpoint_epoch=checkpoint_epoch,
-        split=split,
-        mean=mean_list,
-        std=std_list,
-        jy_stats=jy_stats,
-        extent=args.extent,
-    )
+        payload = None if args.force_recompute else load_cached_payload(out_dir, signature)
 
-    payload = None if args.force_recompute else load_cached_payload(out_dir, signature)
     if payload is None:
         device = torch.device(
             args.device if args.device == "cuda" and torch.cuda.is_available() else "cpu"
@@ -517,27 +819,60 @@ def main() -> None:
             raise FileNotFoundError("split.json must contain val_runs and train_runs.")
         mean = torch.tensor(mean_list, dtype=torch.float32, device=device).view(1, 4, 1, 1, 1)
         std = torch.tensor(std_list, dtype=torch.float32, device=device).view(1, 4, 1, 1, 1)
-        jy_stats = load_or_compute_jy_training_stats(
-            run_dir=run_dir,
-            dataset=dataset,
-            train_runs=train_runs,
-            mean=mean,
-            std=std,
-            extent=args.extent,
-            checkpoint_path=ckpt_path,
-            checkpoint_epoch=checkpoint_epoch,
-        )
+        if not calibration:
+            jy_stats = load_or_compute_jy_training_stats(
+                run_dir=run_dir,
+                dataset=dataset,
+                train_runs=train_runs,
+                mean=mean,
+                std=std,
+                extent=args.extent,
+                checkpoint_path=ckpt_path,
+                checkpoint_epoch=checkpoint_epoch,
+            )
         model = UNet3D(
             in_channels=8,
             out_channels=4,
             base_channels=int(ckpt_args.get("base_channels", 16)),
             channel_mults=ckpt_args.get("channel_mults", [1, 2, 4]),
             architecture=ckpt_args.get("model_version", LEGACY_MODEL_VERSION),
+            uncertainty_aware=uncertainty_aware,
             use_attention=bool(ckpt_args.get("use_attention", False)),
             spatial_only_pooling=bool(ckpt_args.get("spatial_only_pooling", False)),
         ).to(device)
-        model.load_state_dict(ckpt["model"])
+        model.load_state_dict(ckpt["model"], strict=True)
         model.eval()
+        if calibration:
+            if val_runs & train_runs:
+                raise ValueError("Training and validation simulation sets overlap.")
+            sample_indices = select_calibration_indices(
+                dataset, val_runs, ckpt_args["betas"], args.calibration_runs_per_beta,
+                args.calibration_windows_per_run, args.calibration_seed)
+            run_split = (split_calibration_runs(dataset, sample_indices, args.calibration_seed)
+                         if args.fit_global_scale else None)
+            torch.manual_seed(args.calibration_seed)
+            samples = []
+            started = time.perf_counter()
+            records, pattern_infos = evaluate_windows(
+                model, dataset, sample_indices, mean, std, device, args.extent, None,
+                calibration_samples=samples,
+                calibration_voxels_per_pattern=args.calibration_voxels_per_pattern,
+                calibration_seed=args.calibration_seed,
+            )
+            save_density_calibration(samples, records, dict(
+                checkpoint=checkpoint_cache_signature(ckpt_path), checkpoint_epoch=checkpoint_epoch,
+                uncertainty_objective=ckpt_args.get("uncertainty_loss", "smooth_l1"),
+                normalization=stats, split=split_identity(split),
+                patterns=list(FIXED_VALIDATION_PATTERNS), pattern_infos=pattern_infos,
+                n_windows=len(sample_indices), n_runs=len({r["run_name"] for r in records}),
+                betas=ckpt_args["betas"], seed=args.calibration_seed,
+                runs_per_beta=args.calibration_runs_per_beta, windows_per_run=args.calibration_windows_per_run,
+                voxels_per_window_pattern=args.calibration_voxels_per_pattern,
+                device=str(device), inference_dtype="bfloat16 autocast" if device.type == "cuda" else "float32",
+                elapsed_seconds=time.perf_counter() - started,
+            ), out_dir, args.calibration_bins, run_split=run_split)
+            dataset.close()
+            return
         sample_indices = select_val_window_indices(dataset, val_runs)
         records, pattern_infos = evaluate_windows(
             model=model,

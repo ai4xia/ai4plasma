@@ -346,7 +346,9 @@ class UNet3D(nn.Module):
             nn.init.zeros_(self.out.weight)
             nn.init.zeros_(self.out.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, *, detach_variance_features: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         visible_fields = x[:, : self.out_channels] if self.residual_output else None
         s0 = self.enc0(x)
         s1 = self.enc1(s0)
@@ -370,7 +372,8 @@ class UNet3D(nn.Module):
         correction = self.out(x)
         prediction = visible_fields + correction if self.residual_output else correction
         if self.variance_out is not None:
-            return prediction, F.softplus(self.variance_out(x))
+            variance_features = x.detach() if detach_variance_features else x
+            return prediction, F.softplus(self.variance_out(variance_features))
         return prediction
 
 

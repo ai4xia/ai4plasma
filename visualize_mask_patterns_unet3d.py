@@ -22,7 +22,7 @@ import numpy as np
 import torch
 
 from data.vpic_hdf5_dataset import VPICWindowDataset
-from data.masking import MASK_PATTERNS, make_fixed_validation_mask, make_visible_input, sample_mask
+from data.masking import MASK_PATTERNS, make_fixed_validation_mask, make_uncertain_input, make_visible_input, sample_mask
 from models.unet3d import LEGACY_MODEL_VERSION, UNet3D
 
 
@@ -129,9 +129,9 @@ def save_information_suite_error_plot(
     out_path: Path,
     title: str,
     experiment_name: str = "",
-    jy_std_train: float = 1.0,
+    jy_std_train: float | None = 1.0,
 ) -> Dict:
-    """Plot Density NRMSE in checkpoint-normalized units and physical-unit Jy NRMSE."""
+    """Plot Density NRMSE and Jy NRMSE, or physical Jy RMSE without training stats."""
     fig, axes = plt.subplots(2, 1, figsize=(10.5, 7.0), sharex=True)
     payload = []
     density_series = []
@@ -144,7 +144,9 @@ def save_information_suite_error_plot(
             row["pred_jy_physical"], target_jy_physical
         )
         density_nrmse = np.sqrt(np.mean(np.square(density_residual), axis=(1, 2)))
-        jy_nrmse = jy_nrmse_from_residual(jy_residual, jy_std_train)
+        jy_nrmse = jy_nrmse_from_residual(
+            jy_residual, 1.0 if jy_std_train is None else jy_std_train
+        )
         if experiment_name == "magnetic_ablation":
             label = validation_statistics_legend_label(
                 experiment_name, row, context_length=0
@@ -162,11 +164,12 @@ def save_information_suite_error_plot(
                 "label": row["label"],
                 "legend_label": label,
                 "density_nrmse": density_nrmse.tolist(),
-                "jy_nrmse": jy_nrmse.tolist(),
+                "jy_nrmse" if jy_std_train is not None else "jy_rmse": jy_nrmse.tolist(),
             }
         )
     axes[0].set_ylabel("Density frame NRMSE")
-    axes[1].set_ylabel(JY_NRMSE_YLABEL)
+    jy_label = JY_NRMSE_YLABEL if jy_std_train is not None else f"Jy RMSE ({JY_UNIT})"
+    axes[1].set_ylabel(jy_label)
     axes[1].set_xlabel("Global frame")
     yscales = {"density": "linear", "jy": "linear"}
     if experiment_name == "magnetic_ablation" and density_series:
@@ -178,7 +181,7 @@ def save_information_suite_error_plot(
         yscales["jy"] = apply_log_yscale_if_strictly_positive(
             axes[1],
             np.concatenate(jy_series),
-            "magnetic_ablation named-window Jy NRMSE",
+            f"magnetic_ablation named-window {jy_label}",
         )
     for ax in axes:
         ax.grid(alpha=0.25)
@@ -191,13 +194,14 @@ def save_information_suite_error_plot(
     payload_out = {
         "frame_ids": frame_ids.tolist(),
         "density_nrmse_yscale": yscales["density"],
-        "jy_nrmse_yscale": yscales["jy"],
-        "jy_nrmse_ylabel": JY_NRMSE_YLABEL,
-        "jy_nrmse_definition": JY_NRMSE_DEFINITION,
-        "jy_std_train": float(jy_std_train),
+        "jy_nrmse_yscale" if jy_std_train is not None else "jy_rmse_yscale": yscales["jy"],
+        "jy_nrmse_ylabel" if jy_std_train is not None else "jy_rmse_ylabel": jy_label,
+        "jy_std_train": jy_std_train,
         "rows": payload,
     }
     payload_out.update(jy_metric_metadata())
+    if jy_std_train is None:
+        payload_out["jy_nrmse_definition"] = None
     return payload_out
 
 
@@ -500,7 +504,8 @@ def parse_args():
         help=(
             "Skip the cross-validation-run median and 16th-84th percentile "
             "error plots. By default they are generated in addition to the "
-            "selected single-window GIFs."
+            "selected single-window GIFs. Uncertainty-aware single-window runs "
+            "without a Jy training cache report Jy errors in physical units."
         ),
     )
     p.add_argument(
@@ -634,6 +639,25 @@ def normalize(y: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.T
 
 def denormalize(y: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
     return y * (std + 1e-8) + mean
+
+
+def predict_masked_fields(model, target: torch.Tensor, mask: torch.Tensor):
+    """Use the existing training input semantics, retaining deterministic behavior."""
+    uncertainty_aware = bool(getattr(model, "uncertainty_aware", False))
+    if uncertainty_aware:
+        variance = 1.0 - mask
+        model_input = torch.cat([make_uncertain_input(target, variance), variance], dim=1)
+    else:
+        model_input = torch.cat([make_visible_input(target, mask), mask], dim=1)
+    with torch.autocast(
+        device_type=target.device.type, dtype=torch.bfloat16,
+        enabled=(uncertainty_aware and target.device.type == "cuda"),
+    ):
+        output = model(model_input)
+    if uncertainty_aware:
+        prediction, squared_error = output
+        return prediction.float(), squared_error.float()
+    return output, None
 
 
 def get_val_runs(run_dir: Path) -> set[str] | None:
@@ -1568,6 +1592,8 @@ def jy_metric_metadata(
         for key in ("jy_mean_train", "jy_std_train", "jy_rms_train", "count", "n_runs"):
             if key in jy_stats:
                 meta[key] = jy_stats[key]
+        if jy_stats.get("jy_std_train", 1.0) is None:
+            meta["jy_nrmse_definition"] = None
         if checkpoint_path is None and jy_stats.get("source_checkpoint_path"):
             checkpoint_path = jy_stats["source_checkpoint_path"]
         elif checkpoint_path is None and jy_stats.get("source_checkpoint"):
@@ -2039,8 +2065,8 @@ def collect_validation_statistics(
             targets = target_normalized.expand(
                 len(canonical_experiment_rows), -1, -1, -1, -1
             )
-            model_input = torch.cat([targets * masks, masks], dim=1)
-            predictions = model(model_input).float().detach().cpu().numpy()
+            predictions, _ = predict_masked_fields(model, targets, masks)
+            predictions = predictions.float().detach().cpu().numpy()
             for row_index, canonical_row in enumerate(canonical_experiment_rows):
                 row = collected[experiment_name][row_index]
                 if canonical_row["name"] != row["name"]:
@@ -2161,22 +2187,23 @@ def add_inplane_quiver(
     )
 
 
-def _make_comparison_axes(n_rows: int):
-    """Create Target | Visible/mask | Prediction | Residual comparison axes."""
+def _make_comparison_axes(n_rows: int, uncertainty: bool = False):
+    """Create comparison axes, optionally pairing actual and predicted errors."""
     # Keep a nearly fixed title band in inches so extra rows do not open a
     # growing gap between the suptitle and the first row of panels.
     title_inches = 0.70
     bottom_inches = 0.52
     fig_h = 4.55 * n_rows + title_inches + bottom_inches
     fig = plt.figure(
-        figsize=(13.0, fig_h),
+        figsize=(16.0 if uncertainty else 13.0, fig_h),
         constrained_layout=False,
     )
     gs = gridspec.GridSpec(
         nrows=n_rows,
-        ncols=6,
+        ncols=8 if uncertainty else 6,
         figure=fig,
-        width_ratios=[1.0, 1.0, 1.0, 0.035, 1.0, 0.035],
+        width_ratios=([1.0, 1.0, 1.0, 0.035, 0.20, 1.0, 1.0, 0.035]
+                      if uncertainty else [1.0, 1.0, 1.0, 0.035, 1.0, 0.035]),
         wspace=0.055,
         hspace=0.075,
         left=0.16,
@@ -2185,10 +2212,11 @@ def _make_comparison_axes(n_rows: int):
         top=1.0 - title_inches / fig_h - 0.03,
     )
 
-    axes = np.empty((n_rows, 4), dtype=object)
+    columns = [0, 1, 2, 5, 6] if uncertainty else [0, 1, 2, 4]
+    axes = np.empty((n_rows, len(columns)), dtype=object)
     base_ax = None
     for r in range(n_rows):
-        for c, gcol in enumerate([0, 1, 2, 4]):
+        for c, gcol in enumerate(columns):
             if base_ax is None:
                 ax = fig.add_subplot(gs[r, gcol])
                 base_ax = ax
@@ -2196,7 +2224,7 @@ def _make_comparison_axes(n_rows: int):
                 ax = fig.add_subplot(gs[r, gcol], sharex=base_ax, sharey=base_ax)
             axes[r, c] = ax
 
-    return fig, axes, fig.add_subplot(gs[:, 3]), fig.add_subplot(gs[:, 5])
+    return fig, axes, fig.add_subplot(gs[:, 3]), fig.add_subplot(gs[:, 7 if uncertainty else 5])
 
 
 def _style_comparison_axis(ax, row: int, col: int, n_rows: int) -> None:
@@ -2379,7 +2407,7 @@ def plot_jy_ay_by_mask_patterns(
     quiver_scale: float,
     dpi: int,
     limit_times: Sequence[int] | None = None,
-    jy_std_train: float = 1.0,
+    jy_std_train: float | None = 1.0,
 ) -> None:
     """
     Plot Jy with Ay contours for complete target/prediction fields.
@@ -2444,12 +2472,16 @@ def plot_jy_ay_by_mask_patterns(
         visible_jy = target.copy()
         visible_jy[joint_b_mask < 0.5] = np.nan
         visible_pct = 100.0 * float(np.mean(joint_b_mask))
-        nrmse, nmae = compute_normalized_metrics(residual, scale=jy_std_train)
+        nrmse, nmae = compute_normalized_metrics(
+            residual, scale=1.0 if jy_std_train is None else jy_std_train
+        )
+        metric_prefix = "N" if jy_std_train is not None else ""
+        metric_units = "" if jy_std_train is not None else f" ({JY_UNIT})"
         row_label = (
             f"{row['label']}\n"
             f"joint B visible={visible_pct:.2f}%\n"
-            f"Jy NRMSE={nrmse:.3g}\n"
-            f"Jy NMAE={nmae:.3g}"
+            f"Jy {metric_prefix}RMSE={nrmse:.3g}{metric_units}\n"
+            f"Jy {metric_prefix}MAE={nmae:.3g}{metric_units}"
         )
 
         field_im = axes[r, 0].imshow(
@@ -2585,9 +2617,10 @@ def plot_density_magnetic_field_by_mask_patterns(
     dpi: int,
     limit_times: Sequence[int] | None = None,
 ) -> None:
-    """Plot Density with Ay contours and in-plane (Bz, Bx) arrows."""
+    """Plot Density, adding squared-error comparisons for uncertainty outputs."""
     n_rows = len(rows)
-    fig, axes, cax_field, cax_residual = _make_comparison_axes(n_rows)
+    uncertainty = all("predicted_squared_error_normalized" in row for row in rows)
+    fig, axes, cax_field, cax_residual = _make_comparison_axes(n_rows, uncertainty)
 
     target_density = target_field[3, local_time]
     pred_arrays = [row["pred_plot"][3, local_time] for row in rows]
@@ -2617,7 +2650,16 @@ def plot_density_magnetic_field_by_mask_patterns(
         q=field_q,
         symmetric=False,
     )
-    if residual_vmax is None:
+    if uncertainty:
+        # Share an unclipped scale across actual/predicted errors and all frames.
+        res_vmin = 0.0
+        res_vmax = max(
+            1e-12,
+            max(float(np.max(np.square(error))) for error in all_residual_density),
+            max(float(np.max(row["predicted_squared_error_normalized"][3, t]))
+                for row in rows for t in color_times),
+        )
+    elif residual_vmax is None:
         res_vmin, res_vmax = robust_limits(
             all_residual_density,
             channel=3,
@@ -2628,7 +2670,7 @@ def plot_density_magnetic_field_by_mask_patterns(
         res_vmin, res_vmax = -float(residual_vmax), float(residual_vmax)
 
     density_cmap = make_nan_cmap("plasma", bad_color="black")
-    residual_cmap = make_nan_cmap(RESIDUAL_CMAP)
+    residual_cmap = make_nan_cmap("viridis" if uncertainty else RESIDUAL_CMAP)
     field_im = None
     residual_im = None
 
@@ -2730,7 +2772,7 @@ def plot_density_magnetic_field_by_mask_patterns(
         )
 
         residual_im = axes[r, 3].imshow(
-            residual,
+            np.square(residual) if uncertainty else residual,
             origin="lower",
             aspect="auto",
             extent=extent,
@@ -2739,6 +2781,13 @@ def plot_density_magnetic_field_by_mask_patterns(
             vmax=res_vmax,
             interpolation="nearest",
         )
+        if uncertainty:
+            axes[r, 4].imshow(
+                row["predicted_squared_error_normalized"][3, local_time],
+                origin="lower", aspect="auto", extent=extent,
+                cmap=residual_cmap, vmin=res_vmin, vmax=res_vmax,
+                interpolation="nearest",
+            )
 
         axes[r, 0].text(
             -0.33,
@@ -2752,14 +2801,15 @@ def plot_density_magnetic_field_by_mask_patterns(
             linespacing=1.05,
         )
 
-        for c in range(4):
+        for c in range(axes.shape[1]):
             if r == 0:
                 axes[r, c].set_title(
                     [
                         "Target Density + Ay/B",
                         "Visible Density + visible B",
                         "Prediction Density + Ay/B",
-                        "Normalized Density residual",
+                        "Actual squared error" if uncertainty else "Normalized Density residual",
+                        "Predicted squared error",
                     ][c],
                     fontsize=11,
                     pad=4,
@@ -2771,7 +2821,8 @@ def plot_density_magnetic_field_by_mask_patterns(
     cb_field.ax.tick_params(labelsize=8, length=2.5)
     cb_res = fig.colorbar(residual_im, cax=cax_residual)
     cb_res.set_label(
-        "Prediction − target (preprocessing std units)",
+        ("Squared error (standardized Density units²)" if uncertainty
+         else "Prediction − target (preprocessing std units)"),
         fontsize=9,
         labelpad=8,
     )
@@ -2823,7 +2874,7 @@ def main():
         target_jy_physical = cached["target_jy_physical"]
         experiment_rows = cached["experiment_rows"]
         jy_stats = cached["jy_stats"]
-        jy_std_train = float(cached["jy_std_train"])
+        jy_std_train = cached["jy_std_train"]
         validation_statistics = cached.get("validation_statistics")
         statistics_window_stride = cached["statistics_window_stride"]
         statistics_index_count = cached.get("statistics_index_count")
@@ -2854,6 +2905,9 @@ def main():
         ckpt_args = ckpt["args"]
         ckpt_epoch = ckpt.get("epoch")
         stats = ckpt["stats"]
+        uncertainty_aware = bool(ckpt_args.get("uncertainty_aware", False))
+        if uncertainty_aware:
+            torch.manual_seed(args.seed)
 
         h5_dir = args.h5_dir if args.h5_dir is not None else ckpt_args["h5_dir"]
         h5_dir = expand_path(h5_dir)
@@ -2933,6 +2987,8 @@ def main():
         )
 
         val_runs = get_val_runs(run_dir)
+        if uncertainty_aware and val_runs is None:
+            raise FileNotFoundError("Uncertainty visualization requires split.json validation runs.")
         if not args.skip_validation_statistics and val_runs is None:
             raise FileNotFoundError(
                 "Cross-run validation statistics require run-dir/split.json. "
@@ -2965,18 +3021,25 @@ def main():
             raise FileNotFoundError(
                 "Jy NRMSE normalization requires run-dir/split.json with train_runs."
             )
-        jy_stats = load_or_compute_jy_training_stats(
-            run_dir=run_dir,
-            dataset=dataset,
-            train_runs=train_runs,
-            mean=mean,
-            std=std,
-            extent=args.extent,
-            checkpoint_path=ckpt_path,
-            checkpoint_epoch=ckpt_epoch,
-        )
-        jy_std_train = float(jy_stats["jy_std_train"])
-        if jy_std_train <= 0.0:
+        if (uncertainty_aware and args.skip_validation_statistics
+                and not (run_dir / JY_STATS_FILENAME).exists()):
+            # A single-window render must not scan every training simulation.
+            # Keep the magnetic figures, reporting physical errors without NRMSE.
+            jy_stats = {"jy_std_train": None}
+            print("No training Jy cache: reporting Jy RMSE/MAE in A/m^2.")
+        else:
+            jy_stats = load_or_compute_jy_training_stats(
+                run_dir=run_dir,
+                dataset=dataset,
+                train_runs=train_runs,
+                mean=mean,
+                std=std,
+                extent=args.extent,
+                checkpoint_path=ckpt_path,
+                checkpoint_epoch=ckpt_epoch,
+            )
+        jy_std_train = jy_stats["jy_std_train"]
+        if jy_std_train is not None and jy_std_train <= 0.0:
             raise RuntimeError(
                 f"Training-set Jy std must be positive, got {jy_std_train}."
             )
@@ -2989,11 +3052,12 @@ def main():
             base_channels=base_channels,
             channel_mults=channel_mults,
             architecture=ckpt_args.get("model_version", LEGACY_MODEL_VERSION),
+            uncertainty_aware=uncertainty_aware,
             use_attention=bool(ckpt_args.get("use_attention", False)),
             spatial_only_pooling=bool(ckpt_args.get("spatial_only_pooling", False)),
         ).to(device)
 
-        model.load_state_dict(ckpt["model"])
+        model.load_state_dict(ckpt["model"], strict=True)
         model.eval()
 
         generator = torch.Generator()
@@ -3023,9 +3087,7 @@ def main():
             rows_for_plot = []
             print(f"Running experiment: {experiment_name} ({len(mask_rows)} rows)")
             for short_name, label, mask in mask_rows:
-                x_visible_norm = make_visible_input(y_norm, mask)
-                model_input = torch.cat([x_visible_norm, mask], dim=1)
-                pred_norm = model(model_input)
+                pred_norm, output_variance = predict_masked_fields(model, y_norm, mask)
 
                 if args.plot_units == "normalized":
                     pred_plot_tensor = pred_norm.detach()
@@ -3043,6 +3105,8 @@ def main():
                     "pred_plot": pred_plot_tensor[0].detach().cpu().numpy(),
                     "pred_normalized": pred_norm[0].detach().cpu().numpy(),
                 }
+                if output_variance is not None:
+                    row["predicted_squared_error_normalized"] = output_variance[0].detach().cpu().numpy()
                 row["pred_ay"], row["pred_jy"] = compute_ay_jy(
                     row["pred_plot"], args.extent
                 )

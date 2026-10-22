@@ -1038,14 +1038,47 @@ def make_uncertain_input(
     return (1.0 - variance).sqrt() * block + variance.sqrt() * noise
 
 
+GAUSSIAN_NLL_VARIANCE_FLOOR = 1e-6
+
+
+def make_rollout_input(
+    target: torch.Tensor,
+    prediction: torch.Tensor,
+    output_variance: torch.Tensor,
+    observation_mask: torch.Tensor,
+    reuse_mask: torch.Tensor,
+    noise: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Retain exact observations, reuse detached predictions, or draw fresh noise.
+
+    The new binary reuse mask selects available locations. Original observations
+    remain exact only where retained by that mask; other available sites reuse
+    predictions and their raw variance, including values greater than one.
+    """
+    if noise is None:
+        noise = torch.randn_like(target)
+    exact_mask = observation_mask * reuse_mask
+    values = torch.where(reuse_mask.bool(), prediction.detach(), noise)
+    variance = torch.where(reuse_mask.bool(), output_variance.detach(), torch.ones_like(target))
+    values = torch.where(exact_mask.bool(), target, values)
+    variance = torch.where(exact_mask.bool(), torch.zeros_like(target), variance)
+    return torch.cat([values, variance], dim=1), exact_mask
+
+
 def predicted_error_mse_loss(
     output_variance: torch.Tensor,
     pred: torch.Tensor,
     target: torch.Tensor,
+    objective: str = "smooth_l1",
 ) -> torch.Tensor:
-    """Smooth L1 regression of detached squared error; retain the legacy name."""
+    """Variance objective in FP32; retain the legacy name and Smooth L1 default."""
     squared_error = (pred.detach().float() - target.float()).square()
-    return F.smooth_l1_loss(output_variance.float(), squared_error, beta=1.0, reduction="mean")
+    if objective == "smooth_l1":
+        return F.smooth_l1_loss(output_variance.float(), squared_error, beta=1.0, reduction="mean")
+    if objective == "gaussian_nll":
+        variance = output_variance.float().clamp_min(GAUSSIAN_NLL_VARIANCE_FLOOR)
+        return 0.5 * (variance.log() + squared_error / variance).mean()
+    raise ValueError(f"Unknown uncertainty objective: {objective!r}")
 
 
 # ---------------------------------------------------------------------------
