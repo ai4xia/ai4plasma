@@ -7,9 +7,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from models.unet3d import DIRECT_MODEL_VERSION, MODEL_VERSION  # noqa: E402
 from make_paper_figures import (  # noqa: E402
     COMPATIBLE_PAPER_CACHE_VERSIONS,
     DEFAULT_MAGNETIC_ABLATION_VISIBLE_PERCENTS,
@@ -63,6 +66,78 @@ def _touch_checkpoint(path: Path, payload: bytes = b"ckpt") -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(payload)
     return path
+
+
+@pytest.mark.parametrize("uncertainty_aware", [False, True])
+@pytest.mark.parametrize("architecture", [MODEL_VERSION, DIRECT_MODEL_VERSION])
+def test_paper_context_strict_loading_and_spatial_array_schema(tmp_path, monkeypatch, uncertainty_aware, architecture):
+    import make_paper_figures as paper
+    from models.unet3d import UNet3D
+
+    options = dict(base_channels=2, channel_mults=[1, 2, 4], use_attention=True, architecture=architecture,
+                   spatial_only_pooling=True, uncertainty_aware=uncertainty_aware)
+    model = UNet3D(**options).eval()
+    ckpt_args = dict(options, model_version=architecture, h5_dir=str(tmp_path),
+                     betas=[.2], delta_t=4, stride_t=2)
+    stats = dict(mean=[1.] * 4, std=[2.] * 4)
+    checkpoint = dict(model=model.state_dict(), args=ckpt_args, stats=stats, epoch=240)
+    torch.save(checkpoint, tmp_path / "latest.pt")
+    (tmp_path / "split.json").write_text(json.dumps(dict(val_runs=["held_out"], train_runs=["train"])))
+    target = torch.randn(4, 4, 16, 8)
+
+    class Dataset:
+        samples = [(0, "held_out", 28)]
+
+        def __getitem__(self, index):
+            return dict(block=target, metadata=dict(run_name="held_out", t0=28))
+
+    monkeypatch.setattr(paper, "VPICWindowDataset", lambda **kw: Dataset())
+    monkeypatch.setattr(paper, "load_or_compute_jy_training_stats", lambda **kw: dict(jy_std_train=1.))
+    args = Namespace(run_dir=str(tmp_path), checkpoint="latest.pt", device="cpu", h5_dir=None,
+                     extent=[-21., 21., -50., 50.], run_name="held_out", t0=28,
+                     global_frame=29, seed=1234)
+    ctx = paper.load_inference_context(args)
+    assert ctx["model"].residual_output == (architecture == MODEL_VERSION)
+    assert ctx["model"].uncertainty_aware is uncertainty_aware
+    normalized = paper.normalize(target.unsqueeze(0), ctx["mean"], ctx["std"])
+    with torch.no_grad():
+        pred, variance = paper.predict_masked_fields(ctx["model"], normalized, torch.zeros_like(normalized))
+    assert pred.shape == normalized.shape and torch.isfinite(pred).all()
+    if uncertainty_aware:
+        assert variance.shape == normalized.shape
+        assert torch.isfinite(variance).all() and (variance > 0).all()
+    else:
+        assert variance is None
+    arrays, metadata = paper.build_spatial_qualitative_cache(ctx, args)
+    assert set(arrays) == {"target_density"} | {
+        f"{name}_{part}" for name in SPATIAL_ROW_ORDER
+        for part in ("visible", "prediction", "residual", "mask")}
+    assert metadata["row_names"] == list(SPATIAL_ROW_ORDER)
+    assert metadata["layout"] == {"rows": 4, "columns": 4}
+    for name in SPATIAL_ROW_ORDER:
+        mask = arrays[f"{name}_mask"]
+        assert np.isfinite(arrays[f"{name}_prediction"]).all()
+        np.testing.assert_allclose(arrays[f"{name}_residual"],
+            (arrays[f"{name}_prediction"] - arrays["target_density"]) / 2., atol=1e-6)
+        assert np.isnan(arrays[f"{name}_visible"][mask == 0]).all()
+    # The added output must be required, rather than accepted via non-strict loading.
+    checkpoint["model"].pop("variance_out.weight" if uncertainty_aware else "out.weight")
+    torch.save(checkpoint, tmp_path / "latest.pt")
+    with pytest.raises(RuntimeError, match="Missing key"):
+        paper.load_inference_context(args)
+
+
+@pytest.mark.parametrize("figure", ["spatial", "sliding"])
+def test_paper_qualitative_requires_held_out_run_before_inference(tmp_path, monkeypatch, figure):
+    import make_paper_figures as paper
+
+    _touch_checkpoint(tmp_path / "latest.pt")
+    (tmp_path / "split.json").write_text(json.dumps(dict(train_runs=["old_canonical"], val_runs=["held_out"])))
+    monkeypatch.setattr(paper, "parse_args", lambda: Namespace(
+        run_dir=str(tmp_path), checkpoint="latest.pt", figure=[figure], run_name="old_canonical"))
+    with pytest.raises(ValueError, match="not in the checkpoint validation split"):
+        paper.main()
+    assert not (tmp_path / "paper_figures_v1").exists()
 
 
 def _write_validation_json(

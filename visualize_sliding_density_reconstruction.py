@@ -20,7 +20,7 @@ import torch
 from data.masking import make_uncertain_input
 from matplotlib.patches import Rectangle
 
-from data.vpic_hdf5_dataset import find_h5_files, parse_run_name
+from data.vpic_hdf5_dataset import TARGET_SPATIAL_SHAPE, find_h5_files, parse_run_name
 from models.unet3d import LEGACY_MODEL_VERSION, UNet3D
 from visualize_mask_patterns_unet3d import (
     DEFAULT_RESIDUAL_VMAX,
@@ -439,6 +439,11 @@ def find_and_load_run(
             group = h5_file["runs"][run_name]
             fields = np.asarray(group["fields"], dtype=np.float32)
             frame_ids = np.asarray(group["frame_ids"], dtype=np.int64)
+            if fields.shape[-2:] != TARGET_SPATIAL_SHAPE:
+                fields = torch.nn.functional.interpolate(
+                    torch.from_numpy(fields), size=TARGET_SPATIAL_SHAPE,
+                    mode="bicubic", antialias=True, align_corners=False,
+                ).numpy()
             return fields, frame_ids, h5_path
     raise KeyError(f"Run {run_name!r} was not found in {h5_dir} for betas={betas}.")
 
@@ -546,7 +551,7 @@ def reconstruct_with_slide_step(
             if overlap_length > 0:
                 input_variance[0, 3, :overlap_length] = variance_state[
                     start:overlap_end
-                ].clamp(0.0, 1.0)
+                ]
             input_variance[0, 3, :valid_length, probe_bool] = 0.0
             # Generate noise only for unknown slots. The binary availability
             # mask preserves reused fields exactly, regardless of their variance.
@@ -557,6 +562,7 @@ def reconstruct_with_slide_step(
             model_input = torch.cat([values * mask, mask], dim=1)
         with torch.autocast(
             device_type=target_normalized.device.type,
+            dtype=torch.bfloat16 if uncertainty_aware else torch.float16,
             enabled=(amp and target_normalized.device.type == "cuda"),
         ):
             prediction = model(model_input)
@@ -851,7 +857,7 @@ def refine_reconstruction_pass(
             input_variance = 1.0 - mask
             input_variance[0, 3, local_start:local_end] = variance_state_normalized[
                 valid_start:valid_end
-            ].clamp(0.0, 1.0)
+            ]
             input_variance[0, 3, local_start:local_end, probe_bool] = 0.0
             model_input = torch.cat(
                 [make_uncertain_input(values, 1.0 - mask), input_variance], dim=1
@@ -860,6 +866,7 @@ def refine_reconstruction_pass(
             model_input = torch.cat([values * mask, mask], dim=1)
         with torch.autocast(
             device_type=target_normalized.device.type,
+            dtype=torch.bfloat16 if uncertainty_aware else torch.float16,
             enabled=(amp and target_normalized.device.type == "cuda"),
         ):
             prediction = model(model_input)

@@ -1,4 +1,6 @@
-# data
+# =============================================================================
+# Data / large numerical artifacts
+# =============================================================================
 *.h5
 *.hdf5
 *.npy
@@ -7,7 +9,28 @@
 *.tar
 *.tar.gz
 
-# generated figures/videos
+# Model checkpoints / serialized runtime artifacts
+*.pt
+*.pth
+*.ckpt
+*.pkl
+
+
+# =============================================================================
+# Generated experiment / evaluation / visualization outputs
+# =============================================================================
+evaluations/
+results/
+outputs/
+visualizations/
+
+# Experiment tracking
+wandb/
+
+
+# =============================================================================
+# Generated figures / videos
+# =============================================================================
 *.png
 *.mp4
 *.gif
@@ -17,22 +40,37 @@
 !assets/paper_figures/
 !assets/paper_figures/*.png
 
-# logs
+
+# =============================================================================
+# Logs / runtime output
+# =============================================================================
 logs/
+*.log
 *.out
 *.err
 
-# python
+
+# =============================================================================
+# Python / caches
+# =============================================================================
 __pycache__/
 *.pyc
+*.pyo
+.pytest_cache/
 .ipynb_checkpoints/
 
-# environment
+
+# =============================================================================
+# Environment / editor / OS
+# =============================================================================
 .env
 .venv/
+.DS_Store
 
-*.pt
 
+# =============================================================================
+# Training runs
+# =============================================================================
 runs/
 
 # Curated v8 review artifacts. Keep checkpoints, NPZ arrays, per-frame tables,
@@ -56,7 +94,10 @@ runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine
 !runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine3000_v8/figures_sliding_density_reconstruction_plasmoid_merger/*_metrics.json
 !runs/masked-resunet3d_beta0p2_dt24_bc24_depth4_ddp16_mixedB50D50_warmup10_cosine3000_v8/figures_sliding_density_reconstruction_plasmoid_merger/*bidirectional*.gif
 
+
+# =============================================================================
 # NeurIPS anonymous release artifacts
+# =============================================================================
 neurips_anonymous_supplement/
 neurips_anonymous_supplement.zip
 anonymous_release_scan_report.txt

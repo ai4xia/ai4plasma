@@ -47,6 +47,29 @@ from visualize_mask_patterns_unet3d import (  # noqa: E402
 )
 
 
+@pytest.mark.parametrize("flags", [[], ["--density-calibration"], ["--fit-global-scale"]])
+def test_uncertainty_checkpoint_keeps_standardized_default_and_explicit_calibration(tmp_path, monkeypatch, flags):
+    import evaluate_standardized_validation as evaluator
+
+    torch.save(dict(args={"uncertainty_aware": True}, epoch=240,
+                    stats=dict(mean=[0.] * 4, std=[1.] * 4)), tmp_path / "latest.pt")
+    (tmp_path / "split.json").write_text(json.dumps(dict(val_runs=["held_out"], train_runs=["train"])))
+    monkeypatch.setattr(sys, "argv", ["evaluate", "--run-dir", str(tmp_path), *flags])
+
+    def stop_before_inference(*args, **kwargs):
+        raise RuntimeError("explicit calibration selected")
+
+    monkeypatch.setattr(evaluator, "load_checkpoint", stop_before_inference)
+    if flags:
+        with pytest.raises(RuntimeError, match="explicit calibration selected"):
+            evaluator.main()
+    else:
+        # The paper table requires Jy stats; stop here without evaluating data.
+        with pytest.raises(FileNotFoundError, match="jy_stats.json"):
+            evaluator.main()
+        assert not (tmp_path / "density_calibration").exists()
+
+
 def test_standardized_pattern_order_matches_fixed_validation():
     assert FIXED_VALIDATION_PATTERNS == (
         "spatial_random",

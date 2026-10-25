@@ -53,7 +53,7 @@ from visualize_mask_patterns_unet3d import (
     load_checkpoint,
     load_or_compute_jy_training_stats,
     make_nan_cmap,
-    make_visible_input,
+    predict_masked_fields,
     normalize,
     normalized_residual,
     resolve_checkpoint_path,
@@ -67,6 +67,7 @@ from visualize_sliding_density_reconstruction import (
     framewise_rmse_mae,
     project_time_z,
     reconstruct_with_slide_step,
+    validate_test_run,
 )
 
 
@@ -825,6 +826,7 @@ def load_inference_context(args: argparse.Namespace) -> Dict:
     )
     ckpt, ckpt_path = load_checkpoint(run_dir, args.checkpoint, device=device)
     ckpt_args = ckpt["args"]
+    uncertainty_aware = bool(ckpt_args.get("uncertainty_aware", False))
     stats = ckpt["stats"]
     h5_dir = expand_path(args.h5_dir or ckpt_args["h5_dir"])
     delta_t = int(ckpt_args.get("delta_t", ckpt_args.get("delta-t", 24)))
@@ -860,8 +862,9 @@ def load_inference_context(args: argparse.Namespace) -> Dict:
         architecture=ckpt_args.get("model_version", LEGACY_MODEL_VERSION),
         use_attention=bool(ckpt_args.get("use_attention", False)),
         spatial_only_pooling=bool(ckpt_args.get("spatial_only_pooling", False)),
+        uncertainty_aware=uncertainty_aware,
     ).to(device)
-    model.load_state_dict(ckpt["model"])
+    model.load_state_dict(ckpt["model"], strict=True)
     model.eval()
     return {
         "run_dir": run_dir,
@@ -977,8 +980,7 @@ def build_spatial_qualitative_cache(ctx: Dict, args: argparse.Namespace) -> Tupl
     row_meta = []
     for name in SPATIAL_ROW_ORDER:
         _label, mask = by_name[name]
-        x_visible = make_visible_input(y_norm, mask)
-        pred_norm = ctx["model"](torch.cat([x_visible, mask], dim=1))
+        pred_norm, _ = predict_masked_fields(ctx["model"], y_norm, mask)
         pred_plot = denormalize(pred_norm, mean, std)
         density_mask = mask[0, 3].detach().cpu().numpy()
         visible = np.array(target_plot[local_time], copy=True)
@@ -2273,6 +2275,9 @@ def main() -> None:
     checkpoint_path = resolve_checkpoint_path(run_dir, args.checkpoint)
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    figures = selected_figures(args.figure)
+    if "spatial" in figures or "sliding" in figures:
+        validate_test_run(run_dir, args.run_name, allow_non_validation=False)
     checkpoint_epoch = read_checkpoint_epoch(checkpoint_path)
     provenance = provenance_for_checkpoint(checkpoint_path, checkpoint_epoch)
     paper_dir = (
@@ -2285,7 +2290,6 @@ def main() -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
     figures_dir.mkdir(parents=True, exist_ok=True)
 
-    figures = selected_figures(args.figure)
     sig_base = base_signature(args, run_dir, checkpoint_path)
     ctx: Dict | None = None
     figure_manifest: List[Dict] = []

@@ -9,6 +9,7 @@ import torch.nn as nn
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from models.unet3d import (  # noqa: E402
+    DIRECT_MODEL_VERSION,
     LEGACY_MODEL_VERSION,
     MODEL_VERSION,
     SpatiotemporalAttention3D,
@@ -152,6 +153,35 @@ def test_residual_unet_has_no_activation_normalization():
         architecture=MODEL_VERSION,
     )
     assert not any(isinstance(module, nn.GroupNorm) for module in model.modules())
+
+
+def test_direct_version_removes_only_global_identity_with_identical_state_dict():
+    options = dict(base_channels=2, channel_mults=(1, 2, 4), use_attention=True,
+                   spatial_only_pooling=True, uncertainty_aware=True)
+    residual = UNet3D(**options, architecture=MODEL_VERSION).eval()
+    direct = UNet3D(**options, architecture=DIRECT_MODEL_VERSION).eval()
+    direct.load_state_dict(residual.state_dict(), strict=True)
+    assert [(name, type(module)) for name, module in residual.named_modules()] == [
+        (name, type(module)) for name, module in direct.named_modules()]
+    assert not any(isinstance(module, nn.GroupNorm) for module in direct.modules())
+    inputs = torch.randn(1, 8, 4, 8, 8)
+    changed = inputs.clone()
+    changed[0, 0, 1, 2, 3] += .5
+    with torch.no_grad():
+        for model in (residual, direct):
+            model.out.weight.zero_()
+            model.out.bias.zero_()
+        old_mean, old_var = residual(inputs)
+        mean, variance = direct(inputs)
+        assert torch.equal(old_mean, inputs[:, :4])
+        assert torch.equal(mean, torch.zeros_like(mean))
+        assert torch.equal(variance, old_var)
+        assert mean.shape == variance.shape == inputs[:, :4].shape
+        assert torch.isfinite(mean).all() and torch.isfinite(variance).all() and (variance > 0).all()
+        assert torch.equal(direct(changed)[0], mean)
+        assert torch.equal(residual(changed)[0], changed[:, :4])
+        direct.out.bias.fill_(.25)
+        assert torch.equal(direct(inputs)[0], torch.full_like(mean, .25))
 
 
 def test_legacy_architecture_keeps_groupnorm_for_old_checkpoints():

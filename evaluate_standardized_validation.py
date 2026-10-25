@@ -80,7 +80,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--h5-dir", default=None)
     parser.add_argument("--density-calibration", action="store_true",
-                        help="Bounded density analysis; automatic for uncertainty-aware checkpoints.")
+                        help="Run bounded density calibration instead of the standardized paper table.")
     parser.add_argument("--calibration-runs-per-beta", type=int, default=2)
     parser.add_argument("--calibration-windows-per-run", type=int, default=1)
     parser.add_argument("--calibration-voxels-per-pattern", type=int, default=2048)
@@ -769,7 +769,7 @@ def main() -> None:
     mean_list = [float(value) for value in stats["mean"]]
     std_list = [float(value) for value in stats["std"]]
     uncertainty_aware = bool(ckpt_args.get("uncertainty_aware", False))
-    calibration = args.density_calibration or args.fit_global_scale or uncertainty_aware
+    calibration = args.density_calibration or args.fit_global_scale
     if calibration and not uncertainty_aware:
         raise ValueError("Density calibration requires an uncertainty-aware checkpoint.")
     out_dir = (expand_path(args.out_dir) if args.out_dir is not None else run_dir /

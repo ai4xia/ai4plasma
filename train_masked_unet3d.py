@@ -39,7 +39,7 @@ from data.masking import (
     sample_training_severity_counts,
     make_fixed_validation_mask,
 )
-from models.unet3d import MODEL_VERSION, UNet3D
+from models.unet3d import DIRECT_MODEL_VERSION, MODEL_VERSION, UNet3D
 
 
 def distributed_is_initialized() -> bool:
@@ -129,6 +129,8 @@ def parse_args():
     p.add_argument("--weight-decay", type=float, default=1e-4)
 
     p.add_argument("--base-channels", type=int, default=24)
+    p.add_argument("--model-version", choices=(MODEL_VERSION, DIRECT_MODEL_VERSION), default=MODEL_VERSION,
+                   help="Output semantics: residual v2 (default), or explicit direct-output v3 for a new run.")
     p.add_argument(
         "--uncertainty-aware", action="store_true",
         help="Use input variance and predict per-element squared reconstruction error.",
@@ -361,7 +363,6 @@ def parse_args():
     else:
         args.mask_pattern_weights = parse_pattern_weights(args.mask_patterns)
     args.masking_version = MASKING_VERSION
-    args.model_version = MODEL_VERSION
 
     if (
         not math.isfinite(args.uncertainty_loss_weight)

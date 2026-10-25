@@ -83,3 +83,29 @@ def test_bicubic_overshoot_is_not_clamped(tmp_path):
     assert block.min() < 0.0 and block.max() > 1.0
     assert torch.isfinite(block).all()
     dataset.close()
+
+
+@pytest.mark.parametrize("beta,shape", [(0.01, (308, 124)), (0.2, (154, 62))])
+def test_full_run_sliding_loader_matches_window_preprocessing(tmp_path, monkeypatch, beta, shape):
+    from visualize_sliding_density_reconstruction import find_and_load_run
+
+    fields = np.random.default_rng(12).normal(size=(3, 4, *shape)).astype(np.float32)
+    path = _write_dataset(tmp_path, beta, fields)
+    run_name = f"beta{beta}_nu0_Bz0_dt2_tau100"
+    frame_ids = np.array([10, 25, 40], dtype=np.int64)
+    with h5py.File(path, "r+") as handle:
+        handle[f"runs/{run_name}/frame_ids"][:] = frame_ids
+    if shape == (154, 62):
+        def forbidden(*args, **kwargs):
+            raise AssertionError("Reference-grid full runs must not be interpolated")
+        monkeypatch.setattr("torch.nn.functional.interpolate", forbidden)
+    dataset = VPICWindowDataset(tmp_path, betas=[beta], delta_t=3)
+    expected = dataset[0]["block"].permute(1, 0, 2, 3).numpy()
+    actual, actual_ids, actual_path = find_and_load_run(tmp_path, [beta], run_name)
+    assert actual.shape == (3, 4, 154, 62) and actual.dtype == np.float32
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(actual_ids, frame_ids)
+    assert actual_path == path
+    if shape == (154, 62):
+        np.testing.assert_array_equal(actual, fields)
+    dataset.close()

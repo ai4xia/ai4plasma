@@ -24,6 +24,7 @@ CURRICULUM=false
 RESUMING=true
 CURRICULUM_STOP=20
 ARM_ARGS=()
+MODEL_ARGS=()
 case "${1:-}" in
     --stage1-gaussian-nll) STAGE1_NLL=true; RESUMING=false; shift ;;
     --resume-stage1-gaussian-nll) STAGE1_NLL=true; RESUME_STAGE1_NLL=true; shift ;;
@@ -37,8 +38,10 @@ while (( $# )); do
         ARM_ARGS+=("$1"); shift
     elif ${CURRICULUM} && [[ "$1" == --stop-after-epochs ]] && (( $# >= 2 )) && [[ "$2" =~ ^[1-9][0-9]*$ ]]; then
         CURRICULUM_STOP=$2; shift 2
+    elif [[ "$1" == --model-version ]] && (( $# >= 2 )); then
+        MODEL_ARGS=(--model-version "$2"); shift 2
     else
-        echo "Usage: bash $0 [--stage1-gaussian-nll|--resume-stage1-gaussian-nll|--curriculum|--resume-curriculum [--arm-variance-ramp|--arm-rollout-ramp] [--stop-after-epochs N]]" >&2
+        echo "Usage: bash $0 [--stage1-gaussian-nll|--resume-stage1-gaussian-nll|--curriculum|--resume-curriculum [--arm-variance-ramp|--arm-rollout-ramp] [--stop-after-epochs N]] [--model-version VERSION]" >&2
         exit 2
     fi
 done
@@ -157,6 +160,7 @@ if ${RESUMING} && [[ ! -f "${CHECKPOINT}" ]]; then
 fi
 
 TRAIN_ARGS=(
+    "${MODEL_ARGS[@]}"
     --h5-dir "${H5_DIR}"
     --betas "${BETAS[@]}"
     --delta-t "${DELTA_T}"
@@ -187,7 +191,6 @@ TRAIN_ARGS=(
     --mask-patterns "${MASK_PATTERNS[@]}"
     --out-dir "${OUT_DIR}"
     --wandb-name "${RUN_NAME}"
-    --no-wandb
 )
 if ${STAGE1_NLL} || ${CURRICULUM}; then
     for FILE in config.json stats.json split.json; do

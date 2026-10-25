@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 LEGACY_MODEL_VERSION = "unet3d_groupnorm_direct_v1"
 MODEL_VERSION = "residual_unet3d_no_activation_norm_v2"
+DIRECT_MODEL_VERSION = "direct_unet3d_no_activation_norm_v3"
 
 
 def _num_groups(num_channels: int, max_groups: int = 8) -> int:
@@ -287,9 +288,9 @@ class UNet3D(nn.Module):
         self.spatial_only_pooling = bool(spatial_only_pooling)
         self.uncertainty_aware = bool(uncertainty_aware)
 
-        if architecture == MODEL_VERSION:
+        if architecture in (MODEL_VERSION, DIRECT_MODEL_VERSION):
             block_cls = ResidualConvBlock3D
-            self.residual_output = True
+            self.residual_output = architecture == MODEL_VERSION
         elif architecture == LEGACY_MODEL_VERSION:
             block_cls = ConvBlock3D
             self.residual_output = False
@@ -339,10 +340,9 @@ class UNet3D(nn.Module):
             nn.Conv3d(c0, out_channels, kernel_size=1)
             if self.uncertainty_aware else None
         )
-        if self.residual_output:
-            # Start from identity on visible normalized fields and zero (the
-            # physical channel mean) in missing regions. The network learns a
-            # correction everywhere; no mask-gated value replacement is used.
+        if architecture in (MODEL_VERSION, DIRECT_MODEL_VERSION):
+            # Keep the same zero-initialized learned head: v2 starts at the
+            # physical input, while v3 starts at zero without the global skip.
             nn.init.zeros_(self.out.weight)
             nn.init.zeros_(self.out.bias)
 
@@ -369,11 +369,11 @@ class UNet3D(nn.Module):
         x = self.up1(x, s1)
         x = self.up0(x, s0)
 
-        correction = self.out(x)
-        prediction = visible_fields + correction if self.residual_output else correction
+        predicted_fields = self.out(x)
+        prediction = visible_fields + predicted_fields if self.residual_output else predicted_fields
         if self.variance_out is not None:
             variance_features = x.detach() if detach_variance_features else x
-            return prediction, F.softplus(self.variance_out(variance_features))
+            return prediction, F.softplus(self.variance_out(variance_features).float()).clamp_min(1e-6)
         return prediction
 
 

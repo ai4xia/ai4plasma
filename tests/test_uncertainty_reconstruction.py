@@ -13,7 +13,7 @@ from data.masking import (
     MASK_PATTERNS, GAUSSIAN_NLL_VARIANCE_FLOOR,
     full_mse_loss, make_uncertain_input, predicted_error_mse_loss,
 )
-from models.unet3d import UNet3D
+from models.unet3d import DIRECT_MODEL_VERSION, MODEL_VERSION, UNet3D
 from train_masked_unet3d import (
     RESUME_PARAMETER_KEYS, parse_args, train_one_epoch, validate,
     validate_resume_parameters,
@@ -77,6 +77,33 @@ def test_unet_head_and_checkpoint_roundtrip(tmp_path):
         restored_prediction, restored_variance = restored(inputs)
     torch.testing.assert_close(restored_prediction, prediction)
     torch.testing.assert_close(restored_variance, variance)
+
+
+@pytest.mark.parametrize("architecture", [MODEL_VERSION, DIRECT_MODEL_VERSION])
+@pytest.mark.parametrize("bf16", [False, True])
+def test_returned_variance_fp32_floor_and_gradients(architecture, bf16):
+    model = UNet3D(base_channels=2, channel_mults=(1, 2, 4),
+                   uncertainty_aware=True, architecture=architecture)
+    logits = torch.tensor([-114.5, -1., 0., 3.])
+    with torch.no_grad():
+        model.variance_out.weight.zero_()
+        model.variance_out.bias.copy_(logits)
+    inputs = torch.randn(1, 8, 4, 4, 4)
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=bf16):
+        prediction, variance = model(inputs)
+    expected = F.softplus(logits.float()).clamp_min(1e-6)
+    assert GAUSSIAN_NLL_VARIANCE_FLOOR == 1e-6
+    assert variance.dtype == torch.float32
+    torch.testing.assert_close(variance, expected.view(1, 4, 1, 1, 1).expand_as(variance), rtol=0, atol=0)
+    assert (variance[:, 0] == torch.tensor(1e-6)).all()
+    assert (variance[:, 3] > 1).all()
+    expected_prediction = inputs[:, :4] if architecture == MODEL_VERSION else torch.zeros_like(prediction)
+    torch.testing.assert_close(prediction, expected_prediction, rtol=0, atol=0)
+    variance.sum().backward()
+    assert all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters())
+    assert model.variance_out.bias.grad[0] == 0
+    assert (model.variance_out.bias.grad[1:] > 0).all()
+    assert model.variance_out.weight.grad is not None
 
 
 @pytest.mark.parametrize("objective,pattern", [("smooth_l1", "spatial_random")] +
@@ -147,6 +174,20 @@ def test_cli_and_old_checkpoint_resume(monkeypatch):
     with pytest.raises(ValueError, match="uncertainty_loss:"):
         validate_resume_parameters(args, compatible)
     validate_resume_parameters(args, dict(compatible, uncertainty_loss="gaussian_nll"))
+
+
+def test_direct_model_cli_records_version_and_rejects_cross_version_resume(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["train"])
+    old_args = parse_args()
+    assert old_args.model_version == MODEL_VERSION
+    monkeypatch.setattr(sys, "argv", ["train", "--model-version", DIRECT_MODEL_VERSION])
+    args = parse_args()
+    assert args.model_version == DIRECT_MODEL_VERSION
+    validate_resume_parameters(args, vars(args))
+    with pytest.raises(ValueError, match="model_version"):
+        validate_resume_parameters(args, vars(old_args))
+    with pytest.raises(ValueError, match="model_version"):
+        validate_resume_parameters(old_args, vars(args))
 
 
 def test_gaussian_nll_matches_fp32_formula_detaches_mu_and_keeps_backbone_gradients():
@@ -265,8 +306,16 @@ class RecordingUncertainModel(torch.nn.Module):
         return prediction, torch.full_like(prediction, self.error)
 
 
-@pytest.mark.parametrize("error", [-0.5, 0.25, 2.0])
-def test_sliding_reuses_values_without_noise_and_carries_clipped_error(error):
+@pytest.mark.parametrize("error", [0.25, 1.5, 2.0])
+def test_sliding_reuses_values_without_noise_and_carries_raw_variance(error, monkeypatch):
+    draw_noise, noises = torch.randn_like, []
+
+    def record_noise(values):
+        noise = draw_noise(values)
+        noises.append(noise)
+        return noise
+
+    monkeypatch.setattr("data.masking.torch.randn_like", record_noise)
     model = RecordingUncertainModel(error)
     target = torch.full((4, 6, 2, 2), 2.0)
     probes = torch.tensor([[1.0, 0.0], [0.0, 0.0]])
@@ -279,22 +328,27 @@ def test_sliding_reuses_values_without_noise_and_carries_clipped_error(error):
     assert torch.all(first[0, 4:7] == 0)
     assert torch.all(first[0, 7, :, 0, 0] == 0)
     assert torch.all(first[0, 7, :, 1, 1] == 1)
+    torch.testing.assert_close(first[0, 3, :, 1, 1], noises[0][0, 3, :, 1, 1])
     assert torch.all(second[0, 3, :2, 1, 1] == 5.0)
-    assert torch.all(second[0, 7, :2, 1, 1] == min(max(error, 0.0), 1.0))
+    assert torch.all(second[0, 7, :2, 1, 1] == error)
     assert torch.all(second[0, 3, :, 0, 0] == 2.0)
     assert torch.all(second[0, 7, :, 0, 0] == 0)
     assert torch.all(second[0, 7, 2:, 1, 1] == 1)
+    torch.testing.assert_close(second[0, 3, 2:, 1, 1], noises[1][0, 3, 2:, 1, 1])
     # Refinement must retain the error state too, including padded windows.
     refine_reconstruction_pass(
         model, target, result["raw_state_normalized"],
-        result["conditioning_state_normalized"], probes, 4, 2, "reverse", 0,
-        False, variance_state_normalized=result["variance_state_normalized"],
+        result["conditioning_state_normalized"], probes, 4, 2, "reverse", 1,
+        False, include_boundary_padding=True,
+        variance_state_normalized=result["variance_state_normalized"],
     )
     reused = model.inputs[-1]
-    assert torch.all(reused[0, 3, :, 1, 1] == 5.0)
-    assert torch.all(reused[0, 7, :, 1, 1] == min(max(error, 0.0), 1.0))
-    assert torch.all(reused[0, 3, :, 0, 0] == 2.0)
-    assert torch.all(reused[0, 7, :, 0, 0] == 0)
+    assert torch.all(reused[0, 3, 1:, 1, 1] == 5.0)
+    assert torch.all(reused[0, 7, 1:, 1, 1] == error)
+    assert torch.all(reused[0, 3, 1:, 0, 0] == 2.0)
+    assert torch.all(reused[0, 7, 1:, 0, 0] == 0)
+    assert torch.all(reused[0, 4:, 0] == 1)
+    torch.testing.assert_close(reused[0, :4, 0], noises[-1][0, :, 0])
 
 
 def test_bidirectional_passes_carry_variance_and_keep_hidden_magnetic_unknown():
@@ -438,28 +492,30 @@ def test_manual_curriculum_cli_guards(monkeypatch):
     with pytest.raises(SystemExit): parse_args()
 
 
-def test_curriculum_rollout_input_exact_reuse_noise_and_detach():
+@pytest.mark.parametrize("reused_variance", [1.5, 2.0])
+def test_curriculum_rollout_input_exact_reuse_noise_and_detach(reused_variance):
     from data.masking import make_rollout_input
     truth = torch.full((1, 4, 1, 1, 4), 7.)
     pred = torch.full_like(truth, 3., requires_grad=True)
-    variance = torch.tensor([.25, 2., 4., 5.]).expand_as(truth).clone().requires_grad_()
+    variance = torch.tensor([.25, reused_variance, 4., 5.]).expand_as(truth).clone().requires_grad_()
     observed = torch.tensor([1., 0., 0., 1.]).expand_as(truth)
     available = torch.tensor([1., 1., 0., 0.]).expand_as(truth)
     noise = torch.full_like(truth, -2.)
     inputs, exact = make_rollout_input(truth, pred, variance, observed, available, noise)
     assert not inputs.requires_grad
     assert torch.equal(inputs[:, :4], torch.tensor([7., 3., -2., -2.]).expand_as(truth))
-    assert torch.equal(inputs[:, 4:], torch.tensor([0., 2., 1., 1.]).expand_as(truth))
+    assert torch.equal(inputs[:, 4:], torch.tensor([0., reused_variance, 1., 1.]).expand_as(truth))
     assert torch.equal(exact, observed * available)
 
 
 @pytest.mark.parametrize("lambda_v,lambda_r,forwards", [(0., 0., 1), (.3, 0., 1), (1., .4, 2)])
-def test_curriculum_phases_formula_and_gradient_routing(lambda_v, lambda_r, forwards, monkeypatch):
+@pytest.mark.parametrize("architecture", [MODEL_VERSION, DIRECT_MODEL_VERSION])
+def test_curriculum_phases_formula_and_gradient_routing(lambda_v, lambda_r, forwards, monkeypatch, architecture):
     from train_masked_unet3d import curriculum_forward_loss
     if lambda_v == 0:
         monkeypatch.setattr("train_masked_unet3d.predicted_error_mse_loss",
                             lambda *a, **kw: pytest.fail("Phase A must not compute a variance loss"))
-    model = UNet3D(base_channels=2, channel_mults=(1, 2, 4), uncertainty_aware=True)
+    model = UNet3D(base_channels=2, channel_mults=(1, 2, 4), uncertainty_aware=True, architecture=architecture)
     truth = torch.randn(1, 4, 4, 4, 4)
     mask = torch.randint(2, truth.shape).float()
     inputs = torch.cat([make_uncertain_input(truth, 1 - mask), 1 - mask], 1)
@@ -496,13 +552,69 @@ def test_curriculum_phases_formula_and_gradient_routing(lambda_v, lambda_r, forw
     assert (model.variance_out.weight.grad is None) == (lambda_v == 0)
     hook.remove()
     # Strict loading uses identical keys in both gradient-routing modes.
-    restored = UNet3D(base_channels=2, channel_mults=(1, 2, 4), uncertainty_aware=True)
+    restored = UNet3D(base_channels=2, channel_mults=(1, 2, 4), uncertainty_aware=True, architecture=architecture)
     restored.load_state_dict(model.state_dict(), strict=True)
     with torch.no_grad():
         model.variance_out.weight.zero_()
         model.variance_out.bias.fill_(3.)
         assert (model(inputs, detach_variance_features=True)[1] > 1).all()
     assert GAUSSIAN_NLL_VARIANCE_FLOOR == 1e-6
+
+
+@pytest.mark.parametrize("bf16", [False, True])
+def test_direct_two_pass_optimization_preserves_gaussian_inputs_and_raw_variance(monkeypatch, bf16):
+    from train_masked_unet3d import curriculum_forward_loss
+
+    model = UNet3D(base_channels=2, channel_mults=(1, 2, 4), use_attention=True,
+                   spatial_only_pooling=True, uncertainty_aware=True, architecture=DIRECT_MODEL_VERSION)
+    with torch.no_grad():
+        model.variance_out.weight.zero_()
+        model.variance_out.bias.fill_(torch.log(torch.expm1(torch.tensor(1.5))).item())
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5)
+    target = torch.randn(1, 4, 4, 8, 8)
+    observed, reuse = torch.zeros_like(target), torch.zeros_like(target)
+    observed[..., ::2] = 1
+    reuse[..., :4] = 1
+    draw_noise, noises, inputs, outputs = torch.randn_like, [], [], []
+
+    def record_noise(values):
+        noise = draw_noise(values)
+        noises.append(noise)
+        return noise
+
+    monkeypatch.setattr("data.masking.torch.randn_like", record_noise)
+    pre = model.register_forward_pre_hook(lambda m, a: inputs.append((a[0].detach().clone(), a[0].requires_grad)))
+    post = model.register_forward_hook(lambda m, a, out: outputs.append(out))
+    model_input = torch.cat([make_uncertain_input(target, 1 - observed), 1 - observed], dim=1)
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=bf16):
+        loss, _, _, parts = curriculum_forward_loss(model, model_input, target, observed, 1., 1., reuse)
+    pre.remove()
+    post.remove()
+    assert len(inputs) == len(outputs) == len(noises) == 2
+    first, second = inputs[0][0], inputs[1][0]
+    exact, retained, unknown = (observed * reuse).bool(), ((1 - observed) * reuse).bool(), (1 - reuse).bool()
+    assert not inputs[1][1]  # No BPTT through either first-pass output.
+    assert torch.equal(first[:, 4:], 1 - observed)
+    assert torch.equal(first[:, :4][observed.bool()], target[observed.bool()])
+    assert torch.equal(first[:, :4][~observed.bool()], noises[0][~observed.bool()])
+    assert torch.count_nonzero(first[:, :4][~observed.bool()]) > 0
+    assert torch.equal(second[:, :4][exact], target[exact]) and (second[:, 4:][exact] == 0).all()
+    torch.testing.assert_close(second[:, :4][retained], outputs[0][0].float()[retained], rtol=0, atol=0)
+    torch.testing.assert_close(second[:, 4:][retained], outputs[0][1].float()[retained], rtol=0, atol=0)
+    assert (second[:, 4:][retained] > 1).all()
+    assert torch.equal(second[:, :4][unknown], noises[1][unknown]) and (second[:, 4:][unknown] == 1).all()
+    for mean, variance in outputs:
+        assert mean.shape == variance.shape == target.shape
+        assert torch.isfinite(mean).all() and torch.isfinite(variance).all() and (variance > 0).all()
+        assert mean.dtype == (torch.bfloat16 if bf16 else torch.float32)
+    assert torch.isfinite(loss) and all(torch.isfinite(parts[k]) for k in ("L_mu_1", "L_var_1", "L_mu_2", "L_var_2"))
+    assert parts["L_var_1"].dtype == parts["L_var_2"].dtype == torch.float32
+    loss.backward()
+    assert all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters())
+    before = model.out.weight.detach().clone()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
+    optimizer.step()
+    assert not torch.equal(model.out.weight, before)
 
 
 def test_curriculum_skipped_updates_do_not_advance_ramps():
