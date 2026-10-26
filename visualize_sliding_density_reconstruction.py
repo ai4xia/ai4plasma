@@ -20,7 +20,15 @@ import torch
 from data.masking import make_uncertain_input
 from matplotlib.patches import Rectangle
 
-from data.vpic_hdf5_dataset import TARGET_SPATIAL_SHAPE, find_h5_files, parse_run_name
+from data.vpic_hdf5_dataset import (
+    FIXED_SPLIT_PATH,
+    TARGET_SPATIAL_SHAPE,
+    find_h5_files,
+    fixed_split_metadata,
+    load_fixed_split,
+    parse_run_name,
+    validate_final_checkpoint,
+)
 from models.unet3d import LEGACY_MODEL_VERSION, UNet3D
 from visualize_mask_patterns_unet3d import (
     DEFAULT_RESIDUAL_VMAX,
@@ -109,11 +117,11 @@ def sliding_plot_cache_signature(
     return {
         "version": PLOT_CACHE_VERSION,
         "kind": "sliding_density_reconstruction",
+        "data_split": fixed_split_metadata(),
         "checkpoint": checkpoint_cache_signature(
             resolve_checkpoint_path(run_dir, args.checkpoint)
         ),
         "run_name": args.run_name,
-        "allow_non_validation_run": bool(args.allow_non_validation_run),
         "slide_steps": [int(step) for step in args.slide_steps],
         "analysis": args.analysis,
         "refinement_step": int(args.refinement_step),
@@ -182,13 +190,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--run-dir",
-        default=DEFAULT_RUN_DIR,
-        help=(
-            "Training run directory containing best.pt. "
-            f"Default: {DEFAULT_RUN_DIR}."
-        ),
+        required=True,
+        help="Completed fixed-split training run containing final.pt.",
     )
-    parser.add_argument("--checkpoint", default="best.pt")
+    parser.add_argument("--checkpoint", default="final.pt")
     parser.add_argument("--h5-dir", default=None)
     parser.add_argument(
         "--run-name",
@@ -197,11 +202,6 @@ def parse_args() -> argparse.Namespace:
             "Complete HDF5 run to reconstruct. The default is the 52-frame "
             "held-out two-plasmoid merger run with beta=0.2."
         ),
-    )
-    parser.add_argument(
-        "--allow-non-validation-run",
-        action="store_true",
-        help="Allow analysis of a run absent from run-dir/split.json val_runs.",
     )
     parser.add_argument(
         "--slide-steps",
@@ -448,20 +448,9 @@ def find_and_load_run(
     raise KeyError(f"Run {run_name!r} was not found in {h5_dir} for betas={betas}.")
 
 
-def validate_test_run(run_dir: Path, run_name: str, allow_non_validation: bool) -> None:
-    split_path = run_dir / "split.json"
-    if not split_path.exists():
-        if allow_non_validation:
-            return
-        raise FileNotFoundError(
-            f"Cannot verify a test run because {split_path} does not exist."
-        )
-    split = json.loads(split_path.read_text())
-    if run_name not in set(split["val_runs"]) and not allow_non_validation:
-        raise ValueError(
-            f"{run_name!r} is not in the checkpoint validation split. Use a "
-            "validation run or pass --allow-non-validation-run explicitly."
-        )
+def validate_test_run(_run_dir: Path, run_name: str) -> None:
+    if run_name not in set(load_fixed_split()["test_runs"]):
+        raise ValueError(f"{run_name!r} is not in {FIXED_SPLIT_PATH} test_runs.")
 
 
 def convert_density_units(
@@ -2180,6 +2169,7 @@ def main() -> None:
             args.device if args.device == "cuda" and torch.cuda.is_available() else "cpu"
         )
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        validate_final_checkpoint(checkpoint)
         checkpoint_args = checkpoint["args"]
         checkpoint_epoch = checkpoint.get("epoch")
         stats = checkpoint["stats"]
@@ -2192,7 +2182,6 @@ def main() -> None:
         validate_test_run(
             run_dir=run_dir,
             run_name=args.run_name,
-            allow_non_validation=args.allow_non_validation_run,
         )
         fields_time_first, frame_ids, h5_path = find_and_load_run(
             h5_dir=h5_dir,

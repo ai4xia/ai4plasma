@@ -13,11 +13,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from data.masking import DEFAULT_PATTERN_WEIGHTS, MASK_PATTERNS  # noqa: E402
 from train_masked_unet3d import (  # noqa: E402
+    apply_ready_curriculum_transition,
     build_epoch_wandb_log,
+    curriculum_is_complete,
     save_checkpoint,
     train_one_epoch,
     validate,
     positive_metric_convergence,
+    require_complete_curriculum,
     phase_a_convergence,
     nll_metric_convergence,
     phase_b_convergence,
@@ -102,7 +105,7 @@ def test_transition_readiness_phase_and_lr_guards():
     assert not phase_a_convergence(history, args, state)["ready_for_variance_ramp"]
 
 
-def test_transition_history_resume_is_exact_and_passive(tmp_path):
+def test_transition_history_resume_is_exact_and_detector_is_pure(tmp_path):
     import json
     from train_masked_unet3d import make_curriculum_state
     args = SimpleNamespace(curriculum_training=True, epochs=20, min_lr=2e-6,
@@ -124,7 +127,7 @@ def test_transition_history_resume_is_exact_and_passive(tmp_path):
         resumed[-1]["phase_convergence"] = actual[-1]
     assert actual == expected
     assert expected[-1]["ready_for_variance_ramp"]
-    assert state == initial_state  # Advisory readiness never arms a ramp or advances a counter.
+    assert state == initial_state  # The epoch-boundary actuator, not the detector, mutates ramp state.
     assert torch.equal(torch.get_rng_state(), rng)
 
 
@@ -170,7 +173,7 @@ def test_transition_phase_a_resets_when_lr_regime_changes():
     assert final["stable_count"] == 1 and not final["ready_for_variance_ramp"]
 
 
-def test_transition_cli_defaults_and_old_checkpoint_compatibility(monkeypatch):
+def test_transition_cli_defaults_and_curriculum_resume_compatibility(monkeypatch):
     from train_masked_unet3d import parse_args, validate_resume_parameters
     options = {"transition_ema_half_life": 5., "transition_rate_window": 5,
                "transition_rate_threshold": .005, "transition_patience": 4}
@@ -179,10 +182,14 @@ def test_transition_cli_defaults_and_old_checkpoint_compatibility(monkeypatch):
         monkeypatch.setattr(sys, "argv", ["train"] + mode)
         args = parse_args()
         assert all(getattr(args, name) == value for name, value in options.items())
-        old = {key: value for key, value in vars(args).items() if key not in options}
-        validate_resume_parameters(args, old)
+        saved = vars(args).copy()
+        validate_resume_parameters(args, saved)
         args.transition_rate_threshold = .001
-        validate_resume_parameters(args, old)  # Advisory settings are not immutable training parameters.
+        if args.curriculum_training:
+            with pytest.raises(ValueError, match="transition_rate_threshold"):
+                validate_resume_parameters(args, saved)
+        else:
+            validate_resume_parameters(args, saved)
     for flag, value in (("--transition-ema-half-life", "0"), ("--transition-ema-half-life", "nan"),
                         ("--transition-rate-window", "0"), ("--transition-rate-threshold", "-1"),
                         ("--transition-patience", "0")):
@@ -273,7 +280,7 @@ def test_phase_b_joint_patience_resets_if_either_metric_moves():
         assert result["stable_count"] == 0 and not result["ready_for_rollout_ramp"]
 
 
-def test_phase_b_history_resume_is_exact_and_passive(tmp_path):
+def test_phase_b_history_resume_is_exact_and_detector_is_pure(tmp_path):
     import json
     args, state, history = _phase_b_example()
     before = dict(state)
@@ -296,6 +303,54 @@ def test_phase_b_history_resume_is_exact_and_passive(tmp_path):
     assert not phase_b_convergence(missing, args, state)["ready_for_rollout_ramp"]
 
 
+def test_ready_detectors_automatically_arm_existing_cosine_ramps():
+    from train_masked_unet3d import curriculum_weights, make_curriculum_state
+
+    args = SimpleNamespace(curriculum_training=True, epochs=20, min_lr=2e-6,
+                           variance_ramp_epochs=40., rollout_ramp_epochs=40.,
+                           transition_ema_half_life=5., transition_rate_window=5,
+                           transition_rate_threshold=.005, transition_patience=4)
+    state = make_curriculum_state(args, updates_per_epoch=10)
+    state["successful_optimizer_steps"] = 300
+    history = [{"epoch": epoch, "val_mse": 1., "val_gaussian_nll": -1.,
+                "learning_rate": 2e-6,
+                "curriculum": {"successful_optimizer_steps": epoch * 10}}
+               for epoch in range(1, 31)]
+
+    phase_a = phase_a_convergence(history, args, state)
+    assert phase_a["ready_for_variance_ramp"]
+    assert apply_ready_curriculum_transition(state, phase_a) == ("variance", 300)
+    assert curriculum_weights(state) == (0., 0.)
+    state["successful_optimizer_steps"] += 1
+    assert 0 < curriculum_weights(state)[0] < 1 and curriculum_weights(state)[1] == 0
+
+    variance_end = state["variance_ramp_start_step"] + state["variance_ramp_steps"]
+    state["successful_optimizer_steps"] = variance_end
+    for epoch in range(31, 45):
+        history.append({"epoch": epoch, "val_mse": 1., "val_gaussian_nll": -1.,
+                        "learning_rate": 2e-6,
+                        "curriculum": {"successful_optimizer_steps": variance_end}})
+    phase_b = phase_b_convergence(history, args, state)
+    assert phase_b["ready_for_rollout_ramp"]
+    assert apply_ready_curriculum_transition(state, phase_b) == ("rollout", variance_end)
+    assert curriculum_weights(state) == (1., 0.)
+    state["successful_optimizer_steps"] += state["rollout_ramp_steps"]
+    assert curriculum_weights(state) == (1., 1.)
+    assert curriculum_is_complete(state)
+    require_complete_curriculum(state, epoch=240)
+
+
+def test_incomplete_curriculum_is_rejected_as_official_final():
+    from train_masked_unet3d import make_curriculum_state
+
+    args = SimpleNamespace(variance_ramp_epochs=40., rollout_ramp_epochs=40.)
+    state = make_curriculum_state(args, updates_per_epoch=10)
+    with pytest.raises(RuntimeError, match="final epoch 240 reached before the curriculum completed"):
+        require_complete_curriculum(state, epoch=240)
+    assert not curriculum_is_complete(state)
+    assert state["successful_optimizer_steps"] == 0
+
+
 def test_supplied_scaler_persists_across_epochs_and_checkpoints(tmp_path):
     from types import SimpleNamespace
 
@@ -316,7 +371,7 @@ def test_supplied_scaler_persists_across_epochs_and_checkpoints(tmp_path):
         assert metrics["amp_skipped_steps"] == 0
     assert scales == [(8.0, 16.0), (16.0, 32.0)]
     path = tmp_path / "latest.pt"
-    save_checkpoint(path, model, optimizer, epoch=2, best_val_mse=1.0,
+    save_checkpoint(path, model, optimizer, epoch=2,
                     args=SimpleNamespace(), stats={}, scaler=scaler)
     checkpoint = torch.load(path, weights_only=False)
     restored = torch.amp.GradScaler("cpu")
@@ -387,7 +442,7 @@ def test_resume_scaler_state_disabled_bf16_and_enabled_fp16(tmp_path, enabled):
     scaler.update()
     assert model.scale.item() == pytest.approx(.4)
     path = tmp_path / "latest.pt"
-    save_checkpoint(path, model, optimizer, 1, 1., SimpleNamespace(), {}, scaler=scaler)
+    save_checkpoint(path, model, optimizer, 1, SimpleNamespace(), {}, scaler=scaler)
     assert ("scaler" in torch.load(path, weights_only=False)) is enabled
 
 
@@ -410,7 +465,7 @@ def test_launcher_resume_scaler_preflight(tmp_path, monkeypatch, dtype, scaler_s
     state["successful_optimizer_steps"] = 6
     checkpoint = dict(model={"weight": torch.ones(1)}, optimizer={"state": {}},
         stats={"mean": [0.] * 4, "std": [1.] * 4}, epoch=6, args=vars(args),
-        curriculum_state=state, best_val_mse=.1)
+        curriculum_state=state, split_sha256=args.split_sha256)
     if scaler_state != "missing":
         checkpoint["scaler"] = (torch.amp.GradScaler("cpu", init_scale=1e31).state_dict()
                                 if scaler_state == "old" else {})
@@ -567,6 +622,60 @@ def test_wandb_epoch_log_has_no_mae_and_keeps_mse_and_sampling_stats():
         assert key in log_data
 
 
+def test_wandb_epoch_log_includes_curriculum_phase_and_convergence_state():
+    train_metrics = {
+        "magnetic_pattern_share": {name: 0.2 for name in MASK_PATTERNS},
+        "density_pattern_share": {name: 0.2 for name in MASK_PATTERNS},
+    }
+    val_metrics = {pattern: {"mse": 0.1} for pattern in MASK_PATTERNS}
+    val_metrics["mean"] = {"mse": 0.1}
+    row = {
+        "epoch": 30, "learning_rate": 2e-6, "train_mse": 0.1, "val_mse": 0.1,
+        "train_mask_target_fraction": 0.5, "train_mask_actual_fraction": 0.5,
+        "train_density_probe_count": 10., "train_density_visible_fraction": 0.1,
+        "train_density_zero_sample_share": 0.05, "train_density_full_sample_share": 0.05,
+        "train_magnetic_visible_count": 20., "train_magnetic_visible_fraction": 0.2,
+        "train_magnetic_zero_sample_share": 0.05, "train_magnetic_full_sample_share": 0.05,
+        "curriculum": {
+            "lambda_v_start": 0., "lambda_v_mean": 0., "lambda_v_end": 0.,
+            "lambda_r_start": 0., "lambda_r_mean": 0., "lambda_r_end": 0.,
+            "phase_index": 0, "phase_name": "reconstruction_only",
+            "convergence_rate_threshold": .005, "convergence_patience_target": 4,
+        },
+        "phase_convergence": {
+            "smoothed_rate_per_epoch": -.001, "stable_count": 4, "segment_age": 10,
+            "ready_for_variance_ramp": True,
+        },
+    }
+    log_data = build_epoch_wandb_log(row, train_metrics, val_metrics, list(MASK_PATTERNS))
+    expected = {
+        "optimization/learning_rate": 2e-6,
+        "curriculum/lambda_v_start": 0., "curriculum/lambda_v_mean": 0.,
+        "curriculum/lambda_v_end": 0., "curriculum/lambda_r_start": 0.,
+        "curriculum/lambda_r_mean": 0., "curriculum/lambda_r_end": 0.,
+        "curriculum/phase_index": 0, "curriculum/phase_name": "reconstruction_only",
+        "curriculum/convergence_rate_threshold": .005,
+        "curriculum/convergence_patience_target": 4,
+        "curriculum/mse_rate_per_epoch": -.001,
+        "curriculum/convergence_stable_count": 4,
+        "curriculum/convergence_segment_age": 10,
+        "curriculum/ready_for_variance_ramp": True,
+        "curriculum/ready_for_rollout_ramp": False,
+    }
+    assert {key: log_data[key] for key in expected} == expected
+
+    row.pop("phase_convergence")
+    row["phase_b_convergence"] = {
+        "mse_rate_per_epoch": -.002, "nll_rate_per_epoch": .003,
+        "stable_count": 3, "segment_age": 12, "ready_for_rollout_ramp": False,
+    }
+    log_data = build_epoch_wandb_log(row, train_metrics, val_metrics, list(MASK_PATTERNS))
+    assert log_data["curriculum/mse_rate_per_epoch"] == -.002
+    assert log_data["curriculum/nll_rate_per_epoch"] == .003
+    assert log_data["curriculum/convergence_stable_count"] == 3
+    assert not log_data["curriculum/ready_for_rollout_ramp"]
+
+
 def test_resume_history_filter_tolerates_old_mae_fields():
     history = [
         {"epoch": 1, "train_mse": 0.2, "train_mae": 0.1, "val_mse": 0.3, "val_mae": 0.2},
@@ -578,12 +687,7 @@ def test_resume_history_filter_tolerates_old_mae_fields():
     assert filtered[0]["val_mse"] == 0.3
 
 
-def test_best_checkpoint_selection_uses_val_mse_only():
-    best_val_mse = float("inf")
-    chosen = None
-    for epoch, val_mse, val_mae in ((1, 0.20, 0.01), (2, 0.25, 0.001), (3, 0.15, 0.9)):
-        if val_mse < best_val_mse:
-            best_val_mse = val_mse
-            chosen = epoch
-    assert chosen == 3
-    assert best_val_mse == 0.15
+def test_validation_metrics_do_not_select_a_checkpoint():
+    source = Path(__file__).resolve().parents[1].joinpath("train_masked_unet3d.py").read_text()
+    assert 'out_dir / "best.pt"' not in source
+    assert 'out_dir / "final.pt"' in source

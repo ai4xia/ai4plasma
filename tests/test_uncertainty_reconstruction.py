@@ -237,15 +237,21 @@ def test_stage1_stops_before_optimizer_step_on_invalid_values(monkeypatch, fault
     assert not optimizer.state
 
 
-def test_six_epoch_main_preserves_twenty_epoch_schedule_and_reference_stats(monkeypatch, tmp_path, capsys):
+def test_six_epoch_main_preserves_twenty_epoch_schedule_and_fixed_train_stats(monkeypatch, tmp_path, capsys):
     import json
     import train_masked_unet3d as train
 
+    from data.vpic_hdf5_dataset import load_fixed_split
+    split = load_fixed_split()
+    train_name = next(name for name in split["train_runs"] if name.startswith("beta0.2_"))
+    val_name = next(name for name in split["val_runs"] if name.startswith("beta0.2_"))
+
     class Dataset(torch.utils.data.Dataset):
+        samples = [(0, train_name, 0), (0, val_name, 0)]
         def __len__(self):
             return 2
         def __getitem__(self, i):
-            return {"block": torch.ones(4, 2, 4, 4), "metadata": {"beta": .01}}
+            return {"block": torch.ones(4, 2, 4, 4), "metadata": {"beta": .2}}
 
     class Model(torch.nn.Module):
         def __init__(self):
@@ -255,27 +261,22 @@ def test_six_epoch_main_preserves_twenty_epoch_schedule_and_reference_stats(monk
         def forward(self, x):
             return x[:, :4] * self.scale, F.softplus(self.logit).expand_as(x[:, :4])
 
-    reference = tmp_path / "reference"
-    reference.mkdir()
     stats = {"mean": [0.] * 4, "std": [1.] * 4}
-    (reference / "stats.json").write_text(json.dumps(stats))
-    (reference / "split.json").write_text(json.dumps({"train_runs": ["train"], "val_runs": ["val"]}))
     out = tmp_path / "experiment"
     monkeypatch.setattr(sys, "argv", ["train", "--epochs", "20", "--stop-after-epochs", "6",
                         "--warmup-epochs", "1", "--lr", "2e-5", "--min-lr", "2e-6",
                         "--batch-size", "1", "--num-workers", "0", "--uncertainty-aware",
                         "--uncertainty-loss", "gaussian_nll", "--no-auto-resume", "--no-wandb",
                         "--mask-patterns", "spatial_random", "1", "--val-patterns", "spatial_random",
-                        "--reference-run-dir", str(reference), "--out-dir", str(out)])
+                        "--final-epoch", "20", "--out-dir", str(out)])
     monkeypatch.setattr(train, "initialize_distributed", lambda: (torch.device("cpu"), 0, 1, 0))
     monkeypatch.setattr(train, "VPICWindowDataset", lambda **kw: Dataset())
     monkeypatch.setattr(train, "DataLoader", lambda *a, **kw: torch.utils.data.DataLoader(
         *a, **dict(kw, pin_memory=False)))
-    monkeypatch.setattr(train, "split_by_run", lambda *a, **kw: ([0], [1], ["train"], ["val"]))
+    monkeypatch.setattr(train, "split_by_run", lambda *a, **kw: ([0], [1], [train_name], [val_name]))
     monkeypatch.setattr(train, "UNet3D", lambda **kw: Model())
-    def no_recompute(*a, **kw):
-        pytest.fail("Reference normalization must not be recomputed")
-    monkeypatch.setattr(train, "estimate_channel_stats", no_recompute)
+    stats_calls = []
+    monkeypatch.setattr(train, "estimate_channel_stats", lambda *a, **kw: stats_calls.append(True) or stats)
     train.main()
     history = json.loads((out / "history.json").read_text())
     assert [r["epoch"] for r in history] == list(range(1, 7))
@@ -286,6 +287,8 @@ def test_six_epoch_main_preserves_twenty_epoch_schedule_and_reference_stats(monk
     checkpoint = torch.load(out / "latest.pt", weights_only=False)
     assert checkpoint["epoch"] == 6 and checkpoint["args"]["epochs"] == 20
     assert checkpoint["stats"] == stats
+    assert stats_calls == [True]
+    assert not (out / "final.pt").exists()
     Model().load_state_dict(checkpoint["model"], strict=True)
     assert all(float(state["step"]) == 6 for state in checkpoint["optimizer"]["state"].values())
     printed = capsys.readouterr().out
@@ -417,7 +420,8 @@ def test_manual_curriculum_arming_and_checkpoint_continuity(monkeypatch, tmp_pat
     assert not state["variance_ramp_armed"] and not state["rollout_ramp_armed"]
     assert state["variance_ramp_steps"] == state["rollout_ramp_steps"] == 400
     state["successful_optimizer_steps"] = 1000
-    assert curriculum_weights(state) == (0., 0.)  # No automatic transition.
+    # Successful steps alone do not replace the validation-readiness actuator.
+    assert curriculum_weights(state) == (0., 0.)
     args.arm_rollout_ramp = True
     with pytest.raises(ValueError, match="fully completed"):
         make_curriculum_state(args, 10, {"curriculum_state": state})
@@ -445,7 +449,7 @@ def test_manual_curriculum_arming_and_checkpoint_continuity(monkeypatch, tmp_pat
     for prefix, mid_step in (("variance", 1200), ("rollout", 1600)):
         state["successful_optimizer_steps"] = mid_step
         expected = curriculum_weights(state)
-        save_checkpoint(checkpoint_path, model, optimizer, 20, .1, args, {}, curriculum_state=state)
+        save_checkpoint(checkpoint_path, model, optimizer, 20, args, {}, curriculum_state=state)
         checkpoint = torch.load(checkpoint_path, weights_only=False)
         assert (checkpoint["curriculum_state"]["lambda_v"], checkpoint["curriculum_state"]["lambda_r"]) == expected
         assert checkpoint["lr_schedule"]["horizon_epochs"] == 20
@@ -689,22 +693,25 @@ def test_curriculum_compressed_main_save_resume_smoke(monkeypatch, tmp_path, cap
     if device.type == "cuda":
         assert torch.cuda.is_available(), "GPU smoke explicitly requested but CUDA is unavailable"
     class Dataset(torch.utils.data.Dataset):
+        samples = []
         def __len__(self): return 5
         def __getitem__(self, i):
             block = torch.randn(4, 2, 8, 8, generator=torch.Generator().manual_seed(i))
             return {"block": block, "metadata": {"beta": .01}}
+    from data.vpic_hdf5_dataset import load_fixed_split
+    split = load_fixed_split()
+    train_name = next(name for name in split["train_runs"] if name.startswith("beta0.2_"))
+    val_name = next(name for name in split["val_runs"] if name.startswith("beta0.2_"))
+    Dataset.samples = [(0, train_name, i) for i in range(4)] + [(0, val_name, 0)]
     monkeypatch.setattr(train, "initialize_distributed", lambda: (device, 0, 1, 0))
     monkeypatch.setattr(train, "VPICWindowDataset", lambda **kw: Dataset())
-    monkeypatch.setattr(train, "split_by_run", lambda *a, **kw: ([0, 1, 2, 3], [4], ["train"], ["val"]))
-    reference = tmp_path / "reference"
-    reference.mkdir()
-    (reference / "stats.json").write_text(json.dumps({"mean": [0.] * 4, "std": [1.] * 4}))
-    (reference / "split.json").write_text(json.dumps({"train_runs": ["train"], "val_runs": ["val"]}))
+    monkeypatch.setattr(train, "split_by_run", lambda *a, **kw: ([0, 1, 2, 3], [4], [train_name], [val_name]))
+    monkeypatch.setattr(train, "estimate_channel_stats", lambda *a, **kw: {"mean": [0.] * 4, "std": [1.] * 4})
     base = ["train", "--epochs", "20", "--warmup-epochs", "1", "--lr", "2e-5", "--min-lr", "2e-6",
             "--batch-size", "2", "--num-workers", "0", "--base-channels", "2", "--channel-mults", "1", "2", "4", "8",
             "--spatial-only-pooling", "--use-attention", "--uncertainty-aware", "--uncertainty-loss", "gaussian_nll",
             "--curriculum-training", "--variance-ramp-epochs", "2", "--rollout-ramp-epochs", "2", "--curriculum-log-every", "1",
-            "--no-wandb", "--val-patterns", "spatial_random", "--reference-run-dir", str(reference)]
+            "--no-wandb", "--val-patterns", "spatial_random", "--final-epoch", "27"]
     if not manual:
         base += ["--variance-ramp-start-epoch", "1", "--rollout-ramp-start-epoch", "4"]
     if device.type == "cuda": base += ["--amp", "--amp-dtype", "bfloat16"]
@@ -745,7 +752,8 @@ def test_curriculum_compressed_main_save_resume_smoke(monkeypatch, tmp_path, cap
         assert all(r["learning_rate"] == 2e-6 for r in history if r["epoch"] >= 20)
         assert all(r["curriculum"]["total_loss"] == pytest.approx(r["train_mse"], rel=1e-7) and
                    r["curriculum"]["two_forward_fraction"] == 0 for r in history[:21])
-        assert saved["best_val_mse"] == min(r["val_mse"] for r in history)
+        assert "best_val_mse" not in saved and not (out / "best.pt").exists()
+        assert (out / "final.pt").is_file()
         assert all(r["amp_skipped_steps"] == r["nonfinite_events"] == 0 for r in history)
         assert all(torch.isfinite(torch.tensor(r["gradient_norm_max"])) for r in history)
         if device.type == "cpu":
@@ -753,7 +761,7 @@ def test_curriculum_compressed_main_save_resume_smoke(monkeypatch, tmp_path, cap
             assert all(r["amp_scale_start"] == 8. * 2 ** (2 * (r["epoch"] - 1)) for r in history)
         (tmp_path / "manual_curriculum_smoke.log").write_text(log)
         print(log)
-        print("Manual arming/resume preserved optimizer, scaler, history, best metric and min LR; checkpoints:", out)
+        print("Manual arming/resume preserved optimizer, scaler, history and min LR; checkpoints:", out)
         return
     full, resumed = tmp_path / "uninterrupted", tmp_path / "resumed"
     complete_log = run(full, 8, True)
@@ -781,7 +789,7 @@ def test_curriculum_compressed_main_save_resume_smoke(monkeypatch, tmp_path, cap
                     "lambda_r_start", "lambda_r_end", "lambda_r_mean", "successful_optimizer_steps"):
             assert full_epoch["curriculum"][key] == resumed_epoch["curriculum"][key]
     assert [r["epoch"] for r in history] == list(range(1, 9))
-    assert checkpoint["best_val_mse"] == min(r["val_mse"] for r in history)
+    assert "best_val_mse" not in checkpoint and not (resumed / "best.pt").exists()
     assert all(r["amp_skipped_steps"] == r["nonfinite_events"] == 0 for r in history)
     assert all(torch.isfinite(torch.tensor(r["gradient_norm_max"])) for r in history)
     assert history[-1]["curriculum"]["two_forward_fraction"] == 1

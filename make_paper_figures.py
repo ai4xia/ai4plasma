@@ -20,7 +20,13 @@ import numpy as np
 import torch
 from matplotlib.lines import Line2D
 
-from data.vpic_hdf5_dataset import VPICWindowDataset, find_h5_files
+from data.vpic_hdf5_dataset import (
+    VPICWindowDataset,
+    find_h5_files,
+    fixed_split_metadata,
+    load_fixed_split,
+    validate_final_checkpoint,
+)
 from models.unet3d import LEGACY_MODEL_VERSION, UNet3D
 from visualize_mask_patterns_unet3d import (
     DEFAULT_MAGNETIC_ABLATION_VISIBLE_FRACTIONS,
@@ -47,7 +53,7 @@ from visualize_mask_patterns_unet3d import (
     denormalize,
     expand_path,
     get_train_runs,
-    get_val_runs,
+    get_test_runs,
     jy_metric_metadata,
     jy_nrmse_from_residual,
     load_checkpoint,
@@ -158,8 +164,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Render paper figures from cached arrays, recomputing only if needed."
     )
-    parser.add_argument("--run-dir", default=DEFAULT_RUN_DIR)
-    parser.add_argument("--checkpoint", default="latest.pt")
+    parser.add_argument("--run-dir", required=True)
+    parser.add_argument("--checkpoint", default="final.pt")
     parser.add_argument("--run-name", default=DEFAULT_RUN_NAME)
     parser.add_argument("--paper-dir", default=None)
     parser.add_argument("--force-recompute", action="store_true")
@@ -219,8 +225,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_SLIDING_MAX_RUNS,
         help=(
-            "Maximum held-out validation runs for sliding appendix left-panel "
-            "RMSE stats, taken in split.json order. Runs shorter than 48 frames "
+            "Maximum held-out test runs for sliding appendix left-panel "
+            "RMSE stats, taken in authoritative test-split order. Runs shorter than 48 frames "
             "are skipped; remaining runs use only the first 48 frames."
         ),
     )
@@ -365,10 +371,8 @@ def annotate_density_nrmse(ax, nrmse: float) -> None:
 
 
 def validation_run_order(run_dir: Path) -> List[str]:
-    split_path = run_dir / "split.json"
-    if not split_path.exists():
-        return []
-    return [str(name) for name in json.loads(split_path.read_text()).get("val_runs", [])]
+    del run_dir
+    return [str(name) for name in load_fixed_split()["test_runs"]]
 
 
 def peek_run_n_frames(
@@ -389,7 +393,7 @@ def select_sliding_aggregate_runs(
     val_run_order: Sequence[str],
     max_runs: int,
 ) -> List[str]:
-    """Take the first ``max_runs`` validation runs in ``split.json`` order."""
+    """Take the first ``max_runs`` test runs in authoritative split order."""
     if int(max_runs) <= 0:
         raise ValueError(f"sliding max runs must be positive, got {max_runs}")
     return [str(name) for name in val_run_order][: int(max_runs)]
@@ -539,8 +543,7 @@ def save_png_pdf(fig, figures_dir: Path, stem: str, dpi: int) -> None:
 
 
 def base_signature(args: argparse.Namespace, run_dir: Path, checkpoint_path: Path) -> Dict:
-    split_path = run_dir / "split.json"
-    split = json.loads(split_path.read_text()) if split_path.exists() else {}
+    split = load_fixed_split()
     return {
         "cache_version": PAPER_CACHE_VERSION,
         "checkpoint": checkpoint_cache_signature(checkpoint_path),
@@ -549,7 +552,9 @@ def base_signature(args: argparse.Namespace, run_dir: Path, checkpoint_path: Pat
         "global_frame": int(args.global_frame),
         "seed": int(args.seed),
         "extent": [float(value) for value in args.extent],
-        "val_runs": sorted(split.get("val_runs", [])),
+        "data_role": "test",
+        "data_split": fixed_split_metadata(),
+        "test_runs": sorted(split["test_runs"]),
         "train_run_count": len(split.get("train_runs", [])),
     }
 
@@ -653,6 +658,7 @@ def manifest_figure_entry(
 
 def read_checkpoint_epoch(checkpoint_path: Path) -> int:
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    validate_final_checkpoint(ckpt)
     epoch = ckpt.get("epoch")
     if epoch is None:
         raise RuntimeError(f"Checkpoint {checkpoint_path} has no epoch metadata.")
@@ -838,10 +844,8 @@ def load_inference_context(args: argparse.Namespace) -> Dict:
         layout="C T X Z",
         return_metadata=True,
     )
-    val_runs = get_val_runs(run_dir)
-    train_runs = get_train_runs(run_dir)
-    if train_runs is None:
-        raise FileNotFoundError("Jy stats require split.json train_runs.")
+    val_runs = get_test_runs()
+    train_runs = get_train_runs()
     mean = torch.tensor(stats["mean"], dtype=torch.float32, device=device).view(1, 4, 1, 1, 1)
     std = torch.tensor(stats["std"], dtype=torch.float32, device=device).view(1, 4, 1, 1, 1)
     jy_stats = load_or_compute_jy_training_stats(
@@ -1904,7 +1908,7 @@ def build_sliding_appendix_cache(
     slide_steps = [int(step) for step in args.slide_steps]
     candidate_runs = validation_run_order(run_dir)
     if not candidate_runs:
-        raise RuntimeError(f"No validation runs in {run_dir / 'split.json'}")
+        raise RuntimeError(f"No test runs in the authoritative project split")
     aggregate_runs = select_sliding_aggregate_runs(
         candidate_runs,
         int(args.sliding_max_runs),
@@ -2006,7 +2010,7 @@ def build_sliding_appendix_cache(
         "size_x": size_x,
         "size_z": size_z,
         "aggregation": (
-            f"{len(loaded_runs)} validation runs; one framewise RMSE series per run "
+            f"{len(loaded_runs)} test runs; one framewise RMSE series per run "
             f"from the first {SLIDING_AGGREGATE_N_FRAMES} frames, B condition, "
             "and slide step; then median and 16th-84th percentiles across runs"
         ),
@@ -2032,9 +2036,9 @@ def plot_sliding_window_appendix(
     probe_count = metadata.get("density_probe_count")
     ratio_percent = metadata.get("density_visible_ratio_percent")
     run_phrase = (
-        f"{int(n_runs)} validation runs, first {int(n_frames)} frames"
+        f"{int(n_runs)} test runs, first {int(n_frames)} frames"
         if n_runs and n_frames
-        else (f"{int(n_runs)} validation runs" if n_runs else "Validation runs")
+        else (f"{int(n_runs)} test runs" if n_runs else "Test runs")
     )
     if probe_count is not None and ratio_percent is not None:
         figure_title = (
@@ -2277,7 +2281,7 @@ def main() -> None:
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     figures = selected_figures(args.figure)
     if "spatial" in figures or "sliding" in figures:
-        validate_test_run(run_dir, args.run_name, allow_non_validation=False)
+        validate_test_run(run_dir, args.run_name)
     checkpoint_epoch = read_checkpoint_epoch(checkpoint_path)
     provenance = provenance_for_checkpoint(checkpoint_path, checkpoint_epoch)
     paper_dir = (

@@ -1,6 +1,8 @@
 # ai4plasma/data/vpic_hdf5_dataset.py
 
 from __future__ import annotations
+import hashlib
+import json
 import os
 import re
 from pathlib import Path
@@ -14,6 +16,90 @@ from torch.utils.data import Dataset, DataLoader
 
 
 TARGET_SPATIAL_SHAPE = (154, 62)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+FIXED_SPLIT_PATH = PROJECT_ROOT / "split.json"
+FIXED_SPLIT_COUNTS = {"train_runs": 2250, "val_runs": 125, "test_runs": 125}
+CANONICAL_TEST_RUN = "beta0.2_nu2_Bz0_dt2_tau70"
+KNOWN_SHORT_TRAIN_RUNS = {
+    "beta0.02_nu10_Bz0.3_dt2_tau150",
+    "beta0.1_nu10_Bz0.15_dt2_tau150",
+}
+
+
+def fixed_split_sha256(path: Union[str, Path] = FIXED_SPLIT_PATH) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def load_fixed_split(path: Union[str, Path] = FIXED_SPLIT_PATH) -> Dict:
+    """Load and validate the project-wide train/validation/test split."""
+    path = Path(path).resolve()
+    if path != FIXED_SPLIT_PATH.resolve():
+        raise ValueError(f"The only supported split is {FIXED_SPLIT_PATH}.")
+    split = json.loads(path.read_text())
+    roles = {}
+    for key, expected_count in FIXED_SPLIT_COUNTS.items():
+        values = split.get(key)
+        if not isinstance(values, list) or len(values) != expected_count:
+            raise ValueError(
+                f"{path}: {key} must contain exactly {expected_count} runs."
+            )
+        if len(set(values)) != len(values):
+            raise ValueError(f"{path}: {key} contains duplicate run names.")
+        roles[key] = set(values)
+    for left, right in (("train_runs", "val_runs"), ("train_runs", "test_runs"),
+                        ("val_runs", "test_runs")):
+        overlap = roles[left] & roles[right]
+        if overlap:
+            raise ValueError(f"{path}: {left} and {right} overlap: {sorted(overlap)[:5]}")
+    if CANONICAL_TEST_RUN not in roles["test_runs"]:
+        raise ValueError(f"{CANONICAL_TEST_RUN} must remain in test_runs.")
+    if not KNOWN_SHORT_TRAIN_RUNS <= roles["train_runs"]:
+        raise ValueError("Both known short runs must remain in train_runs.")
+    return split
+
+
+def fixed_split_metadata(path: Union[str, Path] = FIXED_SPLIT_PATH) -> Dict:
+    split = load_fixed_split(path)
+    return {
+        "path": str(FIXED_SPLIT_PATH),
+        "sha256": fixed_split_sha256(path),
+        "counts": {key: len(split[key]) for key in FIXED_SPLIT_COUNTS},
+    }
+
+
+def validate_checkpoint_split(checkpoint: Dict) -> None:
+    expected = fixed_split_sha256()
+    actual = checkpoint.get("split_sha256")
+    if actual != expected:
+        raise ValueError(
+            "Checkpoint split hash does not match the authoritative project split: "
+            f"checkpoint={actual!r}, current={expected!r}."
+        )
+
+
+def validate_final_checkpoint(checkpoint: Dict) -> None:
+    validate_checkpoint_split(checkpoint)
+    final_epoch = checkpoint.get("args", {}).get("final_epoch")
+    if final_epoch is None or int(checkpoint.get("epoch", -1)) != int(final_epoch):
+        raise ValueError(
+            "Test-set evaluation requires the predetermined final checkpoint; "
+            f"checkpoint epoch={checkpoint.get('epoch')!r}, final_epoch={final_epoch!r}."
+        )
+
+
+def h5_run_lengths(h5_dir: Union[str, Path]) -> Dict[str, int]:
+    """Read run lengths from all VPIC HDF5 indices, including short runs."""
+    lengths: Dict[str, int] = {}
+    for path in find_h5_files(h5_dir):
+        with h5py.File(path, "r") as handle:
+            names = handle["index/run_names"].asstr()[:]
+            times = handle["index/T"][:]
+            for name, length in zip(names, times):
+                name = str(name)
+                if name in lengths:
+                    raise ValueError(f"Duplicate HDF5 run name: {name}")
+                lengths[name] = int(length)
+    return lengths
 
 
 def _beta_from_filename(path: Path) -> float:
@@ -77,6 +163,7 @@ class VPICWindowDataset(Dataset):
         layout: str = "C T X Z",
         return_metadata: bool = True,
         load_to_memory: bool = False,
+        include_runs: Optional[Sequence[str]] = None,
     ):
         """
         Parameters
@@ -107,6 +194,10 @@ class VPICWindowDataset(Dataset):
 
         load_to_memory:
             Usually False. Keep HDF5 lazy reading.
+
+        include_runs:
+            Optional authoritative run-name allowlist. Training uses this to
+            index train/validation windows without creating test samples.
         """
         super().__init__()
 
@@ -125,6 +216,7 @@ class VPICWindowDataset(Dataset):
         self.layout = layout
         self.return_metadata = return_metadata
         self.load_to_memory = load_to_memory
+        self.include_runs = None if include_runs is None else set(include_runs)
         # each sample: (file_idx, run_name, t0)
 
         self._build_index(run_stride=run_stride)
@@ -155,6 +247,8 @@ class VPICWindowDataset(Dataset):
 
                 for i in range(0, len(run_names), run_stride):
                     run_name = str(run_names[i])
+                    if self.include_runs is not None and run_name not in self.include_runs:
+                        continue
                     Ti = int(T[i])
 
                     if Ti < self.delta_t:

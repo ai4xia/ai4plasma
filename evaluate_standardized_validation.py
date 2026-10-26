@@ -1,5 +1,5 @@
 # evaluate_standardized_validation.py
-"""Post-hoc held-out evaluation on the five standardized ~50% validation masks."""
+"""Post-hoc test-set evaluation on the five standardized ~50% masks."""
 
 from __future__ import annotations
 
@@ -20,7 +20,13 @@ from data.masking import (
     full_mse_loss,
     make_fixed_validation_mask,
 )
-from data.vpic_hdf5_dataset import VPICWindowDataset
+from data.vpic_hdf5_dataset import (
+    FIXED_SPLIT_PATH,
+    VPICWindowDataset,
+    fixed_split_metadata,
+    load_fixed_split,
+    validate_final_checkpoint,
+)
 from models.unet3d import LEGACY_MODEL_VERSION, UNet3D
 from visualize_mask_patterns_unet3d import (
     DEFAULT_RUN_DIR,
@@ -31,7 +37,7 @@ from visualize_mask_patterns_unet3d import (
     denormalize,
     expand_path,
     get_train_runs,
-    get_val_runs,
+    get_test_runs,
     jy_metric_metadata,
     load_checkpoint,
     load_or_compute_jy_training_stats,
@@ -63,12 +69,12 @@ DENSITY_NRMSE_DEFINITION = (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate latest.pt on the five standardized 50% validation masks "
+            "Evaluate final.pt on the fixed test runs with five standardized 50% masks "
             "and write a paper numerical table, or a bounded density calibration plot."
         )
     )
-    parser.add_argument("--run-dir", default=DEFAULT_RUN_DIR)
-    parser.add_argument("--checkpoint", default="latest.pt")
+    parser.add_argument("--run-dir", required=True)
+    parser.add_argument("--checkpoint", default="final.pt")
     parser.add_argument("--out-dir", default=None)
     parser.add_argument("--force-recompute", action="store_true")
     parser.add_argument("--device", default="cuda")
@@ -201,12 +207,13 @@ def format_median_interval(stats: Dict[str, float]) -> str:
 
 def split_identity(split: Dict) -> Dict:
     return {
-        "val_runs": sorted(split.get("val_runs", [])),
+        "data_role": "test",
+        "split_path": str(FIXED_SPLIT_PATH),
+        "split_sha256": fixed_split_metadata()["sha256"],
+        "test_runs": sorted(split.get("test_runs", [])),
         "train_runs": sorted(split.get("train_runs", [])),
-        "n_val_runs": len(split.get("val_runs", [])),
+        "n_test_runs": len(split.get("test_runs", [])),
         "n_train_runs": len(split.get("train_runs", [])),
-        "num_val_windows": split.get("num_val_windows"),
-        "num_train_windows": split.get("num_train_windows"),
     }
 
 
@@ -273,7 +280,7 @@ def load_cached_payload(out_dir: Path, signature: Dict) -> Dict | None:
     if payload.get("signature") != signature:
         print(f"Cache signature mismatch at {json_path}; will recompute.")
         return None
-    print(f"Reusing standardized validation cache: {json_path}")
+    print(f"Reusing standardized test cache: {json_path}")
     return payload
 
 
@@ -399,7 +406,7 @@ def select_val_window_indices(dataset: VPICWindowDataset, val_runs: set[str]) ->
         if run_name in val_runs
     ]
     if not indices:
-        raise RuntimeError("No validation windows found for split.json val_runs.")
+        raise RuntimeError(f"No test windows found for {FIXED_SPLIT_PATH} test_runs.")
     return indices
 
 
@@ -415,7 +422,7 @@ def select_calibration_indices(dataset, val_runs, betas, runs_per_beta, windows_
     for beta, runs in sorted(grouped.items()):
         eligible = sorted(name for name, indices in runs.items() if len(indices) >= windows_per_run)
         if len(eligible) < runs_per_beta:
-            raise ValueError(f"Beta {beta}: need {runs_per_beta} eligible validation runs, got {len(eligible)}")
+            raise ValueError(f"Beta {beta}: need {runs_per_beta} eligible test runs, got {len(eligible)}")
         for name in sorted(rng.choice(eligible, runs_per_beta, replace=False)):
             selected.extend(sorted(rng.choice(runs[name], windows_per_run, replace=False).tolist()))
     return selected
@@ -612,7 +619,7 @@ def save_density_calibration(samples, records, metadata, out_dir, n_bins, run_sp
     if run_split is not None:
         summary["interpretation"] += (
             " Held-out-run post-hoc calibration evaluation, not an independent test set: "
-            "the checkpoint was selected using this validation population. Runs are the independent "
+            "the final checkpoint was predetermined before this test population was evaluated. Runs are the independent "
             "sampling units; no voxel-level uncertainty intervals are reported. Positive scaling "
             "preserves discrimination but global mean correction does not guarantee conditional "
             "calibration. "
@@ -746,7 +753,7 @@ def evaluate_windows(
             or sample_number == len(sample_indices)
         ):
             print(
-                f"Standardized validation: {sample_number}/{len(sample_indices)} windows"
+                f"Standardized test evaluation: {sample_number}/{len(sample_indices)} windows"
             )
     return records, pattern_infos or []
 
@@ -757,12 +764,10 @@ def main() -> None:
     checkpoint_path = resolve_checkpoint_path(run_dir, args.checkpoint)
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    split_path = run_dir / "split.json"
-    if not split_path.exists():
-        raise FileNotFoundError(f"Missing {split_path}")
-    split = json.loads(split_path.read_text())
+    split = load_fixed_split()
 
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    validate_final_checkpoint(ckpt)
     ckpt_args = ckpt["args"]
     checkpoint_epoch = int(ckpt["epoch"])
     stats = ckpt["stats"]
@@ -812,11 +817,8 @@ def main() -> None:
             layout="C T X Z",
             return_metadata=True,
         )
-        val_runs = get_val_runs(run_dir)
-        train_runs = get_train_runs(run_dir)
-        if val_runs is None or train_runs is None:
-            dataset.close()
-            raise FileNotFoundError("split.json must contain val_runs and train_runs.")
+        test_runs = get_test_runs()
+        train_runs = get_train_runs()
         mean = torch.tensor(mean_list, dtype=torch.float32, device=device).view(1, 4, 1, 1, 1)
         std = torch.tensor(std_list, dtype=torch.float32, device=device).view(1, 4, 1, 1, 1)
         if not calibration:
@@ -843,10 +845,10 @@ def main() -> None:
         model.load_state_dict(ckpt["model"], strict=True)
         model.eval()
         if calibration:
-            if val_runs & train_runs:
-                raise ValueError("Training and validation simulation sets overlap.")
+            if test_runs & train_runs:
+                raise ValueError("Training and test simulation sets overlap.")
             sample_indices = select_calibration_indices(
-                dataset, val_runs, ckpt_args["betas"], args.calibration_runs_per_beta,
+                dataset, test_runs, ckpt_args["betas"], args.calibration_runs_per_beta,
                 args.calibration_windows_per_run, args.calibration_seed)
             run_split = (split_calibration_runs(dataset, sample_indices, args.calibration_seed)
                          if args.fit_global_scale else None)
@@ -873,7 +875,7 @@ def main() -> None:
             ), out_dir, args.calibration_bins, run_split=run_split)
             dataset.close()
             return
-        sample_indices = select_val_window_indices(dataset, val_runs)
+        sample_indices = select_val_window_indices(dataset, test_runs)
         records, pattern_infos = evaluate_windows(
             model=model,
             dataset=dataset,
@@ -903,7 +905,7 @@ def main() -> None:
             "pattern_labels": PATTERN_LABELS,
             "pattern_infos": pattern_infos,
             "n_windows": len(sample_indices),
-            "n_runs": len(val_runs),
+            "n_runs": len(test_runs),
             "records": records,
             "per_run": per_run,
             "summary": summary,
@@ -911,7 +913,7 @@ def main() -> None:
                 records
             ),
             "aggregation": (
-                "mean over windows within each validation run, then cross-run "
+                "mean over windows within each test run, then cross-run "
                 "median and 16th-84th percentiles"
             ),
             "overall_mse_definition": OVERALL_MSE_DEFINITION,

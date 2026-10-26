@@ -536,7 +536,7 @@ def test_named_sample_selection_rejects_training_run():
             t0=0,
         )
     except ValueError as error:
-        assert "not in split.json validation runs" in str(error)
+        assert "not in" in str(error) and "test_runs" in str(error)
     else:
         raise AssertionError("Expected a non-validation run to be rejected.")
 
@@ -978,4 +978,3 @@ def test_single_window_jy_without_training_stats_is_labeled_physical_rmse(tmp_pa
     assert payload["jy_rmse_ylabel"] == "Jy RMSE (A/m^2)"
     assert "jy_nrmse" not in payload["rows"][0]
     np.testing.assert_allclose(payload["rows"][0]["jy_rmse"], 3.0)
-

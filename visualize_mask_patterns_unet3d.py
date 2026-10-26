@@ -21,7 +21,13 @@ import matplotlib.gridspec as gridspec
 import numpy as np
 import torch
 
-from data.vpic_hdf5_dataset import VPICWindowDataset
+from data.vpic_hdf5_dataset import (
+    FIXED_SPLIT_PATH,
+    VPICWindowDataset,
+    fixed_split_metadata,
+    load_fixed_split,
+    validate_final_checkpoint,
+)
 from data.masking import MASK_PATTERNS, make_fixed_validation_mask, make_uncertain_input, make_visible_input, sample_mask
 from models.unet3d import LEGACY_MODEL_VERSION, UNet3D
 
@@ -229,6 +235,7 @@ def information_suite_plot_cache_signature(
     return {
         "version": PLOT_CACHE_VERSION,
         "kind": "information_suite",
+        "data_split": fixed_split_metadata(),
         "checkpoint": checkpoint_cache_signature(
             resolve_checkpoint_path(run_dir, args.checkpoint)
         ),
@@ -307,16 +314,13 @@ def parse_args():
     p.add_argument(
         "--run-dir",
         type=str,
-        default=DEFAULT_RUN_DIR,
-        help=(
-            "Training run directory containing best.pt, stats.json, split.json. "
-            f"Default: {DEFAULT_RUN_DIR}."
-        ),
+        required=True,
+        help="Completed fixed-split training run containing final.pt and stats.json.",
     )
     p.add_argument(
         "--checkpoint",
         type=str,
-        default="best.pt",
+        default="final.pt",
         help="Checkpoint filename inside run-dir, or an absolute path.",
     )
     p.add_argument(
@@ -331,7 +335,7 @@ def parse_args():
         type=str,
         default=DEFAULT_RUN_NAME,
         help=(
-            "Validation run to visualize (default: the canonical two-plasmoid "
+            "Test run to visualize (default: the canonical two-plasmoid "
             f"merger run {DEFAULT_RUN_NAME})."
         ),
     )
@@ -349,7 +353,7 @@ def parse_args():
         type=int,
         default=None,
         help=(
-            "Legacy zero-based index within validation windows. When given, "
+            "Zero-based index within test windows. When given, "
             "it overrides --run-name and --t0."
         ),
     )
@@ -502,7 +506,7 @@ def parse_args():
         "--skip-validation-statistics",
         action="store_true",
         help=(
-            "Skip the cross-validation-run median and 16th-84th percentile "
+            "Skip the cross-test-run median and 16th-84th percentile "
             "error plots. By default they are generated in addition to the "
             "selected single-window GIFs. Uncertainty-aware single-window runs "
             "without a Jy training cache report Jy errors in physical units."
@@ -513,7 +517,7 @@ def parse_args():
         type=int,
         default=None,
         help=(
-            "Stride used to crop validation runs into context windows for "
+            "Stride used to crop test runs into context windows for "
             "aggregate statistics. Default: one context length; a final "
             "run-end-aligned window is also included when needed."
         ),
@@ -523,7 +527,7 @@ def parse_args():
         type=int,
         default=None,
         help=(
-            "Optional cap on aggregate-statistics windows per validation run. "
+            "Optional cap on aggregate-statistics windows per test run. "
             "Selected windows are spread evenly over each run."
         ),
     )
@@ -627,9 +631,10 @@ def load_checkpoint(run_dir: Path, checkpoint_name: str, device: torch.device):
         ckpt_path = run_dir / checkpoint_name
 
     ckpt = torch.load(ckpt_path, map_location=device)
+    validate_final_checkpoint(ckpt)
     print(f"Loaded checkpoint: {ckpt_path}")
     print(f"Checkpoint epoch: {ckpt.get('epoch', 'N/A')}")
-    print(f"Best val MSE: {ckpt.get('best_val_mse', 'N/A')}")
+    print(f"Authoritative split: {FIXED_SPLIT_PATH} ({ckpt['split_sha256']})")
     return ckpt, ckpt_path
 
 
@@ -660,35 +665,16 @@ def predict_masked_fields(model, target: torch.Tensor, mask: torch.Tensor):
     return output, None
 
 
-def get_val_runs(run_dir: Path) -> set[str] | None:
-    split_path = run_dir / "split.json"
-    if not split_path.exists():
-        print(f"No split.json found at {split_path}. Will use all samples.")
-        return None
-
-    with open(split_path, "r") as f:
-        split = json.load(f)
-
-    val_runs = set(split["val_runs"])
-    print(f"Loaded {len(val_runs)} validation runs from split.json")
-    return val_runs
+def get_test_runs(_run_dir: Path | None = None) -> set[str]:
+    test_runs = set(load_fixed_split()["test_runs"])
+    print(f"Loaded {len(test_runs)} test runs from {FIXED_SPLIT_PATH}")
+    return test_runs
 
 
-def get_train_runs(run_dir: Path) -> set[str] | None:
-    split_path = run_dir / "split.json"
-    if not split_path.exists():
-        print(f"No split.json found at {split_path}. Cannot resolve training runs.")
-        return None
-
-    with open(split_path, "r") as f:
-        split = json.load(f)
-
-    if "train_runs" not in split:
-        print(f"No train_runs key in {split_path}.")
-        return None
-
+def get_train_runs(_run_dir: Path | None = None) -> set[str]:
+    split = load_fixed_split()
     train_runs = set(split["train_runs"])
-    print(f"Loaded {len(train_runs)} training runs from split.json")
+    print(f"Loaded {len(train_runs)} training runs from {FIXED_SPLIT_PATH}")
     return train_runs
 
 
@@ -706,7 +692,7 @@ def select_sample_index(dataset: VPICWindowDataset, val_runs: set[str] | None, s
             val_indices.append(i)
 
     if len(val_indices) == 0:
-        raise RuntimeError("No validation samples found from split.json.")
+        raise RuntimeError(f"No test samples found from {FIXED_SPLIT_PATH}.")
 
     if sample_index >= len(val_indices):
         raise IndexError(
@@ -727,7 +713,7 @@ def select_run_t0_index(
         raise ValueError(f"t0 must be non-negative, got {t0}")
     if val_runs is not None and run_name not in val_runs:
         raise ValueError(
-            f"run_name={run_name!r} is not in split.json validation runs."
+            f"run_name={run_name!r} is not in {FIXED_SPLIT_PATH} test_runs."
         )
 
     run_windows = [
@@ -2986,14 +2972,7 @@ def main():
             return_metadata=True,
         )
 
-        val_runs = get_val_runs(run_dir)
-        if uncertainty_aware and val_runs is None:
-            raise FileNotFoundError("Uncertainty visualization requires split.json validation runs.")
-        if not args.skip_validation_statistics and val_runs is None:
-            raise FileNotFoundError(
-                "Cross-run validation statistics require run-dir/split.json. "
-                "Use --skip-validation-statistics only if aggregate plots are not needed."
-            )
+        val_runs = get_test_runs()
         if args.sample_index is None:
             dataset_idx = select_run_t0_index(
                 dataset=dataset,
@@ -3016,11 +2995,7 @@ def main():
 
         mean = torch.tensor(stats["mean"], dtype=torch.float32, device=device).view(1, 4, 1, 1, 1)
         std = torch.tensor(stats["std"], dtype=torch.float32, device=device).view(1, 4, 1, 1, 1)
-        train_runs = get_train_runs(run_dir)
-        if train_runs is None:
-            raise FileNotFoundError(
-                "Jy NRMSE normalization requires run-dir/split.json with train_runs."
-            )
+        train_runs = get_train_runs()
         if (uncertainty_aware and args.skip_validation_statistics
                 and not (run_dir / JY_STATS_FILENAME).exists()):
             # A single-window render must not scan every training simulation.
@@ -3138,7 +3113,7 @@ def main():
                 statistics_dataset.samples[index][1] for index in statistics_indices
             }
             print(
-                "Collecting validation statistics from "
+                "Collecting test statistics from "
                 f"{len(selected_statistics_runs)} runs and "
                 f"{len(statistics_indices)} windows."
             )

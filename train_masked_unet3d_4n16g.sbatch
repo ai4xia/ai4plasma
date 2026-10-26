@@ -23,6 +23,7 @@ RESUME_STAGE1_NLL=false
 CURRICULUM=false
 RESUMING=true
 CURRICULUM_STOP=20
+FINAL_EPOCH=20
 ARM_ARGS=()
 MODEL_ARGS=()
 case "${1:-}" in
@@ -38,10 +39,12 @@ while (( $# )); do
         ARM_ARGS+=("$1"); shift
     elif ${CURRICULUM} && [[ "$1" == --stop-after-epochs ]] && (( $# >= 2 )) && [[ "$2" =~ ^[1-9][0-9]*$ ]]; then
         CURRICULUM_STOP=$2; shift 2
+    elif [[ "$1" == --final-epoch ]] && (( $# >= 2 )) && [[ "$2" =~ ^[1-9][0-9]*$ ]]; then
+        FINAL_EPOCH=$2; shift 2
     elif [[ "$1" == --model-version ]] && (( $# >= 2 )); then
         MODEL_ARGS=(--model-version "$2"); shift 2
     else
-        echo "Usage: bash $0 [--stage1-gaussian-nll|--resume-stage1-gaussian-nll|--curriculum|--resume-curriculum [--arm-variance-ramp|--arm-rollout-ramp] [--stop-after-epochs N]] [--model-version VERSION]" >&2
+        echo "Usage: bash $0 [--stage1-gaussian-nll|--resume-stage1-gaussian-nll|--curriculum|--resume-curriculum [--arm-variance-ramp|--arm-rollout-ramp] [--stop-after-epochs N]] [--final-epoch N] [--model-version VERSION]" >&2
         exit 2
     fi
 done
@@ -100,11 +103,11 @@ PY
 
 H5_DIR=/pscratch/sd/b/binxia/VPIC_PPPL_HDF5_by_beta_official2500_none_compat
 RUN_NAME=multi_beta_smoothl1_6ep_horizon20_20261018
-REFERENCE_DIR=runs/${RUN_NAME}
 if ${STAGE1_NLL}; then
     RUN_NAME=multi_beta_stage1_gaussian_nll_6ep_horizon20_20261019
 elif ${CURRICULUM}; then
     RUN_NAME=${CURRICULUM_RUN_NAME:-multi_beta_curriculum_manual_20261020}
+    if [[ ${FINAL_EPOCH} -eq 20 ]]; then FINAL_EPOCH=${CURRICULUM_FINAL_EPOCH:-240}; fi
 fi
 
 BETAS=(0.01 0.02 0.04 0.06 0.08 0.10 0.12 0.15 0.18 0.20)
@@ -150,6 +153,10 @@ if [[ ! -d "${H5_DIR}" ]]; then
     echo "ERROR: HDF5 directory not found: ${H5_DIR}" >&2
     exit 2
 fi
+if [[ ! -f "${PROJECT_DIR}/split.json" ]]; then
+    echo "ERROR: authoritative split not found: ${PROJECT_DIR}/split.json" >&2
+    exit 2
+fi
 if ! ${RESUMING} && [[ -e "${OUT_DIR}" ]]; then
     echo "ERROR: fresh output directory already exists: ${OUT_DIR}; refusing overwrite/resume." >&2
     exit 2
@@ -168,6 +175,7 @@ TRAIN_ARGS=(
     --batch-size "${BATCH_SIZE}"
     --num-workers "${NUM_WORKERS}"
     --epochs "${EPOCHS}"
+    --final-epoch "${FINAL_EPOCH}"
     --lr "${LR}"
     --warmup-epochs "${WARMUP_EPOCHS}"
     --min-lr "${MIN_LR}"
@@ -193,14 +201,8 @@ TRAIN_ARGS=(
     --wandb-name "${RUN_NAME}"
 )
 if ${STAGE1_NLL} || ${CURRICULUM}; then
-    for FILE in config.json stats.json split.json; do
-        if [[ ! -f "${REFERENCE_DIR}/${FILE}" ]]; then
-            echo "ERROR: missing reference ${REFERENCE_DIR}/${FILE}" >&2
-            exit 2
-        fi
-    done
     TRAIN_ARGS+=(--uncertainty-loss gaussian_nll --stop-after-epochs "${STOP_EPOCH}"
-                 --reference-run-dir "${REFERENCE_DIR}")
+    )
     if ${CURRICULUM}; then
         TRAIN_ARGS+=(--curriculum-training "${ARM_ARGS[@]}")
     fi
@@ -222,6 +224,7 @@ from pathlib import Path
 import json
 import math
 import torch
+from data.vpic_hdf5_dataset import validate_checkpoint_split
 from train_masked_unet3d import parse_args, validate_resume_parameters, make_curriculum_state
 
 args = parse_args()
@@ -232,6 +235,7 @@ for key in ("model", "optimizer", "stats", "epoch", "args"):
 if args.amp and args.amp_dtype == "float16" and not checkpoint.get("scaler"):
     raise ValueError("Cannot resume: missing or empty checkpoint 'scaler'")
 validate_resume_parameters(args, checkpoint["args"])
+validate_checkpoint_split(checkpoint)
 epoch = int(checkpoint["epoch"])
 limit = (args.stop_after_epochs or args.epochs) if args.curriculum_training else args.epochs
 if not (1 if args.curriculum_training else 6) <= epoch <= limit:
@@ -244,8 +248,6 @@ if args.uncertainty_loss == "gaussian_nll":
     history = json.loads((Path(args.out_dir) / "history.json").read_text())
     if [row["epoch"] for row in history] != list(range(1, epoch + 1)):
         raise ValueError("Cannot resume: history does not match completed checkpoint epochs.")
-    if not math.isfinite(checkpoint.get("best_val_mse", float("nan"))):
-        raise ValueError("Cannot resume: missing or nonfinite best validation metric.")
 print(epoch)
 PY
 )
@@ -264,16 +266,17 @@ echo "DDP world size: ${WORLD_SIZE}"
 echo "Per-GPU batch size: ${BATCH_SIZE}"
 echo "Global batch size: $((BATCH_SIZE * WORLD_SIZE))"
 echo "Epochs: $((COMPLETED_EPOCH + 1)) through ${STOP_EPOCH} (original ${EPOCHS}-epoch LR horizon)"
+echo "Predetermined official final epoch: ${FINAL_EPOCH}"
 if ${CURRICULUM}; then
-    echo "Manual curriculum: unarmed ramps stay at zero; arming flags: ${ARM_ARGS[*]:-none}"
+    echo "Adaptive curriculum: readiness automatically arms unarmed ramps; manual arming flags: ${ARM_ARGS[*]:-none}"
     echo "40-epoch cosine ramps; fixed ${EPOCHS}-epoch LR horizon, then LR=${MIN_LR}"
-    echo "Reference split and normalization: ${REFERENCE_DIR}; resume=${RESUMING}"
+    echo "Authoritative split: ${PROJECT_DIR}/split.json; resume=${RESUMING}"
 elif ${STAGE1_NLL}; then
     echo "Stage-1 Gaussian NLL: stop after epoch ${STOP_EPOCH}; binary v_in only"
     echo "FP32 NLL variance floor: 1e-6; uncertainty loss weight: 1.0; no output variance cap"
-    echo "Reference split and normalization: ${REFERENCE_DIR}"
+    echo "Authoritative split: ${PROJECT_DIR}/split.json"
     if ${RESUME_STAGE1_NLL}; then
-        echo "Resume: ${CHECKPOINT} (model, optimizer, AMP scaler, channel stats, history, best metric)"
+        echo "Resume: ${CHECKPOINT} (model, optimizer, AMP scaler, channel stats, history)"
     else
         echo "Random initialization; no checkpoint weights loaded"
     fi

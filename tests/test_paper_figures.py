@@ -13,6 +13,9 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from models.unet3d import DIRECT_MODEL_VERSION, MODEL_VERSION  # noqa: E402
+from data.vpic_hdf5_dataset import (  # noqa: E402
+    CANONICAL_TEST_RUN, fixed_split_sha256, load_fixed_split,
+)
 from make_paper_figures import (  # noqa: E402
     COMPATIBLE_PAPER_CACHE_VERSIONS,
     DEFAULT_MAGNETIC_ABLATION_VISIBLE_PERCENTS,
@@ -78,23 +81,23 @@ def test_paper_context_strict_loading_and_spatial_array_schema(tmp_path, monkeyp
                    spatial_only_pooling=True, uncertainty_aware=uncertainty_aware)
     model = UNet3D(**options).eval()
     ckpt_args = dict(options, model_version=architecture, h5_dir=str(tmp_path),
-                     betas=[.2], delta_t=4, stride_t=2)
+                     betas=[.2], delta_t=4, stride_t=2, final_epoch=240)
     stats = dict(mean=[1.] * 4, std=[2.] * 4)
-    checkpoint = dict(model=model.state_dict(), args=ckpt_args, stats=stats, epoch=240)
-    torch.save(checkpoint, tmp_path / "latest.pt")
-    (tmp_path / "split.json").write_text(json.dumps(dict(val_runs=["held_out"], train_runs=["train"])))
+    checkpoint = dict(model=model.state_dict(), args=ckpt_args, stats=stats, epoch=240,
+                      split_sha256=fixed_split_sha256())
+    torch.save(checkpoint, tmp_path / "final.pt")
     target = torch.randn(4, 4, 16, 8)
 
     class Dataset:
-        samples = [(0, "held_out", 28)]
+        samples = [(0, CANONICAL_TEST_RUN, 28)]
 
         def __getitem__(self, index):
-            return dict(block=target, metadata=dict(run_name="held_out", t0=28))
+            return dict(block=target, metadata=dict(run_name=CANONICAL_TEST_RUN, t0=28))
 
     monkeypatch.setattr(paper, "VPICWindowDataset", lambda **kw: Dataset())
     monkeypatch.setattr(paper, "load_or_compute_jy_training_stats", lambda **kw: dict(jy_std_train=1.))
-    args = Namespace(run_dir=str(tmp_path), checkpoint="latest.pt", device="cpu", h5_dir=None,
-                     extent=[-21., 21., -50., 50.], run_name="held_out", t0=28,
+    args = Namespace(run_dir=str(tmp_path), checkpoint="final.pt", device="cpu", h5_dir=None,
+                     extent=[-21., 21., -50., 50.], run_name=CANONICAL_TEST_RUN, t0=28,
                      global_frame=29, seed=1234)
     ctx = paper.load_inference_context(args)
     assert ctx["model"].residual_output == (architecture == MODEL_VERSION)
@@ -122,7 +125,7 @@ def test_paper_context_strict_loading_and_spatial_array_schema(tmp_path, monkeyp
         assert np.isnan(arrays[f"{name}_visible"][mask == 0]).all()
     # The added output must be required, rather than accepted via non-strict loading.
     checkpoint["model"].pop("variance_out.weight" if uncertainty_aware else "out.weight")
-    torch.save(checkpoint, tmp_path / "latest.pt")
+    torch.save(checkpoint, tmp_path / "final.pt")
     with pytest.raises(RuntimeError, match="Missing key"):
         paper.load_inference_context(args)
 
@@ -135,7 +138,7 @@ def test_paper_qualitative_requires_held_out_run_before_inference(tmp_path, monk
     (tmp_path / "split.json").write_text(json.dumps(dict(train_runs=["old_canonical"], val_runs=["held_out"])))
     monkeypatch.setattr(paper, "parse_args", lambda: Namespace(
         run_dir=str(tmp_path), checkpoint="latest.pt", figure=[figure], run_name="old_canonical"))
-    with pytest.raises(ValueError, match="not in the checkpoint validation split"):
+    with pytest.raises(ValueError, match="test_runs"):
         paper.main()
     assert not (tmp_path / "paper_figures_v1").exists()
 
@@ -739,10 +742,7 @@ def test_sliding_default_steps_are_1_12_24():
 
 
 def test_validation_run_order_preserves_split_json(tmp_path):
-    (tmp_path / "split.json").write_text(
-        json.dumps({"val_runs": ["run_b", "run_a"], "train_runs": []})
-    )
-    assert validation_run_order(tmp_path) == ["run_b", "run_a"]
+    assert validation_run_order(tmp_path) == load_fixed_split()["test_runs"]
 
 
 def test_stack_rmse_aligns_global_frames():

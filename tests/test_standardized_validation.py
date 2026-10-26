@@ -10,6 +10,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from data.vpic_hdf5_dataset import fixed_split_sha256  # noqa: E402
 from data.masking import (  # noqa: E402
     FIXED_VALIDATION_PATTERNS,
     make_fixed_validation_mask,
@@ -51,9 +52,9 @@ from visualize_mask_patterns_unet3d import (  # noqa: E402
 def test_uncertainty_checkpoint_keeps_standardized_default_and_explicit_calibration(tmp_path, monkeypatch, flags):
     import evaluate_standardized_validation as evaluator
 
-    torch.save(dict(args={"uncertainty_aware": True}, epoch=240,
-                    stats=dict(mean=[0.] * 4, std=[1.] * 4)), tmp_path / "latest.pt")
-    (tmp_path / "split.json").write_text(json.dumps(dict(val_runs=["held_out"], train_runs=["train"])))
+    torch.save(dict(args={"uncertainty_aware": True, "final_epoch": 240}, epoch=240,
+                    split_sha256=fixed_split_sha256(),
+                    stats=dict(mean=[0.] * 4, std=[1.] * 4)), tmp_path / "final.pt")
     monkeypatch.setattr(sys, "argv", ["evaluate", "--run-dir", str(tmp_path), *flags])
 
     def stop_before_inference(*args, **kwargs):
@@ -299,7 +300,7 @@ def test_calibration_selection_is_reproducible_stratified_and_metadata_only():
     assert len(first) == len({ds.samples[i][1] for i in first}) == 20
     assert all(ds.samples[i][1] in val for i in first)
     assert all(sum(ds.samples[i][0] == f for i in first) == 2 for f in range(10))
-    with pytest.raises(ValueError, match="eligible validation runs"):
+    with pytest.raises(ValueError, match="eligible test runs"):
         select_calibration_indices(ds, val, betas, 4, 1, 1234)
 
 

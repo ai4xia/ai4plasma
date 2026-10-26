@@ -20,7 +20,17 @@ from torch.utils.data import DataLoader, Sampler, Subset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
-from data.vpic_hdf5_dataset import VPICWindowDataset
+from data.vpic_hdf5_dataset import (
+    FIXED_SPLIT_COUNTS,
+    FIXED_SPLIT_PATH,
+    VPICWindowDataset,
+    fixed_split_metadata,
+    fixed_split_sha256,
+    h5_run_lengths,
+    load_fixed_split,
+    parse_run_name,
+    validate_checkpoint_split,
+)
 from data.masking import (
     DEFAULT_PATTERN_WEIGHTS,
     MASKING_VERSION,
@@ -111,8 +121,11 @@ def parse_args():
                    help="Cosine LR horizon and default final epoch; curriculum can continue at min LR using --stop-after-epochs.")
     p.add_argument("--stop-after-epochs", type=int, default=None,
                    help="Stop after this completed epoch without changing --epochs LR horizon; may exceed the horizon in curriculum mode.")
-    p.add_argument("--reference-run-dir", default=None,
-                   help="Reuse channel statistics and verify the run split against this experiment; no weights loaded.")
+    p.add_argument(
+        "--final-epoch", type=int, default=None,
+        help=("Predetermined official final epoch. Bounded curriculum stages may stop "
+              "earlier, but final.pt is written only at this epoch."),
+    )
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument(
         "--warmup-epochs",
@@ -159,10 +172,10 @@ def parse_args():
     p.add_argument("--curriculum-log-every", type=int, default=50,
                    help="Batch interval for curriculum component logs; lambdas update every successful step.")
     p.add_argument("--transition-ema-half-life", type=float, default=5.0,
-                   help="Advisory convergence EMA half-life in epochs (MSE: log space; NLL: direct).")
+                   help="Curriculum convergence EMA half-life in epochs (MSE: log space; NLL: direct).")
     p.add_argument("--transition-rate-window", type=int, default=5)
     p.add_argument("--transition-rate-threshold", type=float, default=0.005,
-                   help="Advisory absolute smoothed relative change per epoch (default: 0.005 = 0.5%); never arms a ramp.")
+                   help="Automatic curriculum-transition threshold (default: 0.005 = 0.5% per epoch).")
     p.add_argument("--transition-patience", type=int, default=4)
     p.add_argument(
         "--channel-mults",
@@ -280,7 +293,6 @@ def parse_args():
         ),
     )
 
-    p.add_argument("--val-frac", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=1234)
 
     p.add_argument("--stats-batches", type=int, default=50)
@@ -326,7 +338,7 @@ def parse_args():
     p.add_argument(
         "--wandb-log-model",
         action="store_true",
-        help="Upload the best checkpoint as a W&B artifact at the end of training.",
+        help="Upload final.pt as a W&B artifact after the predetermined final epoch.",
     )
     resume_group = p.add_mutually_exclusive_group()
     resume_group.add_argument(
@@ -363,6 +375,9 @@ def parse_args():
     else:
         args.mask_pattern_weights = parse_pattern_weights(args.mask_patterns)
     args.masking_version = MASKING_VERSION
+    split_metadata = fixed_split_metadata()
+    args.split_path = split_metadata["path"]
+    args.split_sha256 = split_metadata["sha256"]
 
     if (
         not math.isfinite(args.uncertainty_loss_weight)
@@ -381,6 +396,10 @@ def parse_args():
     if args.stop_after_epochs is not None and (args.stop_after_epochs < 1 or
             (not args.curriculum_training and args.stop_after_epochs > args.epochs)):
         p.error("--stop-after-epochs must be positive; only curriculum runs may exceed --epochs")
+    if args.final_epoch is None:
+        args.final_epoch = args.stop_after_epochs or args.epochs
+    if args.final_epoch < (args.stop_after_epochs or args.epochs):
+        p.error("--final-epoch cannot precede the requested stopping epoch")
     if (args.arm_variance_ramp or args.arm_rollout_ramp) and (not args.curriculum_training or not args.auto_resume):
         p.error("Ramp arming requires --curriculum-training and --auto-resume")
     if args.uncertainty_loss == "gaussian_nll" and not args.uncertainty_aware:
@@ -632,7 +651,8 @@ RESUME_PARAMETER_KEYS = (
     "channel_mults",
     "use_attention",
     "spatial_only_pooling",
-    "val_frac",
+    "final_epoch",
+    "split_sha256",
     "seed",
     "stats_batches",
     "grad_clip",
@@ -698,7 +718,9 @@ def validate_resume_parameters(args, checkpoint_args: Dict[str, Any]) -> None:
             mismatches.append(f"{key}: checkpoint={old_value!r}, current={new_value!r}")
     if getattr(args, "curriculum_training", False):
         for key in ("variance_ramp_start_epoch", "variance_ramp_epochs",
-                    "rollout_ramp_start_epoch", "rollout_ramp_epochs"):
+                    "rollout_ramp_start_epoch", "rollout_ramp_epochs",
+                    "transition_ema_half_life", "transition_rate_window",
+                    "transition_rate_threshold", "transition_patience"):
             if checkpoint_args.get(key) != getattr(args, key):
                 mismatches.append(f"{key}: checkpoint={checkpoint_args.get(key)!r}, current={getattr(args, key)!r}")
     for key in RESUME_PARAMETER_KEYS:
@@ -724,29 +746,23 @@ def validate_resume_parameters(args, checkpoint_args: Dict[str, Any]) -> None:
 
 def split_by_run(
     dataset: VPICWindowDataset,
-    val_frac: float,
-    seed: int,
+    split: Dict,
 ) -> Tuple[List[int], List[int], List[str], List[str]]:
-    """
-    Split by run_name, not by window, to avoid leakage between train/val.
-    """
-    run_names = sorted({run_name for _, run_name, _ in dataset.samples})
-
-    rng = random.Random(seed)
-    rng.shuffle(run_names)
-
-    n_val = max(1, int(round(len(run_names) * val_frac)))
-    val_runs = set(run_names[:n_val])
-    train_runs = set(run_names[n_val:])
+    """Select training and validation windows from the authoritative split."""
+    train_runs = set(split["train_runs"])
+    val_runs = set(split["val_runs"])
+    test_runs = set(split["test_runs"])
 
     train_idx = []
     val_idx = []
 
     for i, (_, run_name, _) in enumerate(dataset.samples):
-        if run_name in val_runs:
-            val_idx.append(i)
-        else:
+        if run_name in train_runs:
             train_idx.append(i)
+        elif run_name in val_runs:
+            val_idx.append(i)
+        elif run_name not in test_runs:
+            raise ValueError(f"Dataset run {run_name!r} is absent from {FIXED_SPLIT_PATH}.")
 
     return train_idx, val_idx, sorted(train_runs), sorted(val_runs)
 
@@ -845,6 +861,40 @@ def cosine_continuation(step: int, start: float, duration: float) -> float:
     return 0.5 * (1.0 - math.cos(math.pi * u))
 
 
+def arm_curriculum_ramp(state: Dict[str, Any], prefix: str) -> int:
+    """Arm one immutable ramp at the current successful optimizer step."""
+    if prefix not in ("variance", "rollout"):
+        raise ValueError(f"Unknown curriculum ramp: {prefix}")
+    if state[f"{prefix}_ramp_armed"]:
+        raise ValueError(f"The {prefix} ramp is already armed; its start is immutable")
+    if prefix == "rollout" and (not state["variance_ramp_armed"] or
+            state["successful_optimizer_steps"] < state["variance_ramp_start_step"] + state["variance_ramp_steps"] or
+            curriculum_weights(state)[0] != 1.0):
+        raise ValueError("Rollout arming requires a fully completed variance ramp (lambda_v == 1)")
+    start = state["successful_optimizer_steps"]
+    state[f"{prefix}_ramp_start_step"] = start
+    state[f"{prefix}_ramp_armed"] = True
+    return start
+
+
+def apply_ready_curriculum_transition(
+    state: Dict[str, Any], diagnostic: Optional[Dict[str, Any]],
+) -> Optional[Tuple[str, int]]:
+    """Apply the ramp named by an existing readiness detector result."""
+    if diagnostic is None:
+        return None
+    ready = [prefix for prefix, key in (
+        ("variance", "ready_for_variance_ramp"),
+        ("rollout", "ready_for_rollout_ramp"),
+    ) if diagnostic.get(key, False)]
+    if len(ready) > 1:
+        raise ValueError("A convergence diagnostic cannot arm both curriculum ramps")
+    if not ready:
+        return None
+    prefix = ready[0]
+    return prefix, arm_curriculum_ramp(state, prefix)
+
+
 def make_curriculum_state(args, updates_per_epoch: int, checkpoint=None) -> Dict[str, Any]:
     """Restore immutable ramps, optionally arming one at the saved update count.
 
@@ -894,14 +944,7 @@ def make_curriculum_state(args, updates_per_epoch: int, checkpoint=None) -> Dict
             continue
         if checkpoint is None:
             raise ValueError("Ramp arming requires resuming an existing curriculum checkpoint")
-        if state[f"{prefix}_ramp_armed"]:
-            raise ValueError(f"The {prefix} ramp is already armed; its start is immutable")
-        if prefix == "rollout" and (not state["variance_ramp_armed"] or
-                state["successful_optimizer_steps"] < state["variance_ramp_start_step"] + state["variance_ramp_steps"] or
-                curriculum_weights(state)[0] != 1.0):
-            raise ValueError("Rollout arming requires a fully completed variance ramp (lambda_v == 1)")
-        state[f"{prefix}_ramp_start_step"] = state["successful_optimizer_steps"]
-        state[f"{prefix}_ramp_armed"] = True
+        arm_curriculum_ramp(state, prefix)
     return state
 
 
@@ -912,11 +955,33 @@ def curriculum_weights(state: Dict[str, Any]) -> Tuple[float, float]:
                  for prefix in ("variance", "rollout"))
 
 
+def curriculum_is_complete(state: Dict[str, Any]) -> bool:
+    steps = state["successful_optimizer_steps"]
+    ramps_complete = all(
+        state[f"{prefix}_ramp_armed"]
+        and state[f"{prefix}_ramp_start_step"] is not None
+        and steps >= state[f"{prefix}_ramp_start_step"] + state[f"{prefix}_ramp_steps"]
+        for prefix in ("variance", "rollout")
+    )
+    return ramps_complete and curriculum_weights(state) == (1.0, 1.0)
+
+
+def require_complete_curriculum(state: Dict[str, Any], epoch: int) -> None:
+    if curriculum_is_complete(state):
+        return
+    lambda_v, lambda_r = curriculum_weights(state)
+    raise RuntimeError(
+        f"Predetermined final epoch {epoch} reached before the curriculum completed: "
+        f"lambda_v={lambda_v:g}, lambda_r={lambda_r:g}. latest.pt and history.json "
+        "were saved, but final.pt was not created."
+    )
+
+
 def positive_metric_convergence(
     history, metric="val_mse", half_life=5.0, window=5, threshold=0.005, patience=4,
     segment_start_epoch=None,
 ):
-    """Reconstruct advisory log-EMA diagnostics; never use with signed NLL.
+    """Reconstruct log-EMA diagnostics; never use with signed NLL.
 
     Initialize m at the first log-loss in the selected segment. Callers can
     select a new segment after an LR regime change or a completed lambda ramp.
@@ -962,7 +1027,7 @@ def positive_metric_convergence(
 
 
 def phase_a_convergence(history, args, curriculum_state):
-    """Advisory only: start fresh in the current contiguous fixed-LR regime."""
+    """Detect Phase-A readiness in the current contiguous fixed-LR regime."""
     def at_floor(row):
         lr = row.get("learning_rate")
         return bool(row["epoch"] >= args.epochs and lr is not None and math.isfinite(lr)
@@ -987,6 +1052,8 @@ def phase_a_convergence(history, args, curriculum_state):
     floor_reached = at_floor(history[-1])
     diagnostics["ema_val_mse"] = diagnostics.pop("ema_value")
     diagnostics.update(phase_a=phase_a, lr_floor_reached=floor_reached, segment_start_epoch=segment_start,
+                       threshold=getattr(args, "transition_rate_threshold", 0.005),
+                       patience_target=getattr(args, "transition_patience", 4),
                        ready_for_variance_ramp=phase_a and floor_reached and diagnostics["converged"]
                        and diagnostics["burn_in_complete"])
     return diagnostics
@@ -1024,7 +1091,7 @@ def nll_metric_convergence(history, half_life=5.0, window=5, segment_start_epoch
 
 
 def phase_b_convergence(history, args, curriculum_state):
-    """Advisory joint stability after variance-ramp completion; never arms rollout."""
+    """Detect joint Phase-B stability after variance-ramp completion."""
     state = curriculum_state or {}
     start = state.get("variance_ramp_start_step")
     duration = state.get("variance_ramp_steps")
@@ -1066,6 +1133,7 @@ def phase_b_convergence(history, args, curriculum_state):
                 mse_rate_per_epoch=rates[0], nll_rate_per_epoch=rates[1], stable_count=stable_count,
                 segment_age=min(ages) if all(age is not None for age in ages) else None,
                 minimum_segment_age=2.0 * half_life, burn_in_complete=burn_in_complete,
+                threshold=threshold, patience_target=patience,
                 ready_for_rollout_ramp=phase_b and burn_in_complete and stable_count >= patience)
 
 
@@ -1745,12 +1813,32 @@ def build_epoch_wandb_log(
         log_data["val/uncertainty_smooth_l1"] = row["val_uncertainty_mse"]
     if "curriculum" in row:
         log_data.update({f"curriculum/{key}": value for key, value in row["curriculum"].items()})
+        log_data["curriculum/ready_for_variance_ramp"] = False
+        log_data["curriculum/ready_for_rollout_ramp"] = False
     if "phase_convergence" in row:
         log_data.update({f"phase_convergence/{key}": value for key, value in row["phase_convergence"].items()
                          if value is not None})
+        diagnostic = row["phase_convergence"]
+        if diagnostic["smoothed_rate_per_epoch"] is not None:
+            log_data["curriculum/mse_rate_per_epoch"] = diagnostic["smoothed_rate_per_epoch"]
+        log_data.update({
+            "curriculum/convergence_stable_count": diagnostic["stable_count"],
+            "curriculum/convergence_segment_age": diagnostic["segment_age"],
+            "curriculum/ready_for_variance_ramp": diagnostic["ready_for_variance_ramp"],
+        })
     if "phase_b_convergence" in row:
         log_data.update({f"phase_b_convergence/{key}": value for key, value in row["phase_b_convergence"].items()
                          if value is not None})
+        diagnostic = row["phase_b_convergence"]
+        if diagnostic["mse_rate_per_epoch"] is not None:
+            log_data["curriculum/mse_rate_per_epoch"] = diagnostic["mse_rate_per_epoch"]
+        if diagnostic["nll_rate_per_epoch"] is not None:
+            log_data["curriculum/nll_rate_per_epoch"] = diagnostic["nll_rate_per_epoch"]
+        log_data.update({
+            "curriculum/convergence_stable_count": diagnostic["stable_count"],
+            "curriculum/convergence_segment_age": diagnostic["segment_age"],
+            "curriculum/ready_for_rollout_ramp": diagnostic["ready_for_rollout_ramp"],
+        })
 
     return log_data
 
@@ -1760,7 +1848,6 @@ def save_checkpoint(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     epoch: int,
-    best_val_mse: float,
     args,
     stats: Dict[str, List[float]],
     wandb_run_id: Optional[str] = None,
@@ -1772,10 +1859,11 @@ def save_checkpoint(
         "model": model_to_save.state_dict(),
         "optimizer": optimizer.state_dict(),
         "epoch": epoch,
-        "best_val_mse": best_val_mse,
         "args": vars(args),
         "stats": stats,
         "wandb_run_id": wandb_run_id,
+        "split_path": str(FIXED_SPLIT_PATH),
+        "split_sha256": fixed_split_sha256(),
     }
     if scaler is not None and scaler.is_enabled():
         ckpt["scaler"] = scaler.state_dict()
@@ -1803,8 +1891,19 @@ def main():
         dist.barrier()
 
     h5_dir = expand_path(args.h5_dir)
+    split = load_fixed_split()
+    split_metadata = fixed_split_metadata()
+    run_lengths = h5_run_lengths(h5_dir)
+    split_runs = set().union(*(set(split[key]) for key in FIXED_SPLIT_COUNTS))
+    if set(run_lengths) != split_runs:
+        raise ValueError(
+            f"{FIXED_SPLIT_PATH} does not exactly cover the HDF5 runs: "
+            f"missing={sorted(set(run_lengths) - split_runs)[:5]}, "
+            f"unknown={sorted(split_runs - set(run_lengths))[:5]}."
+        )
 
     rank_print("HDF5 dir:", h5_dir)
+    rank_print("Authoritative split:", split_metadata)
     rank_print("Output dir:", out_dir)
     rank_print("Betas:", args.betas)
     rank_print("Model version:", args.model_version)
@@ -1852,39 +1951,28 @@ def main():
         stride_t=args.stride_t,
         layout="C T X Z",
         return_metadata=True,
+        include_runs=list(split["train_runs"]) + list(split["val_runs"]),
     )
 
-    train_idx, val_idx, train_runs, val_runs = split_by_run(
-        dataset,
-        val_frac=args.val_frac,
-        seed=args.seed,
-    )
-    reference_dir = expand_path(args.reference_run_dir) if args.reference_run_dir else None
-    if reference_dir is not None:
-        reference_split = json.loads((reference_dir / "split.json").read_text())
-        if (set(train_runs) != set(reference_split["train_runs"])
-                or set(val_runs) != set(reference_split["val_runs"])):
-            raise ValueError("Run split differs from the reference experiment; refusing comparison.")
-        rank_print("Verified identical run split against", reference_dir)
+    train_idx, val_idx, train_runs, val_runs = split_by_run(dataset, split)
+    selected_betas = {float(beta) for beta in args.betas}
+    selected_train_runs = {
+        name for name in train_runs if float(parse_run_name(name)["beta"]) in selected_betas
+    }
+    usable_train_runs = {dataset.samples[index][1] for index in train_idx}
+    expected_usable_train_runs = {
+        name for name in selected_train_runs if run_lengths[name] >= args.delta_t
+    }
+    if usable_train_runs != expected_usable_train_runs:
+        raise ValueError("Usable fixed-split training runs do not match the HDF5 window index.")
 
     rank_print("Total windows:", len(dataset))
     rank_print("Train windows:", len(train_idx))
     rank_print("Val windows:", len(val_idx))
-    rank_print("Train runs:", len(train_runs))
-    rank_print("Val runs:", len(val_runs))
-
-    if is_main_process():
-        with open(out_dir / "split.json", "w") as f:
-            json.dump(
-                {
-                    "train_runs": train_runs,
-                    "val_runs": val_runs,
-                    "num_train_windows": len(train_idx),
-                    "num_val_windows": len(val_idx),
-                },
-                f,
-                indent=2,
-            )
+    rank_print("Declared train runs:", len(train_runs))
+    rank_print("Usable train runs:", len(usable_train_runs))
+    rank_print("Val runs:", len({dataset.samples[index][1] for index in val_idx}))
+    rank_print("Test runs loaded by training: 0")
 
     train_set = Subset(dataset, train_idx)
     val_set = Subset(dataset, val_idx)
@@ -1940,6 +2028,7 @@ def main():
     )
     if checkpoint_plan.mode == "resume":
         resume_checkpoint = torch.load(checkpoint_plan.path, map_location=device)
+        validate_checkpoint_split(resume_checkpoint)
         validate_resume_parameters(args, resume_checkpoint.get("args", {}))
         rank_print(
             f"Auto-resuming from {checkpoint_plan.path} "
@@ -1958,17 +2047,9 @@ def main():
             "Masking-version mismatch is allowed for this weight-only init."
         )
 
-    state_checkpoint = (
-        resume_checkpoint if resume_checkpoint is not None else init_checkpoint
-    )
-    if state_checkpoint is not None and "stats" in state_checkpoint:
-        stats = state_checkpoint["stats"]
+    if resume_checkpoint is not None:
+        stats = resume_checkpoint["stats"]
         rank_print("Reusing channel statistics from checkpoint")
-        if reference_dir is not None and stats != json.loads((reference_dir / "stats.json").read_text()):
-            raise ValueError("Checkpoint channel statistics differ from the reference experiment.")
-    elif reference_dir is not None:
-        stats = json.loads((reference_dir / "stats.json").read_text())
-        rank_print("Reusing reference channel statistics; model starts from random initialization")
     else:
         stats = None
         if is_main_process():
@@ -2024,7 +2105,6 @@ def main():
     scaler = torch.cuda.amp.GradScaler(enabled=(args.amp and device.type == "cuda" and args.amp_dtype == "float16"))
 
     start_epoch = 1
-    best_val_mse = float("inf")
     curriculum_state = (make_curriculum_state(args, len(train_loader), resume_checkpoint)
                         if args.curriculum_training else None)
     if curriculum_state is not None:
@@ -2035,7 +2115,6 @@ def main():
         if resume_checkpoint.get("scaler"):
             scaler.load_state_dict(resume_checkpoint["scaler"])
         start_epoch = int(resume_checkpoint["epoch"]) + 1
-        best_val_mse = float(resume_checkpoint.get("best_val_mse", float("inf")))
     elif init_checkpoint is not None:
         # Allow deterministic weights to initialize the extended head. Only
         # its new parameters retain their initialization; all old keys stay strict.
@@ -2095,7 +2174,7 @@ def main():
 
     if is_main_process():
         with open(out_dir / "config.json", "w") as f:
-            json.dump(vars(args), f, indent=2)
+            json.dump({**vars(args), "data_split": split_metadata}, f, indent=2)
 
     final_epoch = args.stop_after_epochs or args.epochs
     if (args.arm_variance_ramp or args.arm_rollout_ramp) and start_epoch > final_epoch:
@@ -2127,6 +2206,8 @@ def main():
                 "num_val_windows": len(val_idx),
                 "num_train_runs": len(train_runs),
                 "num_val_runs": len(val_runs),
+                "num_test_runs_used_during_training": 0,
+                "data_split": split_metadata,
                 "channel_mean": stats["mean"],
                 "channel_std": stats["std"],
             },
@@ -2137,6 +2218,9 @@ def main():
         wandb_run.define_metric("val/*", step_metric="epoch")
         wandb_run.define_metric("mask/*", step_metric="epoch")
         wandb_run.define_metric("optimization/*", step_metric="epoch")
+        wandb_run.define_metric("curriculum/*", step_metric="epoch")
+        wandb_run.define_metric("phase_convergence/*", step_metric="epoch")
+        wandb_run.define_metric("phase_b_convergence/*", step_metric="epoch")
 
     history = []
     history_path = out_dir / "history.json"
@@ -2274,6 +2358,15 @@ def main():
         )})
         if curriculum_state is not None:
             row["curriculum"] = train_metrics["curriculum"]
+            lambda_v_end = row["curriculum"]["lambda_v_end"]
+            lambda_r_end = row["curriculum"]["lambda_r_end"]
+            phase_index = 0 if lambda_v_end == 0 else (1 if lambda_r_end == 0 else 2)
+            row["curriculum"].update(
+                phase_index=phase_index,
+                phase_name=("reconstruction_only", "variance", "rollout")[phase_index],
+                convergence_rate_threshold=args.transition_rate_threshold,
+                convergence_patience_target=args.transition_patience,
+            )
             epoch_log("  curriculum (second-pass losses averaged over all batches, inactive = 0): "
                       + json.dumps(row["curriculum"]))
         if args.uncertainty_aware:
@@ -2287,12 +2380,14 @@ def main():
                     "nonfinite_events", "optimizer_updates")})
                 row["val_variance_statistics"] = val_metrics["variance_statistics"]
                 row["val_per_beta"] = val_metrics["per_beta"]
+        transition_diagnostic = None
         if is_main_process():
             history.append(row)
             if curriculum_state is not None:
                 diagnostic = phase_a_convergence(history, args, curriculum_state)
                 if diagnostic["phase_a"]:
                     row["phase_convergence"] = diagnostic
+                    transition_diagnostic = diagnostic
                     ema = diagnostic["ema_val_mse"]
                     rate = diagnostic["smoothed_rate_per_epoch"]
                     ema_text = f"{ema:.8g}" if ema is not None else "n/a"
@@ -2310,6 +2405,7 @@ def main():
                     diagnostic = phase_b_convergence(history, args, curriculum_state)
                     if diagnostic["phase_b"]:
                         row["phase_b_convergence"] = diagnostic
+                        transition_diagnostic = diagnostic
                         fields = []
                         for name in ("ema_val_mse", "mse_rate_per_epoch", "ema_val_nll", "nll_rate_per_epoch"):
                             value = diagnostic[name]
@@ -2323,6 +2419,21 @@ def main():
                                   f"ready_for_rollout_ramp={'yes' if diagnostic['ready_for_rollout_ramp'] else 'no'}")
                         if diagnostic["ready_for_rollout_ramp"]:
                             epoch_log("READY_FOR_ROLLOUT_RAMP=true")
+
+        if curriculum_state is not None:
+            synchronized = [transition_diagnostic]
+            if distributed_is_initialized():
+                dist.broadcast_object_list(synchronized, src=0)
+            transition_diagnostic = synchronized[0]
+            transition = apply_ready_curriculum_transition(curriculum_state, transition_diagnostic)
+            if transition is not None:
+                ramp, start_step = transition
+                if is_main_process():
+                    row["automatic_curriculum_transition"] = {
+                        "ramp": ramp,
+                        "start_step": start_step,
+                    }
+                    epoch_log(f"Automatically armed {ramp} ramp at successful optimizer step {start_step}")
 
         if wandb_run is not None:
             wandb_run.log(
@@ -2358,30 +2469,12 @@ def main():
             )
         )
 
-        if row["val_mse"] < best_val_mse:
-            best_val_mse = row["val_mse"]
-            if is_main_process():
-                save_checkpoint(
-                    out_dir / "best.pt",
-                    model=model,
-                    optimizer=optimizer,
-                    epoch=epoch,
-                    best_val_mse=best_val_mse,
-                    args=args,
-                    stats=stats,
-                    wandb_run_id=wandb_run.id if wandb_run is not None else None,
-                    scaler=scaler,
-                    curriculum_state=curriculum_state,
-                )
-                epoch_log(f"Saved best checkpoint: val_mse={best_val_mse:.6f}")
-
         if is_main_process():
             save_checkpoint(
                 latest_path,
                 model=model,
                 optimizer=optimizer,
                 epoch=epoch,
-                best_val_mse=best_val_mse,
                 args=args,
                 stats=stats,
                 wandb_run_id=wandb_run.id if wandb_run is not None else None,
@@ -2416,6 +2509,26 @@ def main():
         if is_main_process():
             with open(out_dir / "history.json", "w") as f:
                 json.dump(history, f, indent=2)
+        if epoch == args.final_epoch:
+            if distributed_is_initialized():
+                dist.barrier()
+            if curriculum_state is not None:
+                require_complete_curriculum(curriculum_state, epoch)
+            if is_main_process():
+                save_checkpoint(
+                    out_dir / "final.pt",
+                    model=model,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                    args=args,
+                    stats=stats,
+                    wandb_run_id=wandb_run.id if wandb_run is not None else None,
+                    scaler=scaler,
+                    curriculum_state=curriculum_state,
+                )
+                epoch_log(f"Saved predetermined final checkpoint at epoch {epoch}")
+            if distributed_is_initialized():
+                dist.barrier()
 
     if epoch_progress is not None:
         epoch_progress.close()
@@ -2424,16 +2537,16 @@ def main():
                    f"LR horizon remains {args.epochs}; no further optimizer updates.")
 
     if wandb_run is not None:
-        wandb_run.summary["best_val_mse"] = best_val_mse
-        if args.wandb_log_model:
+        wandb_run.summary["final_epoch"] = args.final_epoch
+        if args.wandb_log_model and (out_dir / "final.pt").is_file():
             import wandb
 
             artifact = wandb.Artifact(
-                name=f"{wandb_run.id}-best-model",
+                name=f"{wandb_run.id}-final-model",
                 type="model",
-                metadata={"best_val_mse": best_val_mse},
+                metadata={"final_epoch": args.final_epoch, "split_sha256": args.split_sha256},
             )
-            artifact.add_file(str(out_dir / "best.pt"))
+            artifact.add_file(str(out_dir / "final.pt"))
             wandb_run.log_artifact(artifact)
         wandb_run.finish()
 
