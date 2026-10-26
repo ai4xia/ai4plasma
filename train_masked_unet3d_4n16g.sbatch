@@ -21,8 +21,10 @@ GPUS_PER_NODE=4
 STAGE1_NLL=false
 RESUME_STAGE1_NLL=false
 CURRICULUM=false
+ABCD_SYMMETRIC=false
+GLOBAL_COSINE=false
 RESUMING=true
-CURRICULUM_STOP=20
+CURRICULUM_STOP=200
 FINAL_EPOCH=20
 ARM_ARGS=()
 MODEL_ARGS=()
@@ -31,6 +33,18 @@ case "${1:-}" in
     --resume-stage1-gaussian-nll) STAGE1_NLL=true; RESUME_STAGE1_NLL=true; shift ;;
     --curriculum) CURRICULUM=true; RESUMING=false; shift ;;
     --resume-curriculum) CURRICULUM=true; shift ;;
+    --abcd-symmetric-lr)
+        CURRICULUM=true; ABCD_SYMMETRIC=true; RESUMING=false
+        CURRICULUM_STOP=240; FINAL_EPOCH=240; shift ;;
+    --resume-abcd-symmetric-lr)
+        CURRICULUM=true; ABCD_SYMMETRIC=true
+        CURRICULUM_STOP=240; FINAL_EPOCH=240; shift ;;
+    --global-cosine-lr)
+        CURRICULUM=true; GLOBAL_COSINE=true; RESUMING=false
+        CURRICULUM_STOP=240; FINAL_EPOCH=240; shift ;;
+    --resume-global-cosine-lr)
+        CURRICULUM=true; GLOBAL_COSINE=true
+        CURRICULUM_STOP=240; FINAL_EPOCH=240; shift ;;
     "") ;;
     *) echo "Unknown training mode: $1" >&2; exit 2 ;;
 esac
@@ -44,7 +58,7 @@ while (( $# )); do
     elif [[ "$1" == --model-version ]] && (( $# >= 2 )); then
         MODEL_ARGS=(--model-version "$2"); shift 2
     else
-        echo "Usage: bash $0 [--stage1-gaussian-nll|--resume-stage1-gaussian-nll|--curriculum|--resume-curriculum [--arm-variance-ramp|--arm-rollout-ramp] [--stop-after-epochs N]] [--final-epoch N] [--model-version VERSION]" >&2
+        echo "Usage: bash $0 [--stage1-gaussian-nll|--resume-stage1-gaussian-nll|--curriculum|--resume-curriculum|--abcd-symmetric-lr|--resume-abcd-symmetric-lr|--global-cosine-lr|--resume-global-cosine-lr] [--arm-variance-ramp|--arm-rollout-ramp] [--stop-after-epochs N] [--final-epoch N] [--model-version VERSION]" >&2
         exit 2
     fi
 done
@@ -106,8 +120,14 @@ RUN_NAME=multi_beta_smoothl1_6ep_horizon20_20261018
 if ${STAGE1_NLL}; then
     RUN_NAME=multi_beta_stage1_gaussian_nll_6ep_horizon20_20261019
 elif ${CURRICULUM}; then
-    RUN_NAME=${CURRICULUM_RUN_NAME:-multi_beta_curriculum_manual_20261020}
-    if [[ ${FINAL_EPOCH} -eq 20 ]]; then FINAL_EPOCH=${CURRICULUM_FINAL_EPOCH:-240}; fi
+    if ${GLOBAL_COSINE}; then
+        RUN_NAME=${CURRICULUM_RUN_NAME:-multi_beta_curriculum_direct_v3_fixedsplit_globalcosine_2e4_1e6_20261026}
+    elif ${ABCD_SYMMETRIC}; then
+        RUN_NAME=${CURRICULUM_RUN_NAME:-multi_beta_curriculum_direct_v3_fixedsplit_abcd_symmetriclr_20261026}
+    else
+        RUN_NAME=${CURRICULUM_RUN_NAME:-multi_beta_curriculum_manual_20261020}
+        if [[ ${FINAL_EPOCH} -eq 20 ]]; then FINAL_EPOCH=${CURRICULUM_FINAL_EPOCH:-200}; fi
+    fi
 fi
 
 BETAS=(0.01 0.02 0.04 0.06 0.08 0.10 0.12 0.15 0.18 0.20)
@@ -118,6 +138,8 @@ STRIDE_T=2
 BATCH_SIZE=4
 NUM_WORKERS=4
 EPOCHS=20
+if ${ABCD_SYMMETRIC}; then EPOCHS=45; fi
+if ${GLOBAL_COSINE}; then EPOCHS=240; fi
 STOP_EPOCH=${EPOCHS}
 if ${STAGE1_NLL} && ! ${RESUME_STAGE1_NLL}; then
     STOP_EPOCH=6
@@ -126,7 +148,13 @@ elif ${CURRICULUM}; then
 fi
 LR=2e-5
 WARMUP_EPOCHS=1
+if ${ABCD_SYMMETRIC}; then WARMUP_EPOCHS=5; fi
 MIN_LR=2e-6
+if ${GLOBAL_COSINE}; then
+    LR=2e-4
+    WARMUP_EPOCHS=5
+    MIN_LR=1e-6
+fi
 WEIGHT_DECAY=1e-4
 DENSITY_PROBE_MIN=0
 DENSITY_PROBE_MAX=30
@@ -205,6 +233,11 @@ if ${STAGE1_NLL} || ${CURRICULUM}; then
     )
     if ${CURRICULUM}; then
         TRAIN_ARGS+=(--curriculum-training "${ARM_ARGS[@]}")
+        if ${ABCD_SYMMETRIC}; then
+            TRAIN_ARGS+=(--curriculum-config abcd_symmetric_lr)
+        elif ${GLOBAL_COSINE}; then
+            TRAIN_ARGS+=(--curriculum-config global_cosine)
+        fi
     fi
     if ${RESUMING}; then
         TRAIN_ARGS+=(--auto-resume)
@@ -216,7 +249,7 @@ else
 fi
 
 # Check the same compatibility rules as the trainer before starting workers.
-# The checkpoint already records epochs=20; never use the bounded six-epoch wrapper.
+# Resume uses the LR horizon recorded by the selected curriculum configuration.
 COMPLETED_EPOCH=0
 if ${RESUMING}; then
 COMPLETED_EPOCH=$("${PYTHON}" - "${TRAIN_ARGS[@]}" <<'PY'
@@ -269,7 +302,16 @@ echo "Epochs: $((COMPLETED_EPOCH + 1)) through ${STOP_EPOCH} (original ${EPOCHS}
 echo "Predetermined official final epoch: ${FINAL_EPOCH}"
 if ${CURRICULUM}; then
     echo "Adaptive curriculum: readiness automatically arms unarmed ramps; manual arming flags: ${ARM_ARGS[*]:-none}"
-    echo "40-epoch cosine ramps; fixed ${EPOCHS}-epoch LR horizon, then LR=${MIN_LR}"
+    if ${GLOBAL_COSINE}; then
+        echo "Global cosine LR: epochs 1-5 ${MIN_LR}->${LR}; epochs 6-240 one cosine decay to ${MIN_LR}"
+        echo "Curriculum transitions do not restart or modify LR; final epoch ${FINAL_EPOCH}"
+    elif ${ABCD_SYMMETRIC}; then
+        echo "ABCD symmetric LR: Phase A/D each use 5-epoch ${MIN_LR}->${LR} linear warmup plus 40-epoch cosine decay"
+        echo "Phase C->D uses rollout validation MSE and Gaussian NLL convergence; final epoch ${FINAL_EPOCH}"
+    else
+        echo "40-epoch cosine ramps; original ${EPOCHS}-epoch LR horizon, then LR=${MIN_LR} until Phase D"
+        echo "Phase D: 5-epoch linear reheat to LR=1e-5, fixed 40-epoch cosine decay to ${MIN_LR}, then fixed floor"
+    fi
     echo "Authoritative split: ${PROJECT_DIR}/split.json; resume=${RESUMING}"
 elif ${STAGE1_NLL}; then
     echo "Stage-1 Gaussian NLL: stop after epoch ${STOP_EPOCH}; binary v_in only"

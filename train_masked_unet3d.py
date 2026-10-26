@@ -158,6 +158,12 @@ def parse_args():
     )
     p.add_argument("--curriculum-training", action="store_true",
                    help="Opt-in reconstruction / detached variance / two-pass curriculum.")
+    p.add_argument(
+        "--curriculum-config",
+        choices=("adaptive", "abcd_symmetric_lr", "global_cosine"),
+        default="adaptive",
+        help="Curriculum control flow; the default preserves the existing adaptive run.",
+    )
     p.add_argument("--variance-ramp-start-epoch", type=float, default=None,
                    help="Optional legacy scheduled start (completed epochs); omit to leave the ramp unarmed.")
     p.add_argument("--variance-ramp-epochs", type=float, default=40.0)
@@ -425,6 +431,28 @@ def parse_args():
             p.error("Rollout ramp must start at or after the variance ramp ends; overlapping ramps are not supported")
         if args.curriculum_log_every <= 0:
             p.error("--curriculum-log-every must be positive")
+        if args.curriculum_config == "abcd_symmetric_lr":
+            if (args.epochs, args.warmup_epochs) != (45, 5):
+                p.error("abcd_symmetric_lr requires --epochs 45 --warmup-epochs 5")
+            if not (math.isclose(args.lr, 2e-5) and math.isclose(args.min_lr, 2e-6)):
+                p.error("abcd_symmetric_lr requires --lr 2e-5 --min-lr 2e-6")
+            if (args.variance_ramp_epochs, args.rollout_ramp_epochs) != (40.0, 40.0):
+                p.error("abcd_symmetric_lr requires 40-epoch variance and rollout ramps")
+            if args.variance_ramp_start_epoch is not None or args.rollout_ramp_start_epoch is not None:
+                p.error("abcd_symmetric_lr uses convergence-triggered ramps; scheduled starts are not supported")
+            if args.final_epoch != 240:
+                p.error("abcd_symmetric_lr requires --final-epoch 240")
+        elif args.curriculum_config == "global_cosine":
+            if (args.epochs, args.warmup_epochs) != (240, 5):
+                p.error("global_cosine requires --epochs 240 --warmup-epochs 5")
+            if not (math.isclose(args.lr, 2e-4) and math.isclose(args.min_lr, 1e-6)):
+                p.error("global_cosine requires --lr 2e-4 --min-lr 1e-6")
+            if (args.variance_ramp_epochs, args.rollout_ramp_epochs) != (40.0, 40.0):
+                p.error("global_cosine requires 40-epoch variance and rollout ramps")
+            if args.variance_ramp_start_epoch is not None or args.rollout_ramp_start_epoch is not None:
+                p.error("global_cosine uses convergence-triggered ramps; scheduled starts are not supported")
+            if args.final_epoch != 240:
+                p.error("global_cosine requires --final-epoch 240")
     if not (0 <= args.warmup_epochs < args.epochs):
         p.error(
             "--warmup-epochs must lie in [0, epochs), got "
@@ -503,6 +531,91 @@ def learning_rate_for_epoch(
     )
     cosine = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
     return min_lr + (base_lr - min_lr) * cosine
+
+
+PHASE_D_REHEAT_EPOCHS = 5
+PHASE_D_COSINE_EPOCHS = 40
+
+
+def symmetric_lr_cycle(
+    epoch: int, start_epoch: int, min_lr: float, peak_lr: float,
+) -> float:
+    """Five inclusive warmup epochs, 40 inclusive cosine epochs, then floor."""
+    if epoch < start_epoch:
+        raise ValueError(f"LR cycle epoch {epoch} precedes start epoch {start_epoch}")
+    if not (0 <= min_lr <= peak_lr):
+        raise ValueError(f"Expected 0 <= min_lr <= peak_lr, got {min_lr} and {peak_lr}")
+    reheat_end = start_epoch + PHASE_D_REHEAT_EPOCHS - 1
+    if epoch <= reheat_end:
+        progress = float(epoch - start_epoch) / (PHASE_D_REHEAT_EPOCHS - 1)
+        return min_lr + (peak_lr - min_lr) * progress
+    cosine_start = reheat_end + 1
+    cosine_end = cosine_start + PHASE_D_COSINE_EPOCHS - 1
+    if epoch >= cosine_end:
+        return min_lr
+    progress = float(epoch - cosine_start) / (PHASE_D_COSINE_EPOCHS - 1)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr + (peak_lr - min_lr) * cosine
+
+
+def global_cosine_learning_rate(
+    epoch: int, total_epochs: int, warmup_epochs: int,
+    min_lr: float, peak_lr: float,
+) -> float:
+    """Inclusive low-to-peak warmup followed by one inclusive global cosine."""
+    if not (1 <= epoch <= total_epochs):
+        raise ValueError(f"epoch must lie in [1, {total_epochs}], got {epoch}")
+    if not (1 < warmup_epochs < total_epochs - 1):
+        raise ValueError("Global cosine requires at least two warmup and cosine epochs")
+    if not (0 <= min_lr <= peak_lr):
+        raise ValueError(f"Expected 0 <= min_lr <= peak_lr, got {min_lr} and {peak_lr}")
+    if epoch <= warmup_epochs:
+        progress = float(epoch - 1) / float(warmup_epochs - 1)
+        return min_lr + (peak_lr - min_lr) * progress
+    cosine_epochs = total_epochs - warmup_epochs
+    progress = float(epoch - warmup_epochs - 1) / float(cosine_epochs - 1)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr + (peak_lr - min_lr) * cosine
+
+
+def curriculum_learning_rate_for_epoch(epoch: int, args, state: Dict[str, Any]) -> float:
+    """Return the existing LR until Phase D, then its fixed reheat/cosine LR."""
+    phase_d_start = state.get("phase_d_start_epoch")
+    if getattr(args, "curriculum_config", "adaptive") == "global_cosine":
+        return global_cosine_learning_rate(
+            epoch, args.epochs, args.warmup_epochs, args.min_lr, args.lr,
+        )
+    if getattr(args, "curriculum_config", "adaptive") == "abcd_symmetric_lr":
+        return symmetric_lr_cycle(
+            epoch, phase_d_start if phase_d_start is not None else 1,
+            args.min_lr, args.lr,
+        )
+    if phase_d_start is None or epoch < phase_d_start:
+        return learning_rate_for_epoch(
+            epoch=min(epoch, args.epochs),
+            total_epochs=args.epochs,
+            base_lr=args.lr,
+            warmup_epochs=args.warmup_epochs,
+            min_lr=args.min_lr,
+        )
+
+    peak_lr = 0.5 * args.lr
+    if not (0 <= args.min_lr <= peak_lr):
+        raise ValueError(
+            f"Phase-D LR requires 0 <= min_lr <= lr / 2, got {args.min_lr} and {args.lr}"
+        )
+    reheat_end_epoch = phase_d_start + PHASE_D_REHEAT_EPOCHS - 1
+    if epoch <= reheat_end_epoch:
+        progress = float(epoch - phase_d_start + 1) / PHASE_D_REHEAT_EPOCHS
+        return args.min_lr + (peak_lr - args.min_lr) * progress
+
+    cosine_end_epoch = reheat_end_epoch + PHASE_D_COSINE_EPOCHS
+    if epoch >= cosine_end_epoch:
+        return args.min_lr
+    cosine_start_epoch = reheat_end_epoch + 1
+    progress = float(epoch - cosine_start_epoch) / (PHASE_D_COSINE_EPOCHS - 1)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return args.min_lr + (peak_lr - args.min_lr) * cosine
 
 
 def sample_mixed_density_probe_counts(
@@ -705,6 +818,7 @@ def validate_resume_parameters(args, checkpoint_args: Dict[str, Any]) -> None:
         ("uncertainty_loss", "smooth_l1"),
         ("amp_dtype", "float16"),
         ("curriculum_training", False),
+        ("curriculum_config", "adaptive"),
     ):
         if key == "amp_dtype" and not getattr(args, "amp", False):
             continue
@@ -731,6 +845,9 @@ def validate_resume_parameters(args, checkpoint_args: Dict[str, Any]) -> None:
         else:
             old_value = checkpoint_args.get(key)
         new_value = getattr(args, key)
+        if (key == "final_epoch" and getattr(args, "curriculum_training", False)
+                and old_value == 240 and new_value == 200):
+            continue
         if old_value != new_value:
             mismatches.append(f"{key}: checkpoint={old_value!r}, current={new_value!r}")
 
@@ -912,6 +1029,9 @@ def make_curriculum_state(args, updates_per_epoch: int, checkpoint=None) -> Dict
         if not math.isfinite(state[f"{prefix}_ramp_steps"]) or state[f"{prefix}_ramp_steps"] <= 0:
             raise ValueError("Curriculum ramp durations must be positive")
     state["successful_optimizer_steps"] = 0
+    state["phase_d_start_epoch"] = None
+    state["variance_phase_start_epoch"] = None
+    state["rollout_phase_start_epoch"] = None
     if checkpoint is not None:
         saved = checkpoint.get("curriculum_state")
         if saved is None:
@@ -934,6 +1054,22 @@ def make_curriculum_state(args, updates_per_epoch: int, checkpoint=None) -> Dict
             if state[key] is not None and state[key] != start:
                 raise ValueError(f"Curriculum resume changed {key}: {start!r} -> {state[key]!r}")
             state[key], state[f"{prefix}_ramp_armed"] = start, armed
+        phase_d_start = saved.get("phase_d_start_epoch")
+        if phase_d_start is not None and (
+            not isinstance(phase_d_start, int) or isinstance(phase_d_start, bool)
+            or phase_d_start < 1
+        ):
+            raise ValueError("Invalid saved Phase-D start epoch")
+        state["phase_d_start_epoch"] = phase_d_start
+        for prefix in ("variance", "rollout"):
+            phase_key = f"{prefix}_phase_start_epoch"
+            phase_start = saved.get(phase_key)
+            if phase_start is not None and (
+                not isinstance(phase_start, int) or isinstance(phase_start, bool)
+                or phase_start < 1
+            ):
+                raise ValueError(f"Invalid saved {prefix} phase start epoch")
+            state[phase_key] = phase_start
 
     # Validate the restored state before accepting any manual transition.
     if state["rollout_ramp_armed"] and (not state["variance_ramp_armed"] or
@@ -964,6 +1100,56 @@ def curriculum_is_complete(state: Dict[str, Any]) -> bool:
         for prefix in ("variance", "rollout")
     )
     return ramps_complete and curriculum_weights(state) == (1.0, 1.0)
+
+
+def start_phase_d_if_ready(
+    state: Dict[str, Any], completed_epoch: int, final_epoch: int,
+) -> bool:
+    """Store Phase D's immutable start epoch once both curriculum ramps finish."""
+    if state.get("phase_d_start_epoch") is not None or not curriculum_is_complete(state):
+        return False
+    start_epoch = completed_epoch + 1
+    cosine_end_epoch = (start_epoch + PHASE_D_REHEAT_EPOCHS - 1
+                        + PHASE_D_COSINE_EPOCHS)
+    if cosine_end_epoch > final_epoch:
+        raise RuntimeError(
+            "Curriculum completed too late for Phase D's five-epoch reheat and fixed "
+            f"40-epoch cosine decay to finish by predetermined final epoch {final_epoch}"
+        )
+    state["phase_d_start_epoch"] = start_epoch
+    return True
+
+
+def apply_ready_phase_d_transition(
+    state: Dict[str, Any], diagnostic: Optional[Dict[str, Any]],
+    completed_epoch: int, final_epoch: int,
+) -> bool:
+    """Start Phase D only from the Phase-C readiness detector."""
+    if diagnostic is None or not diagnostic.get("ready_for_phase_d", False):
+        return False
+    return start_phase_d_if_ready(state, completed_epoch, final_epoch)
+
+
+def curriculum_phase(
+    epoch: int, state: Dict[str, Any], lambda_v: float, lambda_r: float,
+    config: str = "adaptive",
+) -> Tuple[int, str]:
+    if config == "global_cosine":
+        if lambda_v == 0:
+            return 0, "mean_only"
+        if lambda_r == 0:
+            return 1, "variance_ramp_or_settle"
+        if lambda_r < 1:
+            return 2, "rollout_ramp"
+        return 3, "full_objective"
+    phase_d_start = state.get("phase_d_start_epoch")
+    if phase_d_start is not None and epoch >= phase_d_start:
+        return 3, "joint_refinement"
+    if lambda_v == 0:
+        return 0, "mean" if config == "abcd_symmetric_lr" else "reconstruction"
+    if lambda_r == 0:
+        return 1, "variance"
+    return 2, "rollout"
 
 
 def require_complete_curriculum(state: Dict[str, Any], epoch: int) -> None:
@@ -1028,14 +1214,18 @@ def positive_metric_convergence(
 
 def phase_a_convergence(history, args, curriculum_state):
     """Detect Phase-A readiness in the current contiguous fixed-LR regime."""
-    def at_floor(row):
+    global_cosine = getattr(args, "curriculum_config", "adaptive") == "global_cosine"
+
+    def monitor_active(row):
+        if global_cosine:
+            return bool(row["epoch"] >= args.warmup_epochs)
         lr = row.get("learning_rate")
         return bool(row["epoch"] >= args.epochs and lr is not None and math.isfinite(lr)
                     and math.isclose(lr, args.min_lr, rel_tol=1e-9, abs_tol=0.0))
 
     segment_start = None
     for row in history:
-        if not at_floor(row):
+        if not monitor_active(row):
             segment_start = None
         elif segment_start is None:
             segment_start = row["epoch"]
@@ -1049,17 +1239,26 @@ def phase_a_convergence(history, args, curriculum_state):
                    and not curriculum_state.get("variance_ramp_armed", curriculum_state.get("variance_ramp_start_step") is not None)
                    and not curriculum_state.get("rollout_ramp_armed", curriculum_state.get("rollout_ramp_start_step") is not None)
                    and curriculum_weights(curriculum_state) == (0.0, 0.0))
-    floor_reached = at_floor(history[-1])
+    monitoring_reached = monitor_active(history[-1])
+    lr = history[-1].get("learning_rate")
+    floor_reached = (bool(lr is not None and math.isfinite(lr)
+                          and math.isclose(lr, args.min_lr, rel_tol=1e-9, abs_tol=0.0))
+                     if global_cosine else monitoring_reached)
     diagnostics["ema_val_mse"] = diagnostics.pop("ema_value")
-    diagnostics.update(phase_a=phase_a, lr_floor_reached=floor_reached, segment_start_epoch=segment_start,
+    diagnostics.update(phase_a=phase_a, lr_floor_reached=floor_reached,
+                       transition_monitor_active=monitoring_reached,
+                       segment_start_epoch=segment_start,
                        threshold=getattr(args, "transition_rate_threshold", 0.005),
                        patience_target=getattr(args, "transition_patience", 4),
-                       ready_for_variance_ramp=phase_a and floor_reached and diagnostics["converged"]
+                       ready_for_variance_ramp=phase_a and monitoring_reached and diagnostics["converged"]
                        and diagnostics["burn_in_complete"])
     return diagnostics
 
 
-def nll_metric_convergence(history, half_life=5.0, window=5, segment_start_epoch=None):
+def nll_metric_convergence(
+    history, half_life=5.0, window=5, segment_start_epoch=None,
+    metric="val_gaussian_nll",
+):
     """Direct signed-NLL EMA; expm1 of its K-epoch slope measures exp(NLL) change."""
     if not math.isfinite(half_life) or half_life <= 0 or window < 1:
         raise ValueError("Invalid NLL convergence settings")
@@ -1071,7 +1270,7 @@ def nll_metric_convergence(history, half_life=5.0, window=5, segment_start_epoch
         if previous_epoch is not None and epoch != previous_epoch + 1:
             values = []
         previous_epoch = epoch
-        value = row.get("val_gaussian_nll")
+        value = row.get(metric)
         ema, rate = None, None
         if ((segment_start_epoch is not None and epoch < segment_start_epoch)
                 or value is None or not math.isfinite(value)):
@@ -1135,6 +1334,72 @@ def phase_b_convergence(history, args, curriculum_state):
                 minimum_segment_age=2.0 * half_life, burn_in_complete=burn_in_complete,
                 threshold=threshold, patience_target=patience,
                 ready_for_rollout_ramp=phase_b and burn_in_complete and stable_count >= patience)
+
+
+def phase_c_convergence(history, args, curriculum_state):
+    """Detect rollout stability after its ramp using second-pass validation metrics."""
+    state = curriculum_state or {}
+    start = state.get("rollout_ramp_start_step")
+    duration = state.get("rollout_ramp_steps")
+    rollout_armed = state.get("rollout_ramp_armed", start is not None)
+    completed = bool(
+        rollout_armed and start is not None and duration is not None and duration > 0
+        and state.get("successful_optimizer_steps", -1) >= start + duration
+        and curriculum_weights(state) == (1.0, 1.0)
+    )
+    candidate = bool(
+        getattr(args, "curriculum_training", False)
+        and getattr(args, "curriculum_config", "adaptive") == "abcd_symmetric_lr"
+        and completed and state.get("phase_d_start_epoch") is None
+    )
+    segment_start = None
+    if candidate:
+        for row in history:
+            count = row.get("curriculum", {}).get("successful_optimizer_steps", -1)
+            valid = (row.get("val_rollout_mse") is not None
+                     and row.get("val_rollout_gaussian_nll") is not None)
+            if count < start + duration or not valid:
+                segment_start = None
+            elif segment_start is None:
+                segment_start = row["epoch"]
+    half_life = getattr(args, "transition_ema_half_life", 5.0)
+    window = getattr(args, "transition_rate_window", 5)
+    threshold = getattr(args, "transition_rate_threshold", 0.005)
+    patience = getattr(args, "transition_patience", 4)
+    cutoff = segment_start if segment_start is not None else history[-1]["epoch"] + 1
+    mse_rows = positive_metric_convergence(
+        history, metric="val_rollout_mse", half_life=half_life, window=window,
+        threshold=threshold, patience=patience, segment_start_epoch=cutoff,
+    )
+    nll_rows = nll_metric_convergence(
+        history, metric="val_rollout_gaussian_nll", half_life=half_life,
+        window=window, segment_start_epoch=cutoff,
+    )
+    stable_count, previous_epoch = 0, None
+    for mse, nll in zip(mse_rows, nll_rows):
+        if previous_epoch is not None and mse["epoch"] != previous_epoch + 1:
+            stable_count = 0
+        previous_epoch = mse["epoch"]
+        burn_in_complete = mse["burn_in_complete"] and nll["burn_in_complete"]
+        rates = (mse["smoothed_rate_per_epoch"], nll["smoothed_rate_per_epoch"])
+        stable = burn_in_complete and all(
+            rate is not None and math.isfinite(rate) and abs(rate) < threshold
+            for rate in rates
+        )
+        stable_count = stable_count + 1 if stable else 0
+    ages = (mse["segment_age"], nll["segment_age"])
+    phase_c = candidate and segment_start is not None
+    return dict(
+        epoch=history[-1]["epoch"], phase_c=phase_c,
+        rollout_ramp_complete=completed, segment_start_epoch=segment_start,
+        ema_val_rollout_mse=mse["ema_value"], ema_val_rollout_nll=nll["ema_value"],
+        rollout_mse_rate_per_epoch=rates[0], rollout_nll_rate_per_epoch=rates[1],
+        stable_count=stable_count,
+        segment_age=min(ages) if all(age is not None for age in ages) else None,
+        minimum_segment_age=2.0 * half_life, burn_in_complete=burn_in_complete,
+        threshold=threshold, patience_target=patience,
+        ready_for_phase_d=phase_c and burn_in_complete and stable_count >= patience,
+    )
 
 
 def sample_training_mask(y, pattern_weights, density_p_zero, density_p_full,
@@ -1404,7 +1669,9 @@ def train_one_epoch(
                     loss.new_tensor(components["forwards"] == 2),
                 ]).detach().double()
             if step % curriculum_log_every == 0 or step + 1 == len(loader):
-                region = "A" if lambda_v == 0 else ("B" if lambda_r == 0 else "C")
+                phase_d_start = curriculum_state.get("phase_d_start_epoch")
+                region = ("D" if phase_d_start is not None and epoch_number >= phase_d_start else
+                          ("A" if lambda_v == 0 else ("B" if lambda_r == 0 else "C")))
                 message = (f"Curriculum {region}: successful_step={coordinate} "
                            f"next_successful_step={curriculum_state['successful_optimizer_steps']} "
                            f"lambda_v={lambda_v:.9g} lambda_r={lambda_r:.9g} "
@@ -1594,6 +1861,12 @@ def val_mask_seed(base_seed: int, pattern: str, batch_index: int) -> int:
     return seed % (2 ** 31)
 
 
+def rollout_validation_reuse_pattern(pattern: str) -> str:
+    """Pair each fixed validation mask with the next existing fixed layout."""
+    index = MASK_PATTERNS.index(pattern)
+    return MASK_PATTERNS[(index + 1) % len(MASK_PATTERNS)]
+
+
 @torch.no_grad()
 def validate(
     model: torch.nn.Module,
@@ -1610,6 +1883,7 @@ def validate(
     uncertainty_aware: bool = False,
     amp_dtype: torch.dtype = torch.float16,
     uncertainty_loss: str = "smooth_l1",
+    rollout_validation: bool = False,
 ) -> Dict[str, Dict[str, float]]:
     """
     Evaluate every mask pattern on the same validation blocks.
@@ -1621,12 +1895,16 @@ def validate(
     """
     model.eval()
     stage1 = uncertainty_aware and uncertainty_loss == "gaussian_nll"
+    if rollout_validation and not stage1:
+        raise ValueError("Rollout validation requires uncertainty-aware Gaussian-NLL mode")
     uncertainty_key = "gaussian_nll" if stage1 else "uncertainty_mse"
     beta_details = {}
     _ = (mask_seed, density_probe_min, density_probe_max)
 
     sums = torch.zeros(len(patterns), device=device)
     uncertainty_sums = torch.zeros_like(sums)
+    rollout_mse_sums = torch.zeros_like(sums)
+    rollout_nll_sums = torch.zeros_like(sums)
     counts = torch.zeros(len(patterns), device=device)
 
     if epoch_progress is not None:
@@ -1665,6 +1943,19 @@ def validate(
                 if uncertainty_aware:
                     variance_loss = (predicted_error_mse_loss(output_variance, pred, y, objective=uncertainty_loss)
                                      if stage1 else predicted_error_mse_loss(output_variance, pred, y))
+                if rollout_validation:
+                    reuse_mask, _ = make_fixed_validation_mask(
+                        rollout_validation_reuse_pattern(pattern), y.shape,
+                        device=device, dtype=y.dtype,
+                    )
+                    second_input, exact_mask = make_rollout_input(
+                        y, pred, output_variance, mask, reuse_mask,
+                    )
+                    pred2, variance2 = model(second_input, detach_variance_features=True)
+                    rollout_mse = full_mse_loss(pred2, y, exact_mask)
+                    rollout_nll = predicted_error_mse_loss(
+                        variance2, pred2, y, objective="gaussian_nll",
+                    )
 
             if stage1:
                 # Validation shards have unequal lengths: no per-batch collectives.
@@ -1674,6 +1965,15 @@ def validate(
                              & torch.isfinite(loss_mse) & (loss_mse <= 100),
                              f"Invalid validation values or catastrophic reconstruction MSE (>100): {batch.get('metadata')}",
                              synchronize=False)
+                if rollout_validation:
+                    check_stage1(
+                        torch.isfinite(second_input).all() & torch.isfinite(pred2).all()
+                        & torch.isfinite(variance2).all() & (variance2 > 0).all()
+                        & torch.isfinite(rollout_mse) & (rollout_mse <= 100)
+                        & torch.isfinite(rollout_nll),
+                        f"Invalid rollout validation values or catastrophic reconstruction MSE (>100): "
+                        f"{batch.get('metadata')}", synchronize=False,
+                    )
                 betas = batch.get("metadata", {}).get("beta", ["all"] * batch_size)
                 names = [str(float(b)) if b != "all" else "all" for b in betas]
                 for beta in sorted(set(names)):
@@ -1699,12 +1999,18 @@ def validate(
             counts[i] += batch_size
             if uncertainty_aware:
                 uncertainty_sums[i] += variance_loss.detach().float() * batch_size
+            if rollout_validation:
+                rollout_mse_sums[i] += rollout_mse.detach().float() * batch_size
+                rollout_nll_sums[i] += rollout_nll.detach().float() * batch_size
 
     if distributed_is_initialized():
         dist.all_reduce(sums, op=dist.ReduceOp.SUM)
         dist.all_reduce(counts, op=dist.ReduceOp.SUM)
         if uncertainty_aware:
             dist.all_reduce(uncertainty_sums, op=dist.ReduceOp.SUM)
+        if rollout_validation:
+            dist.all_reduce(rollout_mse_sums, op=dist.ReduceOp.SUM)
+            dist.all_reduce(rollout_nll_sums, op=dist.ReduceOp.SUM)
 
     sums = sums.cpu()
     counts = counts.cpu().clamp(min=1.0)
@@ -1725,6 +2031,20 @@ def validate(
             metrics[pattern][uncertainty_key] = float(uncertainty_sums[i] / counts[i])
         metrics["mean"][uncertainty_key] = sum(
             metrics[p][uncertainty_key] for p in patterns
+        ) / len(patterns)
+    if rollout_validation:
+        rollout_mse_sums = rollout_mse_sums.cpu()
+        rollout_nll_sums = rollout_nll_sums.cpu()
+        for i, pattern in enumerate(patterns):
+            metrics[pattern]["rollout_mse"] = float(rollout_mse_sums[i] / counts[i])
+            metrics[pattern]["rollout_gaussian_nll"] = float(
+                rollout_nll_sums[i] / counts[i]
+            )
+        metrics["mean"]["rollout_mse"] = sum(
+            metrics[p]["rollout_mse"] for p in patterns
+        ) / len(patterns)
+        metrics["mean"]["rollout_gaussian_nll"] = sum(
+            metrics[p]["rollout_gaussian_nll"] for p in patterns
         ) / len(patterns)
 
     if stage1:
@@ -1805,6 +2125,14 @@ def build_epoch_wandb_log(
 
     for pattern in val_patterns:
         log_data[f"val/{pattern}/mse"] = val_metrics[pattern]["mse"]
+        if "rollout_mse" in val_metrics[pattern]:
+            log_data[f"val/{pattern}/rollout_mse"] = val_metrics[pattern]["rollout_mse"]
+            log_data[f"val/{pattern}/rollout_gaussian_nll"] = val_metrics[pattern][
+                "rollout_gaussian_nll"
+            ]
+    if "val_rollout_mse" in row:
+        log_data["val/rollout_mse"] = row["val_rollout_mse"]
+        log_data["val/rollout_gaussian_nll"] = row["val_rollout_gaussian_nll"]
     if "train_gaussian_nll" in row:
         log_data["train/gaussian_nll"] = row["train_gaussian_nll"]
         log_data["val/gaussian_nll"] = row["val_gaussian_nll"]
@@ -1815,6 +2143,7 @@ def build_epoch_wandb_log(
         log_data.update({f"curriculum/{key}": value for key, value in row["curriculum"].items()})
         log_data["curriculum/ready_for_variance_ramp"] = False
         log_data["curriculum/ready_for_rollout_ramp"] = False
+        log_data["curriculum/ready_for_phase_d"] = False
     if "phase_convergence" in row:
         log_data.update({f"phase_convergence/{key}": value for key, value in row["phase_convergence"].items()
                          if value is not None})
@@ -1838,6 +2167,22 @@ def build_epoch_wandb_log(
             "curriculum/convergence_stable_count": diagnostic["stable_count"],
             "curriculum/convergence_segment_age": diagnostic["segment_age"],
             "curriculum/ready_for_rollout_ramp": diagnostic["ready_for_rollout_ramp"],
+        })
+    if "phase_c_convergence" in row:
+        log_data.update({f"phase_c_convergence/{key}": value
+                         for key, value in row["phase_c_convergence"].items()
+                         if value is not None})
+        diagnostic = row["phase_c_convergence"]
+        log_data.update({
+            "curriculum/rollout_mse_rate_per_epoch": diagnostic[
+                "rollout_mse_rate_per_epoch"
+            ],
+            "curriculum/rollout_nll_rate_per_epoch": diagnostic[
+                "rollout_nll_rate_per_epoch"
+            ],
+            "curriculum/convergence_stable_count": diagnostic["stable_count"],
+            "curriculum/convergence_segment_age": diagnostic["segment_age"],
+            "curriculum/ready_for_phase_d": diagnostic["ready_for_phase_d"],
         })
 
     return log_data
@@ -2177,6 +2522,13 @@ def main():
             json.dump({**vars(args), "data_split": split_metadata}, f, indent=2)
 
     final_epoch = args.stop_after_epochs or args.epochs
+    if (curriculum_state is not None and resume_checkpoint is not None
+            and args.curriculum_config == "adaptive"):
+        if start_phase_d_if_ready(curriculum_state, start_epoch - 1, args.final_epoch):
+            rank_print(
+                f"Started Phase D at epoch {curriculum_state['phase_d_start_epoch']} "
+                "from a pre-Phase-D checkpoint whose rollout ramp was already complete."
+            )
     if (args.arm_variance_ramp or args.arm_rollout_ramp) and start_epoch > final_epoch:
         raise ValueError("Arming requires --stop-after-epochs beyond the completed checkpoint epoch")
     if start_epoch > final_epoch:
@@ -2221,6 +2573,7 @@ def main():
         wandb_run.define_metric("curriculum/*", step_metric="epoch")
         wandb_run.define_metric("phase_convergence/*", step_metric="epoch")
         wandb_run.define_metric("phase_b_convergence/*", step_metric="epoch")
+        wandb_run.define_metric("phase_c_convergence/*", step_metric="epoch")
 
     history = []
     history_path = out_dir / "history.json"
@@ -2253,13 +2606,14 @@ def main():
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         epoch_started = time.perf_counter()
-        epoch_lr = learning_rate_for_epoch(
-            epoch=min(epoch, args.epochs) if args.curriculum_training else epoch,
-            total_epochs=args.epochs,
-            base_lr=args.lr,
-            warmup_epochs=args.warmup_epochs,
-            min_lr=args.min_lr,
-        )
+        epoch_lr = (curriculum_learning_rate_for_epoch(epoch, args, curriculum_state)
+                    if curriculum_state is not None else learning_rate_for_epoch(
+                        epoch=epoch,
+                        total_epochs=args.epochs,
+                        base_lr=args.lr,
+                        warmup_epochs=args.warmup_epochs,
+                        min_lr=args.min_lr,
+                    ))
         for parameter_group in optimizer.param_groups:
             parameter_group["lr"] = epoch_lr
         if train_sampler is not None:
@@ -2292,6 +2646,15 @@ def main():
             curriculum_log_every=args.curriculum_log_every,
         )
 
+        rollout_validation = bool(
+            curriculum_state is not None
+            and curriculum_is_complete(curriculum_state)
+            and (
+                args.curriculum_config == "global_cosine"
+                or (args.curriculum_config == "abcd_symmetric_lr"
+                    and curriculum_state.get("phase_d_start_epoch") is None)
+            )
+        )
         validation_started = time.perf_counter()
         val_metrics = validate(
             model=(model.module if isinstance(model, DistributedDataParallel) else model),
@@ -2308,6 +2671,7 @@ def main():
             uncertainty_aware=args.uncertainty_aware,
             amp_dtype=getattr(torch, args.amp_dtype),
             uncertainty_loss=args.uncertainty_loss,
+            rollout_validation=rollout_validation,
         )
         validation_seconds = time.perf_counter() - validation_started
 
@@ -2360,10 +2724,17 @@ def main():
             row["curriculum"] = train_metrics["curriculum"]
             lambda_v_end = row["curriculum"]["lambda_v_end"]
             lambda_r_end = row["curriculum"]["lambda_r_end"]
-            phase_index = 0 if lambda_v_end == 0 else (1 if lambda_r_end == 0 else 2)
+            phase_index, phase_name = curriculum_phase(
+                epoch, curriculum_state, lambda_v_end, lambda_r_end,
+                args.curriculum_config,
+            )
             row["curriculum"].update(
                 phase_index=phase_index,
-                phase_name=("reconstruction_only", "variance", "rollout")[phase_index],
+                phase_name=phase_name,
+                phase_a_start_epoch=1,
+                phase_b_start_epoch=curriculum_state.get("variance_phase_start_epoch"),
+                phase_c_start_epoch=curriculum_state.get("rollout_phase_start_epoch"),
+                phase_d_start_epoch=curriculum_state.get("phase_d_start_epoch"),
                 convergence_rate_threshold=args.transition_rate_threshold,
                 convergence_patience_target=args.transition_patience,
             )
@@ -2380,6 +2751,11 @@ def main():
                     "nonfinite_events", "optimizer_updates")})
                 row["val_variance_statistics"] = val_metrics["variance_statistics"]
                 row["val_per_beta"] = val_metrics["per_beta"]
+                if rollout_validation:
+                    row["val_rollout_mse"] = val_metrics["mean"]["rollout_mse"]
+                    row["val_rollout_gaussian_nll"] = val_metrics["mean"][
+                        "rollout_gaussian_nll"
+                    ]
         transition_diagnostic = None
         if is_main_process():
             history.append(row)
@@ -2397,6 +2773,7 @@ def main():
                               f"stable_count={diagnostic['stable_count']}/{args.transition_patience} "
                               f"segment_age={diagnostic['segment_age'] if diagnostic['segment_age'] is not None else 'n/a'}"
                               f"/{diagnostic['minimum_segment_age']:g} "
+                              f"transition_monitor_active={'yes' if diagnostic['transition_monitor_active'] else 'no'} "
                               f"lr_floor_reached={'yes' if diagnostic['lr_floor_reached'] else 'no'} "
                               f"ready_for_variance_ramp={'yes' if diagnostic['ready_for_variance_ramp'] else 'no'}")
                     if diagnostic["ready_for_variance_ramp"]:
@@ -2419,6 +2796,30 @@ def main():
                                   f"ready_for_rollout_ramp={'yes' if diagnostic['ready_for_rollout_ramp'] else 'no'}")
                         if diagnostic["ready_for_rollout_ramp"]:
                             epoch_log("READY_FOR_ROLLOUT_RAMP=true")
+                    else:
+                        diagnostic = phase_c_convergence(history, args, curriculum_state)
+                        if diagnostic["phase_c"]:
+                            row["phase_c_convergence"] = diagnostic
+                            transition_diagnostic = diagnostic
+                            fields = []
+                            for name in (
+                                "ema_val_rollout_mse", "rollout_mse_rate_per_epoch",
+                                "ema_val_rollout_nll", "rollout_nll_rate_per_epoch",
+                            ):
+                                value = diagnostic[name]
+                                text = (f"{100 * value:+.3f}%" if "rate" in name
+                                        else f"{value:.8g}") if value is not None else "n/a"
+                                fields.append(f"{name}={text}")
+                            epoch_log(
+                                "Phase C convergence: " + " ".join(fields)
+                                + f" threshold={100 * args.transition_rate_threshold:.3f}% "
+                                f"stable_count={diagnostic['stable_count']}/{args.transition_patience} "
+                                f"segment_age={diagnostic['segment_age'] if diagnostic['segment_age'] is not None else 'n/a'}"
+                                f"/{diagnostic['minimum_segment_age']:g} "
+                                f"ready_for_phase_d={'yes' if diagnostic['ready_for_phase_d'] else 'no'}"
+                            )
+                            if diagnostic["ready_for_phase_d"]:
+                                epoch_log("READY_FOR_PHASE_D=true")
 
         if curriculum_state is not None:
             synchronized = [transition_diagnostic]
@@ -2428,12 +2829,37 @@ def main():
             transition = apply_ready_curriculum_transition(curriculum_state, transition_diagnostic)
             if transition is not None:
                 ramp, start_step = transition
+                curriculum_state[f"{ramp}_phase_start_epoch"] = epoch + 1
                 if is_main_process():
                     row["automatic_curriculum_transition"] = {
                         "ramp": ramp,
                         "start_step": start_step,
                     }
                     epoch_log(f"Automatically armed {ramp} ramp at successful optimizer step {start_step}")
+            if args.curriculum_config == "abcd_symmetric_lr":
+                phase_d_started = apply_ready_phase_d_transition(
+                    curriculum_state, transition_diagnostic, epoch, args.final_epoch,
+                )
+            elif args.curriculum_config == "adaptive":
+                phase_d_started = start_phase_d_if_ready(
+                    curriculum_state, epoch, args.final_epoch,
+                )
+            else:
+                phase_d_started = False
+            if phase_d_started:
+                if is_main_process():
+                    row["phase_d_transition"] = {
+                        "start_epoch": curriculum_state["phase_d_start_epoch"],
+                    }
+                    epoch_log(
+                        f"Phase D joint refinement starts at epoch "
+                        f"{curriculum_state['phase_d_start_epoch']}"
+                    )
+            row["curriculum"].update(
+                phase_b_start_epoch=curriculum_state.get("variance_phase_start_epoch"),
+                phase_c_start_epoch=curriculum_state.get("rollout_phase_start_epoch"),
+                phase_d_start_epoch=curriculum_state.get("phase_d_start_epoch"),
+            )
 
         if wandb_run is not None:
             wandb_run.log(

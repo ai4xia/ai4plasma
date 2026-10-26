@@ -688,6 +688,7 @@ def test_curriculum_compressed_main_save_resume_smoke(monkeypatch, tmp_path, cap
     import json
     import os
     import re
+    from types import SimpleNamespace
     import train_masked_unet3d as train
     device = torch.device(os.environ.get("AI4PLASMA_CURRICULUM_SMOKE_DEVICE", "cpu"))
     if device.type == "cuda":
@@ -711,7 +712,7 @@ def test_curriculum_compressed_main_save_resume_smoke(monkeypatch, tmp_path, cap
             "--batch-size", "2", "--num-workers", "0", "--base-channels", "2", "--channel-mults", "1", "2", "4", "8",
             "--spatial-only-pooling", "--use-attention", "--uncertainty-aware", "--uncertainty-loss", "gaussian_nll",
             "--curriculum-training", "--variance-ramp-epochs", "2", "--rollout-ramp-epochs", "2", "--curriculum-log-every", "1",
-            "--no-wandb", "--val-patterns", "spatial_random", "--final-epoch", "27"]
+            "--no-wandb", "--val-patterns", "spatial_random", "--final-epoch", "200"]
     if not manual:
         base += ["--variance-ramp-start-epoch", "1", "--rollout-ramp-start-epoch", "4"]
     if device.type == "cuda": base += ["--amp", "--amp-dtype", "bfloat16"]
@@ -740,24 +741,33 @@ def test_curriculum_compressed_main_save_resume_smoke(monkeypatch, tmp_path, cap
         log += run(out, 25, False, "--arm-rollout-ramp")
         state = checkpoint()["curriculum_state"]
         assert state["rollout_ramp_start_step"] == 48 and state["lambda_r"] == pytest.approx(.5)
-        log += run(out, 27, False)  # Resume in the middle of the rollout ramp.
+        log += run(out, 27, False)  # Finish rollout; Phase D begins at epoch 27.
+        log += run(out, 33, False)  # Resume during the fixed Phase-D cosine decay.
         saved = checkpoint()
-        assert saved["curriculum_state"]["successful_optimizer_steps"] == 54
+        assert saved["curriculum_state"]["successful_optimizer_steps"] == 66
         assert saved["curriculum_state"]["lambda_v"] == saved["curriculum_state"]["lambda_r"] == 1
-        assert {int(s["step"]) for s in saved["optimizer"]["state"].values()} == {11, 54}
+        assert saved["curriculum_state"]["phase_d_start_epoch"] == 27
+        assert {int(s["step"]) for s in saved["optimizer"]["state"].values()} == {23, 66}
+        phase_d_epoch_33_lr = train.curriculum_learning_rate_for_epoch(
+            33, SimpleNamespace(epochs=20, warmup_epochs=1, lr=2e-5,
+                                min_lr=2e-6, final_epoch=200), saved["curriculum_state"])
         assert saved["lr_schedule"] == dict(horizon_epochs=20, warmup_epochs=1, base_lr=2e-5,
-                                            min_lr=2e-6, current_lr=[2e-6])
+                                            min_lr=2e-6, current_lr=[phase_d_epoch_33_lr])
         history = json.loads((out / "history.json").read_text())
-        assert [r["epoch"] for r in history] == list(range(1, 28))
-        assert all(r["learning_rate"] == 2e-6 for r in history if r["epoch"] >= 20)
+        assert [r["epoch"] for r in history] == list(range(1, 34))
+        assert all(r["learning_rate"] == 2e-6 for r in history if 20 <= r["epoch"] < 27)
+        assert [r["learning_rate"] for r in history[26:31]] == pytest.approx(
+            [3.6e-6, 5.2e-6, 6.8e-6, 8.4e-6, 1e-5]
+        )
+        assert history[-1]["learning_rate"] == phase_d_epoch_33_lr
         assert all(r["curriculum"]["total_loss"] == pytest.approx(r["train_mse"], rel=1e-7) and
                    r["curriculum"]["two_forward_fraction"] == 0 for r in history[:21])
         assert "best_val_mse" not in saved and not (out / "best.pt").exists()
-        assert (out / "final.pt").is_file()
+        assert not (out / "final.pt").exists()
         assert all(r["amp_skipped_steps"] == r["nonfinite_events"] == 0 for r in history)
         assert all(torch.isfinite(torch.tensor(r["gradient_norm_max"])) for r in history)
         if device.type == "cpu":
-            assert saved["scaler"]["scale"] == 8. * 2 ** 54
+            assert saved["scaler"]["scale"] == 8. * 2 ** 66
             assert all(r["amp_scale_start"] == 8. * 2 ** (2 * (r["epoch"] - 1)) for r in history)
         (tmp_path / "manual_curriculum_smoke.log").write_text(log)
         print(log)
@@ -769,7 +779,7 @@ def test_curriculum_compressed_main_save_resume_smoke(monkeypatch, tmp_path, cap
     resumed_log += run(resumed, 5, False)  # saved step 10, halfway through rollout ramp
     resumed_log += run(resumed, 8, False)
     (tmp_path / "curriculum_smoke.log").write_text(complete_log + "\nSAVE/RESUME REPLAY\n" + resumed_log)
-    regex = r"Curriculum ([ABC]): successful_step=(\d+) next_successful_step=(\d+) lambda_v=([\d.e+-]+) lambda_r=([\d.e+-]+) forwards=(\d+)"
+    regex = r"Curriculum ([ABCD]): successful_step=(\d+) next_successful_step=(\d+) lambda_v=([\d.e+-]+) lambda_r=([\d.e+-]+) forwards=(\d+)"
     full_rows, resumed_rows = re.findall(regex, complete_log), re.findall(regex, resumed_log)
     assert len(full_rows) == 16 and full_rows == resumed_rows
     for region, step, next_step, lv, lr, forwards in full_rows:
@@ -793,6 +803,8 @@ def test_curriculum_compressed_main_save_resume_smoke(monkeypatch, tmp_path, cap
     assert all(r["amp_skipped_steps"] == r["nonfinite_events"] == 0 for r in history)
     assert all(torch.isfinite(torch.tensor(r["gradient_norm_max"])) for r in history)
     assert history[-1]["curriculum"]["two_forward_fraction"] == 1
-    assert all(r["learning_rate"] == train.learning_rate_for_epoch(r["epoch"], 20, 2e-5, 1, 2e-6) for r in history)
+    assert all(r["learning_rate"] == train.learning_rate_for_epoch(r["epoch"], 20, 2e-5, 1, 2e-6)
+               for r in history[:6])
+    assert [r["learning_rate"] for r in history[6:]] == pytest.approx([3.6e-6, 5.2e-6])
     print(complete_log)
     print("Save/resume at steps 4 and 10 exactly reproduced all 16 lambda pairs; checkpoints:", resumed)
