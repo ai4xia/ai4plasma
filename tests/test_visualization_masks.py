@@ -13,6 +13,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from data.masking import _spatial_block_plane, make_uncertain_input, sample_mask  # noqa: E402
+from data.vpic_hdf5_dataset import KNOWN_SHORT_TRAIN_RUNS, load_fixed_split  # noqa: E402
 
 from visualize_mask_patterns_unet3d import (  # noqa: E402
     DEFAULT_MAGNETIC_ABLATION_VISIBLE_FRACTIONS,
@@ -56,6 +57,7 @@ from visualize_mask_patterns_unet3d import (  # noqa: E402
     select_validation_statistics_indices,
     select_run_t0_index,
     try_reuse_plot_cache,
+    usable_jy_stat_train_runs,
     validation_statistics_legend_label,
     write_animation,
 )
@@ -595,6 +597,25 @@ def test_jy_training_summary_and_cache_keys_match_visualization_definition():
     }
     assert jy_stats_cache_matches(cached, {"run_a"}, mean, std, extent)
     assert not jy_stats_cache_matches(cached, {"run_b"}, mean, std, extent)
+
+
+def test_jy_stats_use_2248_window_usable_train_runs_and_reject_other_missing(capsys):
+    declared = set(load_fixed_split()["train_runs"])
+    usable_expected = declared - KNOWN_SHORT_TRAIN_RUNS
+    dataset = SimpleNamespace(
+        delta_t=24,
+        samples=[(0, run_name, 0) for run_name in sorted(usable_expected)],
+    )
+    usable, skipped = usable_jy_stat_train_runs(dataset, declared)
+    assert usable == usable_expected
+    assert skipped == sorted(KNOWN_SHORT_TRAIN_RUNS)
+    output = capsys.readouterr().out
+    assert "declared train runs = 2250" in output
+    assert "usable train runs = 2248" in output
+    assert all(run_name in output for run_name in KNOWN_SHORT_TRAIN_RUNS)
+
+    with pytest.raises(RuntimeError, match="unexpected runs"):
+        usable_jy_stat_train_runs(dataset, declared | {"unexpected_missing_train_run"})
 
 
 def test_jy_denormalize_before_derivative_ignores_checkpoint_b_std():

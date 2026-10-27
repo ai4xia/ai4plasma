@@ -56,11 +56,13 @@ from make_paper_figures import (  # noqa: E402
     plot_magnetic_ablation_summary,
     plot_sliding_window_appendix,
     plot_spatial_qualitative,
+    plot_global_uncertainty,
     select_sliding_aggregate_runs,
     sliding_density_probe_mask,
     sliding_provenance_error,
     stack_rmse_by_global_frame,
     try_load_validation_json,
+    uncertainty_condition_label,
     validation_run_order,
 )
 
@@ -111,17 +113,22 @@ def test_paper_context_strict_loading_and_spatial_array_schema(tmp_path, monkeyp
         assert torch.isfinite(variance).all() and (variance > 0).all()
     else:
         assert variance is None
+    if not uncertainty_aware:
+        with pytest.raises(RuntimeError, match="uncertainty-aware"):
+            paper.build_spatial_qualitative_cache(ctx, args)
+        return
     arrays, metadata = paper.build_spatial_qualitative_cache(ctx, args)
     assert set(arrays) == {"target_density"} | {
         f"{name}_{part}" for name in SPATIAL_ROW_ORDER
-        for part in ("visible", "prediction", "residual", "mask")}
+        for part in ("visible", "prediction", "actual_squared_error", "predicted_variance", "mask")}
     assert metadata["row_names"] == list(SPATIAL_ROW_ORDER)
-    assert metadata["layout"] == {"rows": 4, "columns": 4}
+    assert metadata["layout"] == {"rows": 3, "columns": 5}
     for name in SPATIAL_ROW_ORDER:
         mask = arrays[f"{name}_mask"]
         assert np.isfinite(arrays[f"{name}_prediction"]).all()
-        np.testing.assert_allclose(arrays[f"{name}_residual"],
-            (arrays[f"{name}_prediction"] - arrays["target_density"]) / 2., atol=1e-6)
+        np.testing.assert_allclose(arrays[f"{name}_actual_squared_error"],
+            ((arrays[f"{name}_prediction"] - arrays["target_density"]) / 2.) ** 2, atol=1e-6)
+        assert (arrays[f"{name}_predicted_variance"] > 0).all()
         assert np.isnan(arrays[f"{name}_visible"][mask == 0]).all()
     # The added output must be required, rather than accepted via non-strict loading.
     checkpoint["model"].pop("variance_out.weight" if uncertainty_aware else "out.weight")
@@ -237,14 +244,15 @@ def test_cache_signature_invalidates_when_checkpoint_changes(tmp_path):
     assert calls["n"] == 2
 
 
-def test_spatial_qualitative_figure_is_4x4(tmp_path):
+def test_spatial_qualitative_figure_is_3x5(tmp_path):
     rng = np.random.default_rng(0)
     target = rng.random((8, 6)).astype(np.float32)
     arrays = {"target_density": target}
     for name in SPATIAL_ROW_ORDER:
         arrays[f"{name}_visible"] = target.copy()
         arrays[f"{name}_prediction"] = target + 0.01
-        arrays[f"{name}_residual"] = rng.normal(0.0, 0.1, target.shape).astype(np.float32)
+        arrays[f"{name}_actual_squared_error"] = rng.random(target.shape).astype(np.float32)
+        arrays[f"{name}_predicted_variance"] = rng.random(target.shape).astype(np.float32)
         arrays[f"{name}_mask"] = np.ones_like(target)
     metadata = {
         "row_names": list(SPATIAL_ROW_ORDER),
@@ -259,8 +267,8 @@ def test_spatial_qualitative_figure_is_4x4(tmp_path):
         field_q=99.0,
         dpi=80,
     )
-    assert (n_rows, n_cols) == (4, 4)
-    assert len(SPATIAL_ROW_ORDER) == 4
+    assert (n_rows, n_cols) == (3, 5)
+    assert len(SPATIAL_ROW_ORDER) == 3
     assert (tmp_path / f"{FIGURE_STEMS['spatial']}.png").exists()
     assert (tmp_path / f"{FIGURE_STEMS['spatial']}.pdf").exists()
 
@@ -283,9 +291,8 @@ def test_spatial_qualitative_uses_visualization_physical_axes(tmp_path, monkeypa
     for name in SPATIAL_ROW_ORDER:
         arrays[f"{name}_visible"] = target.copy()
         arrays[f"{name}_prediction"] = target + 0.01
-        arrays[f"{name}_residual"] = rng.normal(0.0, 0.1, target.shape).astype(
-            np.float32
-        )
+        arrays[f"{name}_actual_squared_error"] = rng.random(target.shape).astype(np.float32)
+        arrays[f"{name}_predicted_variance"] = rng.random(target.shape).astype(np.float32)
         arrays[f"{name}_mask"] = np.ones_like(target)
     extent = [-21.0, 21.0, -50.0, 50.0]
     plot_spatial_qualitative(
@@ -300,13 +307,13 @@ def test_spatial_qualitative_uses_visualization_physical_axes(tmp_path, monkeypa
     fig = kept["fig"]
     zmin, zmax, xmin, xmax = extent
     panel_axes = [ax for ax in fig.axes if ax.get_images()]
-    assert len(panel_axes) == 16
+    assert len(panel_axes) == 15
     fig_texts = [text.get_text() for text in fig.texts]
     assert "z [cm]" in fig_texts
     assert "x [cm]" in fig_texts
-    for r in range(4):
-        for c in range(4):
-            ax = panel_axes[r * 4 + c]
+    for r in range(3):
+        for c in range(5):
+            ax = panel_axes[r * 5 + c]
             image = ax.get_images()[0]
             np.testing.assert_allclose(image.get_extent(), extent)
             assert image.origin == "lower"
@@ -314,7 +321,7 @@ def test_spatial_qualitative_uses_visualization_physical_axes(tmp_path, monkeypa
             np.testing.assert_allclose(ax.get_ylim(), (xmin, xmax))
             x_params = ax.xaxis.get_tick_params()
             y_params = ax.yaxis.get_tick_params()
-            assert bool(x_params.get("labelbottom", True)) is (r == 3)
+            assert bool(x_params.get("labelbottom", True)) is (r == 2)
             assert bool(y_params.get("labelleft", True)) is (c == 0)
             assert ax.get_xlabel() == ""
             assert ax.get_ylabel() == ""
@@ -686,7 +693,8 @@ def test_spatial_prediction_and_residual_are_full_field(tmp_path):
     for name in SPATIAL_ROW_ORDER:
         arrays[f"{name}_visible"] = visible
         arrays[f"{name}_prediction"] = prediction
-        arrays[f"{name}_residual"] = residual
+        arrays[f"{name}_actual_squared_error"] = residual ** 2
+        arrays[f"{name}_predicted_variance"] = residual ** 2
         arrays[f"{name}_mask"] = np.isfinite(visible).astype(np.float32)
     assert np.all(np.isfinite(prediction))
     assert np.all(np.isfinite(residual))
@@ -707,7 +715,7 @@ def test_spatial_prediction_and_residual_are_full_field(tmp_path):
         field_q=99.0,
         dpi=80,
     )
-    assert (n_rows, n_cols) == (4, 4)
+    assert (n_rows, n_cols) == (3, 5)
 
 
 def test_clip_positive_for_log_avoids_nonpositive():
@@ -737,8 +745,37 @@ def test_sliding_first_48_frames_skips_short_and_drops_later_frames():
     assert first_48_or_skip(130) == (0, 48)
 
 
-def test_sliding_default_steps_are_1_12_24():
-    assert tuple(DEFAULT_SLIDE_STEPS) == (1, 12, 24)
+def test_sliding_default_steps_cover_requested_journal_sweep():
+    assert tuple(DEFAULT_SLIDE_STEPS) == (1, 2, 4, 6, 8, 12, 24)
+
+
+def test_uncertainty_condition_labels_match_original_experiments():
+    assert uncertainty_condition_label("magnetic_ablation", "magnetic_ablation_0.1_density_hidden") == "Density fully hidden"
+    assert uncertainty_condition_label("magnetic_ablation", "magnetic_ablation_0.1_density_full") == "Density fully visible"
+    assert uncertainty_condition_label("superres", "density_superres_100_B_full") == "B visible"
+    assert uncertainty_condition_label("superres", "density_superres_100_B_hidden") == "B hidden"
+
+
+def test_global_uq_writes_separate_magnetic_channel_summaries(tmp_path):
+    arrays = {}
+    for prefix in ("density", "bx", "by", "bz", "b"):
+        arrays[f"global::{prefix}_variance"] = np.linspace(.1, 1, 20)
+        arrays[f"global::{prefix}_e2"] = np.linspace(.2, 1.1, 20)
+    records = []
+    for run_index in range(3):
+        record = {"run_name": f"run{run_index}", "task": "spatial_random", "family": "standard"}
+        for prefix in ("density", "bx", "by", "bz", "b"):
+            record.update({f"{prefix}_pearson": .2, f"{prefix}_spearman": .3,
+                f"{prefix}_mean_e2": .4, f"{prefix}_mean_variance": .5,
+                f"{prefix}_signed_bias": -.1, f"{prefix}_calibration_gap": .1})
+        records.append(record)
+    figures, data = tmp_path / "figures", tmp_path / "data"
+    figures.mkdir(); data.mkdir()
+    result = plot_global_uncertainty(arrays, records, figures, data, 40)
+    channels = {row["channel"] for row in result["magnetic_channel_summary"]}
+    assert channels == {"Bx", "By", "Bz"}
+    text = (data / "magnetic_channel_uncertainty_summary.csv").read_text()
+    assert all(channel in text for channel in ("Bx", "By", "Bz"))
 
 
 def test_validation_run_order_preserves_split_json(tmp_path):
@@ -851,7 +888,7 @@ def test_validation_json_rejects_stale_standardized_b_jy(tmp_path):
 
 
 def test_compatible_cache_versions_reuse_unchanged_signatures():
-    assert PAPER_CACHE_VERSION == 13
+    assert PAPER_CACHE_VERSION == 14
     assert 12 in COMPATIBLE_PAPER_CACHE_VERSIONS
     for figure in ("spatial", "sliding"):
         stored = {"cache_version": 12, "figure": figure, "payload": 1}

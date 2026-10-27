@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable, Dict, List, Sequence, Tuple
@@ -25,6 +27,7 @@ from data.vpic_hdf5_dataset import (
     find_h5_files,
     fixed_split_metadata,
     load_fixed_split,
+    validate_checkpoint_split,
     validate_final_checkpoint,
 )
 from models.unet3d import LEGACY_MODEL_VERSION, UNet3D
@@ -49,6 +52,8 @@ from visualize_mask_patterns_unet3d import (
     checkpoint_cache_signature,
     collect_validation_statistics,
     compute_normalized_metrics,
+    compute_jy,
+    compute_physical_jy_from_normalized,
     default_density_forecast_visible_frames,
     denormalize,
     expand_path,
@@ -75,13 +80,22 @@ from visualize_sliding_density_reconstruction import (
     reconstruct_with_slide_step,
     validate_test_run,
 )
+from journal_statistics import (
+    calibration_bias,
+    group_run_records,
+    pearson_spearman,
+    predicted_voxel_mask,
+    quantile_calibration,
+    summarize,
+    summarize_run_records,
+)
 
 
-PAPER_CACHE_VERSION = 13
-COMPATIBLE_PAPER_CACHE_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)
+PAPER_CACHE_VERSION = 14
+COMPATIBLE_PAPER_CACHE_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14)
 PAPER_DIRNAME = "paper_figures_v1"
 DEFAULT_GLOBAL_FRAME = 45
-DEFAULT_SLIDE_STEPS = (1, 12, 24)
+DEFAULT_SLIDE_STEPS = (1, 2, 4, 6, 8, 12, 24)
 DEFAULT_PROBE_COUNTS = (0, 10, 100, 1000)
 DEFAULT_X_INDEX = 130
 DEFAULT_DENSITY_VISIBLE_FRACTION = 0.08
@@ -91,12 +105,7 @@ SLIDING_AGGREGATE_N_FRAMES = 48
 LOG_Y_FLOOR = 1e-6
 PNG_DPI = 300
 
-SPATIAL_ROW_ORDER = (
-    "spatial_random",
-    "spatial_grid",
-    "spatial_block_inpainting",
-    "spatial_block_outpainting",
-)
+SPATIAL_ROW_ORDER = ("spatial_random", "spatial_grid", "spatial_block_inpainting")
 SPATIAL_ROW_LABELS = {
     "spatial_random": "Spatial random",
     "spatial_grid": "Spatial grid",
@@ -116,6 +125,8 @@ FIGURE_STEMS = {
     "forecast": "density_forecast_summary",
     "superres": "density_superres_summary",
     "sliding": "sliding_window_appendix",
+    "parameters": "physical_parameter_dependence",
+    "global_uq": "global_uncertainty_quality",
 }
 ALL_FIGURES = tuple(FIGURE_STEMS)
 INFO_DIR_WITH_B = "figures_information_suite_plasmoid_merger"
@@ -166,8 +177,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--checkpoint", default="final.pt")
+    parser.add_argument("--allow-incomplete-checkpoint", action="store_true",
+        help="Allow an explicit latest.pt diagnostic before the predetermined final epoch.")
     parser.add_argument("--run-name", default=DEFAULT_RUN_NAME)
     parser.add_argument("--paper-dir", default=None)
+    parser.add_argument(
+        "--output-dir", default=None,
+        help="Explicit output directory (alias for --paper-dir; takes precedence).",
+    )
     parser.add_argument("--force-recompute", action="store_true")
     parser.add_argument(
         "--figure",
@@ -223,13 +240,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sliding-max-runs",
         type=int,
-        default=DEFAULT_SLIDING_MAX_RUNS,
+        default=0,
         help=(
-            "Maximum held-out test runs for sliding appendix left-panel "
+            "Maximum held-out test runs (0 means every eligible test run) for "
             "RMSE stats, taken in authoritative test-split order. Runs shorter than 48 frames "
             "are skipped; remaining runs use only the first 48 frames."
         ),
     )
+    parser.add_argument("--statistics-max-windows-per-run", type=int, default=None)
+    parser.add_argument("--uq-sample-size", "--uq-voxels-per-window", dest="uq_voxels_per_window",
+        type=int, default=20000,
+        help="Deterministic bounded sample cap for per-run/task correlations (default: 20000).")
     return parser.parse_args()
 
 
@@ -394,9 +415,10 @@ def select_sliding_aggregate_runs(
     max_runs: int,
 ) -> List[str]:
     """Take the first ``max_runs`` test runs in authoritative split order."""
-    if int(max_runs) <= 0:
-        raise ValueError(f"sliding max runs must be positive, got {max_runs}")
-    return [str(name) for name in val_run_order][: int(max_runs)]
+    if int(max_runs) < 0:
+        raise ValueError(f"sliding max runs must be nonnegative, got {max_runs}")
+    runs = [str(name) for name in val_run_order]
+    return runs if int(max_runs) == 0 else runs[: int(max_runs)]
 
 
 def sliding_density_probe_mask(
@@ -569,9 +591,12 @@ def summarize_run_scalars(per_run_profiles: Dict[str, Sequence[float]]) -> Dict:
     return {
         "run_names": run_names,
         "per_run": values.tolist(),
+        "mean": float(np.mean(values)),
+        "std": float(np.std(values)),
         "median": float(np.median(values)),
         "p16": float(np.percentile(values, 16.0)),
         "p84": float(np.percentile(values, 84.0)),
+        "n": int(values.size),
         "aggregation": (
             "existing per-run median over windows, then mean over local frames, "
             "then cross-run median and 16th-84th percentiles"
@@ -656,9 +681,9 @@ def manifest_figure_entry(
     }
 
 
-def read_checkpoint_epoch(checkpoint_path: Path) -> int:
+def read_checkpoint_epoch(checkpoint_path: Path, require_final: bool = True) -> int:
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    validate_final_checkpoint(ckpt)
+    (validate_final_checkpoint if require_final else validate_checkpoint_split)(ckpt)
     epoch = ckpt.get("epoch")
     if epoch is None:
         raise RuntimeError(f"Checkpoint {checkpoint_path} has no epoch metadata.")
@@ -830,7 +855,10 @@ def load_inference_context(args: argparse.Namespace) -> Dict:
     device = torch.device(
         args.device if args.device == "cuda" and torch.cuda.is_available() else "cpu"
     )
-    ckpt, ckpt_path = load_checkpoint(run_dir, args.checkpoint, device=device)
+    ckpt, ckpt_path = load_checkpoint(
+        run_dir, args.checkpoint, device=device,
+        require_final=not bool(getattr(args, "allow_incomplete_checkpoint", False)),
+    )
     ckpt_args = ckpt["args"]
     uncertainty_aware = bool(ckpt_args.get("uncertainty_aware", False))
     stats = ckpt["stats"]
@@ -952,6 +980,9 @@ def row_dicts_from_masks(mask_rows: Sequence[Tuple[str, str, torch.Tensor]]) -> 
 
 @torch.no_grad()
 def build_spatial_qualitative_cache(ctx: Dict, args: argparse.Namespace) -> Tuple[Dict, Dict]:
+    torch.manual_seed(int(args.seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(args.seed))
     sample, y = select_named_window(ctx, args)
     metadata = sample["metadata"]
     local_time = local_index_for_global_frame(args.t0, args.global_frame, ctx["delta_t"])
@@ -984,7 +1015,9 @@ def build_spatial_qualitative_cache(ctx: Dict, args: argparse.Namespace) -> Tupl
     row_meta = []
     for name in SPATIAL_ROW_ORDER:
         _label, mask = by_name[name]
-        pred_norm, _ = predict_masked_fields(ctx["model"], y_norm, mask)
+        pred_norm, pred_variance = predict_masked_fields(ctx["model"], y_norm, mask)
+        if pred_variance is None:
+            raise RuntimeError("Journal uncertainty panels require an uncertainty-aware checkpoint.")
         pred_plot = denormalize(pred_norm, mean, std)
         density_mask = mask[0, 3].detach().cpu().numpy()
         visible = np.array(target_plot[local_time], copy=True)
@@ -995,15 +1028,27 @@ def build_spatial_qualitative_cache(ctx: Dict, args: argparse.Namespace) -> Tupl
             pred_norm[0, 3, local_time].detach().cpu().numpy(),
             target_norm[local_time],
         )
+        squared_error = np.square(residual, dtype=np.float32)
+        variance = pred_variance[0, 3, local_time].float().detach().cpu().numpy()
+        unknown = density_mask[local_time] < 0.5
+        corr = pearson_spearman(variance[unknown], squared_error[unknown])
+        bins = quantile_calibration(variance[unknown], squared_error[unknown], 10)
+        bias = calibration_bias(float(np.mean(squared_error[unknown])), float(np.mean(variance[unknown])))
         arrays[f"{name}_visible"] = np.asarray(visible, dtype=np.float32)
         arrays[f"{name}_prediction"] = np.asarray(pred, dtype=np.float32)
-        arrays[f"{name}_residual"] = np.asarray(residual, dtype=np.float32)
+        arrays[f"{name}_actual_squared_error"] = squared_error
+        arrays[f"{name}_predicted_variance"] = np.asarray(variance, dtype=np.float32)
         arrays[f"{name}_mask"] = np.asarray(density_mask[local_time], dtype=np.float32)
         row_meta.append(
             {
                 "name": name,
                 "density_masked_fraction": float(1.0 - density_mask.mean()),
                 "density_nrmse": density_nrmse_from_residual(residual),
+                **corr,
+                "signed_bias": bias["signed_bias"],
+                "calibration_gap": bias["calibration_gap"],
+                "calibration_bins": bins,
+                "uncertainty_scope": "unobserved Density voxels at displayed frame",
             }
         )
     meta = {
@@ -1025,7 +1070,8 @@ def build_spatial_qualitative_cache(ctx: Dict, args: argparse.Namespace) -> Tupl
             "full-field prediction_normalized - target_normalized, including visible sites"
         ),
         "sample_metadata": dict(metadata),
-        "layout": {"rows": 4, "columns": 4},
+        "layout": {"rows": 3, "columns": 5},
+        "uncertainty_units": "checkpoint-standardized Density squared units",
     }
     return arrays, meta
 
@@ -1040,20 +1086,20 @@ def plot_spatial_qualitative(
     dpi: int,
 ) -> Tuple[int, int]:
     row_names = [str(name) for name in metadata["row_names"]]
-    n_rows, n_cols = 4, 4
+    n_rows, n_cols = 3, 5
     if len(row_names) != n_rows:
         raise ValueError(f"Expected {n_rows} spatial rows, got {row_names}")
     field_arrays = [arrays["target_density"]]
-    residual_arrays = []
+    error_arrays = []
     for name in row_names:
         field_arrays.extend([arrays[f"{name}_visible"], arrays[f"{name}_prediction"]])
-        residual_arrays.append(arrays[f"{name}_residual"])
+        error_arrays.extend([arrays[f"{name}_actual_squared_error"], arrays[f"{name}_predicted_variance"]])
     vmin, vmax = robust_limits(field_arrays, channel=3, q=field_q, symmetric=False)
-    res_vmin, res_vmax = -float(residual_vmax), float(residual_vmax)
+    error_vmax = float(np.nanpercentile(np.concatenate([a.ravel() for a in error_arrays]), 99.0))
     field_cmap = make_nan_cmap("magma")
-    residual_cmap = make_nan_cmap(RESIDUAL_CMAP)
+    error_cmap = make_nan_cmap("viridis")
 
-    fig = plt.figure(figsize=(7.4, 8.0))
+    fig = plt.figure(figsize=(10.2, 6.3))
     gs = gridspec.GridSpec(
         n_rows,
         n_cols,
@@ -1065,7 +1111,7 @@ def plot_spatial_qualitative(
         top=0.92,
         bottom=0.11,
     )
-    col_titles = ["Target Density", "Visible Density", "Prediction", "Residual"]
+    col_titles = ["Target Density", "Visible Density", "Prediction", "Actual squared error", "Predicted variance"]
     nrmse_by_name = {
         str(row.get("name")): row.get("density_nrmse")
         for row in metadata.get("rows") or []
@@ -1079,7 +1125,8 @@ def plot_spatial_qualitative(
             arrays["target_density"],
             arrays[f"{name}_visible"],
             arrays[f"{name}_prediction"],
-            arrays[f"{name}_residual"],
+            arrays[f"{name}_actual_squared_error"],
+            arrays[f"{name}_predicted_variance"],
         ]
         for c, panel in enumerate(panels):
             if base_ax is None:
@@ -1105,16 +1152,17 @@ def plot_spatial_qualitative(
                     origin="lower",
                     aspect="auto",
                     extent=extent,
-                    cmap=residual_cmap,
-                    vmin=res_vmin,
-                    vmax=res_vmax,
+                    cmap=error_cmap,
+                    vmin=0.0,
+                    vmax=error_vmax,
                     interpolation="nearest",
                 )
                 residual_im = im
-                nrmse = nrmse_by_name.get(name)
-                if nrmse is None:
-                    nrmse = density_nrmse_from_residual(panel)
-                annotate_density_nrmse(ax, float(nrmse))
+                if c == 3:
+                    nrmse = nrmse_by_name.get(name)
+                    if nrmse is None:
+                        nrmse = float(np.sqrt(np.nanmean(panel)))
+                    annotate_density_nrmse(ax, float(nrmse))
             if r == 0:
                 ax.set_title(col_titles[c], pad=4)
             if c == 0:
@@ -1142,7 +1190,7 @@ def plot_spatial_qualitative(
     cb_field = fig.colorbar(field_im, cax=cax_field)
     cb_field.set_label("Density", fontsize=8)
     cb_res = fig.colorbar(residual_im, cax=cax_res)
-    cb_res.set_label("Normalized residual", fontsize=8)
+    cb_res.set_label("Standardized squared units", fontsize=8)
     fig.suptitle(
         "B fully observed  ·  Density ~50% masked  ·  "
         f"global frame {metadata['global_frame']}",
@@ -1151,6 +1199,393 @@ def plot_spatial_qualitative(
     )
     save_png_pdf(fig, figures_dir, FIGURE_STEMS["spatial"], dpi)
     return n_rows, n_cols
+
+
+def write_csv(path: Path, rows: Sequence[Dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        path.write_text("")
+        return
+    columns = list(dict.fromkeys(key for row in rows for key in row))
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def plot_spatial_calibration(metadata: Dict, figures_dir: Path, data_dir: Path, dpi: int) -> None:
+    fig, ax = plt.subplots(figsize=(4.2, 3.8))
+    csv_rows = []
+    for row in metadata["rows"]:
+        bins = row["calibration_bins"]
+        x = [item["mean_predicted_variance"] for item in bins]
+        y = [item["mean_actual_squared_error"] for item in bins]
+        ax.plot(x, y, marker="o", label=SPATIAL_ROW_LABELS[row["name"]].replace("\n", " "))
+        csv_rows.extend({"task": row["name"], **item} for item in bins)
+    limit = max(ax.get_xlim()[1], ax.get_ylim()[1])
+    ax.plot([0, limit], [0, limit], "k--", linewidth=1, label="y=x")
+    ax.set(xlabel="Mean predicted variance (standardized²)", ylabel="Mean actual squared error (standardized²)")
+    ax.legend(frameon=False, fontsize=7)
+    ax.grid(alpha=.25)
+    save_png_pdf(fig, figures_dir, "spatial_uncertainty_calibration", dpi)
+    write_csv(data_dir / "spatial_uncertainty_calibration.csv", csv_rows)
+
+
+_RUN_PARAMETERS = re.compile(
+    r"^beta(?P<beta>[^_]+)_nu(?P<nu>[^_]+)_Bz(?P<Bz0>[^_]+)_dt(?P<dt>[^_]+)_tau(?P<tau>[^_]+)$"
+)
+
+
+def parse_run_parameters(run_name: str) -> Dict[str, float]:
+    match = _RUN_PARAMETERS.match(str(run_name))
+    if match is None:
+        raise ValueError(f"Cannot parse physical parameters from run name {run_name!r}")
+    return {key: float(value) for key, value in match.groupdict().items()}
+
+
+def _bounded_pair_sample(variance: np.ndarray, e2: np.ndarray, limit: int, seed: int) -> Tuple[np.ndarray, np.ndarray]:
+    variance, e2 = np.asarray(variance).ravel(), np.asarray(e2).ravel()
+    keep = np.isfinite(variance) & np.isfinite(e2)
+    variance, e2 = variance[keep], e2[keep]
+    if variance.size > limit:
+        indices = np.random.default_rng(seed).choice(variance.size, limit, replace=False)
+        variance, e2 = variance[indices], e2[indices]
+    return variance.astype(np.float32), e2.astype(np.float32)
+
+
+def _journal_mask_rows(ctx: Dict, args: argparse.Namespace) -> List[Dict]:
+    _sample, y = select_named_window(ctx, args)
+    generator = torch.Generator().manual_seed(args.seed)
+    rows = []
+    spatial = build_density_only_multifunction_rows(
+        y, ["spatial_random", "spatial_grid", "spatial_block", "temporal_random", "temporal_block"],
+        .8, .5, 4, 2, generator, magnetic_visible=True,
+    )
+    for name, label, mask in spatial:
+        if name in {*SPATIAL_ROW_ORDER, "temporal_random", "temporal_block"}:
+            rows.append({"family": "standard", "name": name, "label": label, "mask": mask[0].cpu().numpy()})
+    for b_hidden in (False, True):
+        suffix = "B_hidden" if b_hidden else "B_full"
+        for name, label, mask in build_density_forecast_rows(y, default_density_forecast_visible_frames(ctx["delta_t"]), not b_hidden):
+            rows.append({"family": "forecast", "name": f"{name}_{suffix}", "label": label, "mask": mask[0].cpu().numpy()})
+        for name, label, mask in build_density_superres_rows(y, args.density_probe_counts, not b_hidden):
+            rows.append({"family": "superres", "name": f"{name}_{suffix}", "label": label, "mask": mask[0].cpu().numpy()})
+    magnetic = build_magnetic_ablation_rows(y, DEFAULT_MAGNETIC_ABLATION_VISIBLE_FRACTIONS, generator)
+    for density_full in (False, True):
+        condition = "density_full" if density_full else "density_hidden"
+        for name, label, mask in magnetic:
+            mask = mask.clone()
+            mask[:, 3] = 1.0 if density_full else 0.0
+            rows.append({"family": "magnetic_ablation", "name": f"{name}_{condition}", "label": label, "mask": mask[0].cpu().numpy()})
+    return rows
+
+
+@torch.no_grad()
+def build_journal_statistics_cache(ctx: Dict, args: argparse.Namespace) -> Tuple[Dict, Dict]:
+    """Shared test-set pass for Figures 2/3/4/6/7; statistical unit is a run."""
+    torch.manual_seed(int(args.seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(args.seed))
+    if not bool(ctx["ckpt_args"].get("uncertainty_aware", False)):
+        raise RuntimeError("Journal uncertainty evaluation requires an uncertainty-aware checkpoint.")
+    dataset = VPICWindowDataset(h5_dir=ctx["h5_dir"], betas=ctx["ckpt_args"].get("betas", [.2]),
+        delta_t=ctx["delta_t"], stride_t=1, layout="C T X Z", return_metadata=True)
+    indices = select_validation_statistics_indices(dataset, set(ctx["val_runs"]), ctx["delta_t"], args.statistics_max_windows_per_run)
+    canonical = _journal_mask_rows(ctx, args)
+    by_run: Dict[str, Dict[str, Dict]] = {}
+    sample_limit = max(32, int(args.uq_voxels_per_window))
+    for ordinal, index in enumerate(indices):
+        sample = dataset[index]; run_name = sample["metadata"]["run_name"]
+        target = sample["block"].unsqueeze(0).to(ctx["device"])
+        target_norm = normalize(target, ctx["mean"], ctx["std"])
+        target_np = target_norm[0].cpu().numpy(); target_phys = target[0].cpu().numpy()
+        target_jy = compute_jy(target_phys, args.extent)
+        run = by_run.setdefault(run_name, {})
+        for row_index, row in enumerate(canonical):
+            mask = torch.as_tensor(row["mask"], device=ctx["device"], dtype=target_norm.dtype).unsqueeze(0)
+            prediction, variance = predict_masked_fields(ctx["model"], target_norm, mask)
+            pred = prediction[0].float().cpu().numpy(); var = variance[0].float().cpu().numpy()
+            residual = pred - target_np; unknown = np.asarray(row["mask"]) < .5
+            density_nrmse = float(np.sqrt(np.mean(residual[3] ** 2)))
+            prediction_jy = compute_physical_jy_from_normalized(pred, ctx["mean"], ctx["std"], args.extent)
+            jy_nrmse = float(jy_nrmse_from_residual(prediction_jy - target_jy, float(ctx["jy_stats"]["jy_std_train"])).mean())
+            entry = run.setdefault(row["name"], {"family": row["family"], "density_nrmse": [], "jy_nrmse": []})
+            entry["density_nrmse"].append(density_nrmse); entry["jy_nrmse"].append(jy_nrmse)
+            for prefix, channels in (("density", [3]), ("bx", [0]), ("by", [1]), ("bz", [2])):
+                choose = predicted_voxel_mask(row["mask"], channels)
+                if not np.any(choose):
+                    continue
+                entry.setdefault(f"{prefix}_e2", [])
+                entry.setdefault(f"{prefix}_var", [])
+                entry.setdefault(f"{prefix}_sum_e2", 0.0)
+                entry.setdefault(f"{prefix}_sum_var", 0.0)
+                entry.setdefault(f"{prefix}_count", 0)
+                exact_v = var[channels][choose]; exact_e = residual[channels][choose] ** 2
+                entry[f"{prefix}_sum_var"] += float(np.sum(exact_v, dtype=np.float64))
+                entry[f"{prefix}_sum_e2"] += float(np.sum(exact_e, dtype=np.float64))
+                entry[f"{prefix}_count"] += int(exact_v.size)
+                v, e = _bounded_pair_sample(exact_v, exact_e,
+                    min(256, sample_limit), args.seed + ordinal * 1009 + row_index * 31 + channels[0])
+                entry[f"{prefix}_var"].append(v); entry[f"{prefix}_e2"].append(e)
+        if ordinal == 0 or (ordinal + 1) % 25 == 0 or ordinal + 1 == len(indices):
+            print(f"Journal statistics: {ordinal + 1}/{len(indices)} windows")
+    dataset.close()
+    records = []
+    prefixes = ("density", "bx", "by", "bz")
+    global_samples = {
+        f"{prefix}_{kind}": []
+        for prefix in (*prefixes, "b")
+        for kind in ("variance", "e2")
+    }
+    for run_name, tasks in sorted(by_run.items()):
+        params = parse_run_parameters(run_name)
+        for task, entry in tasks.items():
+            record = {"run_name": run_name, "task": task, "family": entry["family"], **params,
+                "density_nrmse": float(np.mean(entry["density_nrmse"])), "jy_nrmse": float(np.mean(entry["jy_nrmse"]))}
+            samples = {}
+            for prefix_index, prefix in enumerate(prefixes):
+                count = int(entry.get(f"{prefix}_count", 0))
+                if count:
+                    variance_sample, e2_sample = _bounded_pair_sample(
+                        np.concatenate(entry.pop(f"{prefix}_var")), np.concatenate(entry.pop(f"{prefix}_e2")),
+                        sample_limit, args.seed + len(records) * 101 + prefix_index,
+                    )
+                    corr = pearson_spearman(variance_sample, e2_sample)
+                    mean_e2 = entry[f"{prefix}_sum_e2"] / count
+                    mean_variance = entry[f"{prefix}_sum_var"] / count
+                    bias = calibration_bias(mean_e2, mean_variance)
+                else:
+                    variance_sample = e2_sample = np.empty(0, dtype=np.float32)
+                    corr = {"pearson": float("nan"), "spearman": float("nan")}
+                    mean_e2 = mean_variance = float("nan")
+                    bias = {"signed_bias": float("nan"), "calibration_gap": float("nan")}
+                record.update({
+                    f"{prefix}_mean_e2": mean_e2, f"{prefix}_mean_variance": mean_variance,
+                    f"{prefix}_signed_bias": bias["signed_bias"], f"{prefix}_calibration_gap": bias["calibration_gap"],
+                    f"{prefix}_pearson": corr["pearson"], f"{prefix}_spearman": corr["spearman"],
+                    f"{prefix}_predicted_voxel_count": count, f"sampled_{prefix}_voxels": int(variance_sample.size),
+                })
+                samples[prefix] = (variance_sample, e2_sample)
+            available_b = [samples[prefix] for prefix in ("bx", "by", "bz") if samples[prefix][0].size]
+            if available_b:
+                b_variance = np.concatenate([pair[0] for pair in available_b])
+                b_e2 = np.concatenate([pair[1] for pair in available_b])
+                b_corr = pearson_spearman(b_variance, b_e2)
+                b_count = sum(int(record[f"{prefix}_predicted_voxel_count"]) for prefix in ("bx", "by", "bz"))
+                b_mean_e2 = sum(entry.get(f"{prefix}_sum_e2", 0.0) for prefix in ("bx", "by", "bz")) / b_count
+                b_mean_variance = sum(entry.get(f"{prefix}_sum_var", 0.0) for prefix in ("bx", "by", "bz")) / b_count
+                b_bias = calibration_bias(b_mean_e2, b_mean_variance)
+            else:
+                b_variance = b_e2 = np.empty(0, dtype=np.float32); b_count = 0
+                b_corr = {"pearson": float("nan"), "spearman": float("nan")}
+                b_mean_e2 = b_mean_variance = float("nan")
+                b_bias = {"signed_bias": float("nan"), "calibration_gap": float("nan")}
+            record.update({"b_mean_e2": b_mean_e2, "b_mean_variance": b_mean_variance,
+                "b_signed_bias": b_bias["signed_bias"], "b_calibration_gap": b_bias["calibration_gap"],
+                "b_pearson": b_corr["pearson"], "b_spearman": b_corr["spearman"],
+                "b_predicted_voxel_count": b_count, "sampled_b_voxels": int(b_variance.size)})
+            records.append(record)
+            for prefix, (variance_sample, e2_sample) in {**samples, "b": (b_variance, b_e2)}.items():
+                if not variance_sample.size:
+                    continue
+                vg, eg = _bounded_pair_sample(variance_sample, e2_sample, min(512, sample_limit), args.seed + len(records) * 29 + prefixes.index(prefix) if prefix in prefixes else args.seed + len(records) * 29 + 4)
+                global_samples[f"{prefix}_variance"].append(vg); global_samples[f"{prefix}_e2"].append(eg)
+    sample_arrays = {
+        f"global::{key}": np.concatenate(values)
+        for key, values in global_samples.items() if values
+    }
+    metadata = {"figure": "journal_statistics", "records": records, "test_run_count": len(by_run),
+        "window_count": len(indices), "sampling_seed": int(args.seed), "max_sampled_voxels_per_run_task_channel_group": sample_limit,
+        "per_window_sampling_cap": min(256, sample_limit), "global_calibration_sample_per_run_task_cap": min(512, sample_limit),
+        "units": "checkpoint-standardized squared units", "aggregation": "windows within run, then runs",
+        "uncertainty_domain": "only mask==0 predicted/unknown voxels; exact observations excluded",
+        "magnetic_uncertainty": "Bx, By, Bz separately plus optional macro aggregate; never Jy",
+        "model_version": ctx["ckpt_args"].get("model_version"), "split": fixed_split_metadata()}
+    return sample_arrays, metadata
+
+
+def _summary_rows(records: Sequence[Dict], group_key: str, metrics: Sequence[str]) -> List[Dict]:
+    grouped = {}
+    for record in records:
+        grouped.setdefault(record[group_key], []).append(record)
+    rows = []
+    for group, members in sorted(grouped.items()):
+        for metric, stats in summarize_run_records(members, metrics).items():
+            rows.append({group_key: group, "metric": metric, **stats})
+    return rows
+
+
+def uncertainty_condition_label(family: str, task: str) -> str:
+    if family == "magnetic_ablation":
+        return "Density fully visible" if task.endswith("density_full") else "Density fully hidden"
+    if family in {"superres", "forecast"}:
+        return "B hidden" if task.endswith("B_hidden") else "B visible"
+    raise ValueError(f"No uncertainty condition label for family={family!r}, task={task!r}")
+
+
+def plot_uncertainty_companions(records: Sequence[Dict], figures_dir: Path, data_dir: Path, dpi: int) -> None:
+    specifications = (
+        ("magnetic_ablation", "magnetic_ablation_uncertainty", "B visible level", lambda r: float(r["task"].split("_")[2]),
+         lambda r: uncertainty_condition_label("magnetic_ablation", r["task"])),
+        ("superres", "density_superres_uncertainty", "Density probe count", lambda r: float(r["task"].split("_")[2]),
+         lambda r: uncertainty_condition_label("superres", r["task"])),
+        ("forecast", "conditional_temporal_uncertainty", "Missing future frames", lambda r: 24 - int(r["task"].split("_")[3]),
+         lambda r: uncertainty_condition_label("forecast", r["task"])),
+    )
+    for family, stem, xlabel, x_fn, condition_fn in specifications:
+        selected = [dict(r, x=x_fn(r), condition=condition_fn(r)) for r in records if r["family"] == family]
+        if not selected:
+            continue
+        combos = sorted({(r["x"], r["condition"]) for r in selected}, key=lambda item: (item[1], item[0]))
+        summary_rows = []
+        fig, axes = plt.subplots(1, 2, figsize=(8.8, 3.5), sharey=False)
+        for condition in sorted({r["condition"] for r in selected}):
+            x_values = sorted({r["x"] for r in selected if r["condition"] == condition})
+            for ax, prefix, title in ((axes[0], "density", "Density"), (axes[1], "b", "Direct B macro-average")):
+                available_for_condition = any(
+                    np.isfinite(r.get(f"{prefix}_mean_e2", np.nan))
+                    for r in selected if r["condition"] == condition
+                )
+                if not available_for_condition:
+                    continue
+                for field, linestyle, label in (("mean_e2", "-", "actual e²"), ("mean_variance", "--", "predicted variance")):
+                    mids=[]; lows=[]; highs=[]
+                    for x in x_values:
+                        members=[r for r in selected if r["condition"] == condition and r["x"] == x]
+                        stats=summarize(r[f"{prefix}_{field}"] for r in members)
+                        mids.append(stats["median"]); lows.append(stats["p16"]); highs.append(stats["p84"])
+                        summary_rows.append({"family":family,"condition":condition,"x":x,"channel_group":prefix,"quantity":field,**stats})
+                    line=ax.plot(x_values,mids,linestyle=linestyle,marker="o",label=f"{condition}: {label}")[0]
+                    ax.fill_between(x_values,lows,highs,color=line.get_color(),alpha=.12)
+                for metric in ("signed_bias", "calibration_gap", "pearson", "spearman"):
+                    for x in x_values:
+                        members=[r for r in selected if r["condition"] == condition and r["x"] == x]
+                        summary_rows.append({"family":family,"condition":condition,"x":x,"channel_group":prefix,
+                            "quantity":metric, **summarize(r.get(f"{prefix}_{metric}", np.nan) for r in members)})
+                ax.set_title(title); ax.set_xlabel(xlabel); ax.grid(alpha=.25)
+        axes[0].set_ylabel("Standardized squared units")
+        axes[1].legend(frameon=False,fontsize=6)
+        fig.tight_layout(); save_png_pdf(fig, figures_dir, stem, dpi)
+        write_csv(data_dir / f"{stem}.csv", summary_rows)
+
+
+def build_parameter_summary(records: Sequence[Dict]) -> List[Dict]:
+    spatial = [r for r in records if r["task"] in SPATIAL_ROW_ORDER]
+    per_run = {}
+    for record in spatial:
+        item = per_run.setdefault(record["run_name"], {k: record[k] for k in ("run_name", "beta", "nu", "Bz0", "tau")})
+        item.setdefault("density_values", []).append(record["density_nrmse"])
+        item.setdefault("jy_values", []).append(record["jy_nrmse"])
+    run_records=[]
+    for item in per_run.values():
+        item["density_nrmse"] = float(np.mean(item.pop("density_values")))
+        item["jy_nrmse"] = float(np.mean(item.pop("jy_values")))
+        run_records.append(item)
+    return [group for parameter in ("beta", "nu", "Bz0", "tau") for group in group_run_records(run_records, parameter, ("density_nrmse", "jy_nrmse"))]
+
+
+def plot_parameter_summary(groups: Sequence[Dict], figures_dir: Path, data_dir: Path, dpi: int) -> None:
+    fig, axes = plt.subplots(2, 2, figsize=(9.2, 6.8)); csv_rows=[]
+    for ax, parameter in zip(axes.ravel(), ("beta", "nu", "Bz0", "tau")):
+        selected=[g for g in groups if g["parameter"] == parameter]
+        x=np.arange(len(selected)); labels=[f"{g['value']:g}" for g in selected]
+        for metric, marker, label in (("density_nrmse","o","Density NRMSE"),("jy_nrmse","s","Jy NRMSE")):
+            mid=np.array([g["metrics"][metric]["median"] for g in selected]); lo=np.array([g["metrics"][metric]["p16"] for g in selected]); hi=np.array([g["metrics"][metric]["p84"] for g in selected])
+            ax.errorbar(x,mid,yerr=[mid-lo,hi-mid],marker=marker,capsize=2,label=label)
+            for g in selected: csv_rows.append({"parameter":parameter,"value":g["value"],"metric":metric,**g["metrics"][metric]})
+        ax.set_xticks(x,labels); ax.set_xlabel(parameter); ax.set_ylabel("NRMSE"); ax.grid(alpha=.25)
+    axes[0,0].legend(frameon=False); fig.suptitle("Marginal grouped performance summaries (three spatial masks)")
+    fig.tight_layout(); save_png_pdf(fig, figures_dir, FIGURE_STEMS["parameters"], dpi)
+    write_csv(data_dir / f"{FIGURE_STEMS['parameters']}.csv", csv_rows)
+
+
+def _global_task_records(records: Sequence[Dict]) -> List[Dict]:
+    wanted = set(SPATIAL_ROW_ORDER) | {"temporal_random", "temporal_block"}
+    direct = [dict(r, task_family=r["task"]) for r in records if r["task"] in wanted]
+    forecasts = [r for r in records if r["family"] == "forecast"]
+    for run_name in sorted({r["run_name"] for r in forecasts}):
+        members=[r for r in forecasts if r["run_name"] == run_name]
+        base={"run_name":run_name,"task_family":"conditional_temporal_completion"}
+        for prefix in ("density", "bx", "by", "bz", "b"):
+            for suffix in ("pearson", "spearman", "mean_e2", "mean_variance", "signed_bias", "calibration_gap"):
+                key=f"{prefix}_{suffix}"
+                values=np.asarray([r.get(key, np.nan) for r in members], dtype=np.float64)
+                finite=values[np.isfinite(values)]
+                base[key]=float(np.mean(finite)) if finite.size else float("nan")
+        direct.append(base)
+    return direct
+
+
+def plot_global_uncertainty(arrays: Dict, records: Sequence[Dict], figures_dir: Path, data_dir: Path, dpi: int) -> Dict:
+    # Equal-cap sampling was already performed deterministically per run/window/task.
+    labels={"density":"Density","bx":"Bx","by":"By","bz":"Bz","b":"B macro"}
+    calibrations={}
+    for prefix,label in labels.items():
+        variance=arrays.get(f"global::{prefix}_variance");e2=arrays.get(f"global::{prefix}_e2")
+        if variance is not None and e2 is not None:
+            calibrations[label]=quantile_calibration(variance,e2,10)
+    fig,ax=plt.subplots(figsize=(4.3,3.8)); calibration_rows=[]
+    for label,bins in calibrations.items():
+        x=[b["mean_predicted_variance"] for b in bins]; y=[b["mean_actual_squared_error"] for b in bins]
+        ax.plot(x,y,marker="o",label=label); calibration_rows.extend({"channel_group":label,**b} for b in bins)
+    limit=max(ax.get_xlim()[1],ax.get_ylim()[1]); ax.plot([0,limit],[0,limit],"k--",label="y=x")
+    ax.set(xlabel="Mean predicted variance (standardized²)",ylabel="Mean actual squared error (standardized²)"); ax.grid(alpha=.25); ax.legend(frameon=False)
+    save_png_pdf(fig,figures_dir,"global_uncertainty_calibration",dpi); write_csv(data_dir/"global_uncertainty_calibration.csv",calibration_rows)
+    task_records=_global_task_records(records); tasks=sorted({r["task_family"] for r in task_records}); x=np.arange(len(tasks))
+    detailed_rows=[]
+    for task in sorted({r["task"] for r in records}):
+        members=[r for r in records if r["task"]==task]
+        for prefix,label in (("density","Density"),("bx","Bx"),("by","By"),("bz","Bz"),("b","B macro")):
+            if not any(int(r.get(f"{prefix}_predicted_voxel_count",0)) > 0 for r in members):
+                continue
+            for metric in ("pearson","spearman","mean_e2","mean_variance","signed_bias","calibration_gap"):
+                detailed_rows.append({"task":task,"family":members[0]["family"],"channel":label,"metric":metric,
+                    **summarize(r.get(f"{prefix}_{metric}",np.nan) for r in members)})
+    write_csv(data_dir/"uq_task_channel_summary.csv",detailed_rows)
+    summary_rows=[]; fig,axes=plt.subplots(1,3,figsize=(12,3.8))
+    for ax,suffix,title in ((axes[0],"pearson","Pearson"),(axes[1],"spearman","Spearman"),(axes[2],"calibration_gap","Calibration gap")):
+        for offset,(prefix,label,marker) in zip((-.08,.08),(('density','Density','o'),('b','B macro','s'))):
+            metric=f"{prefix}_{suffix}";mids=[];lo=[];hi=[]
+            for task in tasks:
+                stats=summarize(r[metric] for r in task_records if r["task_family"]==task);mids.append(stats["median"]);lo.append(stats["p16"]);hi.append(stats["p84"]);summary_rows.append({"task":task,"channel_group":label,"metric":metric,**stats})
+            mids=np.array(mids);lo=np.array(lo);hi=np.array(hi);finite=np.isfinite(mids)
+            if np.any(finite):
+                ax.errorbar(x[finite]+offset,mids[finite],yerr=[mids[finite]-lo[finite],hi[finite]-mids[finite]],fmt=marker,capsize=2,label=label)
+        ax.set_title(title);ax.set_xticks(x,[t.replace("_","\n") for t in tasks],rotation=25,ha="right");ax.grid(alpha=.25)
+    axes[0].legend(frameon=False,fontsize=7)
+    fig.tight_layout();save_png_pdf(fig,figures_dir,"global_uncertainty_task_summary",dpi);write_csv(data_dir/"global_uncertainty_task_summary.csv",summary_rows)
+
+    channel_rows=[]; fig,axes=plt.subplots(1,3,figsize=(12,3.8))
+    for ax,suffix,title in ((axes[0],"pearson","Pearson"),(axes[1],"spearman","Spearman"),(axes[2],"signed_bias","Signed bias (e² − variance)")):
+        for offset,(prefix,label,marker) in zip((-.16,0,.16),(('bx','Bx','o'),('by','By','s'),('bz','Bz','^'))):
+            mids=[];los=[];his=[]
+            for task in tasks:
+                stats=summarize(r.get(f"{prefix}_{suffix}",np.nan) for r in task_records if r["task_family"]==task)
+                mids.append(stats["median"]);los.append(stats["p16"]);his.append(stats["p84"])
+                channel_rows.append({"task":task,"channel":label,"metric":suffix,**stats})
+            mids=np.asarray(mids);los=np.asarray(los);his=np.asarray(his)
+            finite=np.isfinite(mids)
+            if np.any(finite):
+                ax.errorbar(x[finite]+offset,mids[finite],yerr=[mids[finite]-los[finite],his[finite]-mids[finite]],fmt=marker,capsize=2,label=label)
+        ax.set_title(title);ax.set_xticks(x,[t.replace("_","\n") for t in tasks],rotation=25,ha="right");ax.grid(alpha=.25)
+    axes[0].legend(frameon=False,fontsize=7)
+    fig.tight_layout();save_png_pdf(fig,figures_dir,"magnetic_channel_uncertainty_summary",dpi)
+    write_csv(data_dir/"magnetic_channel_uncertainty_summary.csv",channel_rows)
+
+    bias_rows=[];fig,ax=plt.subplots(figsize=(7.2,3.8))
+    for offset,(prefix,label,marker) in zip((-.08,.08),(('density','Density','o'),('b','B macro','s'))):
+        mids=[];los=[];his=[]
+        for task in tasks:
+            stats=summarize(r.get(f"{prefix}_signed_bias",np.nan) for r in task_records if r["task_family"]==task)
+            mids.append(stats["median"]);los.append(stats["p16"]);his.append(stats["p84"])
+            bias_rows.append({"task":task,"channel_group":label,"metric":"signed_bias",**stats})
+        mids=np.asarray(mids);los=np.asarray(los);his=np.asarray(his);finite=np.isfinite(mids)
+        ax.errorbar(x[finite]+offset,mids[finite],yerr=[mids[finite]-los[finite],his[finite]-mids[finite]],fmt=marker,capsize=2,label=label)
+    ax.axhline(0,color="k",linestyle="--",linewidth=1);ax.set_ylabel("Mean e² − mean predicted variance");ax.set_xticks(x,[t.replace("_","\n") for t in tasks],rotation=25,ha="right");ax.grid(alpha=.25);ax.legend(frameon=False)
+    fig.tight_layout();save_png_pdf(fig,figures_dir,"uncertainty_signed_bias_summary",dpi)
+    write_csv(data_dir/"uncertainty_signed_bias_summary.csv",bias_rows)
+    return {"calibration":calibrations,"task_summary":summary_rows,"task_channel_summary":detailed_rows,
+        "magnetic_channel_summary":channel_rows,"signed_bias_summary":bias_rows}
 
 
 # ---------------------------------------------------------------------------
@@ -1750,6 +2185,7 @@ def compute_sliding_aggregate_rmse(
     Dict[str, Dict[int, np.ndarray]],
     Dict[str, Dict[int, np.ndarray]],
     List[str],
+    List[Dict],
     List[str],
 ]:
     device = ctx["device"]
@@ -1762,6 +2198,7 @@ def compute_sliding_aggregate_rmse(
     per_rmse: Dict[str, Dict[int, List[np.ndarray]]] = {
         key: {int(step): [] for step in slide_steps} for key in b_keys
     }
+    uq_records: List[Dict] = []
     loaded: List[str] = []
     skipped: List[str] = []
     for run_name in candidate_runs:
@@ -1815,6 +2252,28 @@ def compute_sliding_aggregate_rmse(
                         f"{run_name} step={step} RMSE length {len(rmse)} != {n_frames}"
                     )
                 per_rmse[b_key][int(step)].append(np.asarray(rmse, dtype=np.float64))
+                if "predicted_squared_error_normalized" in result:
+                    pred_norm = (np.asarray(result["final_reconstruction"]) - float(mean[3].item())) / (float(std[3].item()) + 1e-8)
+                    target_norm = target_normalized[3].detach().cpu().numpy()
+                    variance = np.asarray(result["predicted_squared_error_normalized"])
+                    hidden = ~(probe_mask.detach().cpu().numpy() > .5)
+                    selection = np.broadcast_to(hidden, pred_norm.shape)
+                    e2 = np.square(pred_norm - target_norm)
+                    sampled_v, sampled_e2 = _bounded_pair_sample(
+                        variance[selection], e2[selection], int(args.uq_voxels_per_window),
+                        int(args.seed) + len(uq_records) * 101,
+                    )
+                    corr = pearson_spearman(sampled_v, sampled_e2)
+                    mean_e2 = float(np.mean(e2[selection])); mean_variance = float(np.mean(variance[selection]))
+                    bias = calibration_bias(mean_e2, mean_variance)
+                    uq_records.append({
+                        "run_name": str(run_name), "b_condition": b_key, "step": int(step),
+                        "density_nrmse": float(np.sqrt(np.mean(e2[selection]))),
+                        "mean_e2": mean_e2, "mean_variance": mean_variance,
+                        "signed_bias": bias["signed_bias"], "calibration_gap": bias["calibration_gap"], **corr,
+                        "frame_e2": np.mean(e2[:, hidden], axis=1).tolist(),
+                        "frame_variance": np.mean(variance[:, hidden], axis=1).tolist(),
+                    })
         loaded.append(str(run_name))
     if not loaded:
         raise RuntimeError(
@@ -1832,7 +2291,7 @@ def compute_sliding_aggregate_rmse(
             p16s[b_key][int(step)] = np.percentile(stacked, 16.0, axis=0)
             p84s[b_key][int(step)] = np.percentile(stacked, 84.0, axis=0)
             stacked_by[b_key][int(step)] = stacked
-    return frame_index, medians, p16s, p84s, stacked_by, loaded, skipped
+    return frame_index, medians, p16s, p84s, stacked_by, loaded, skipped, uq_records
 
 
 def reconstruct_sliding_qualitative(
@@ -1903,6 +2362,9 @@ def build_sliding_appendix_cache(
     checkpoint_path: Path,
     checkpoint_epoch: int,
 ) -> Tuple[Dict, Dict]:
+    torch.manual_seed(int(args.seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(args.seed))
     if ctx is None:
         raise RuntimeError("Sliding multi-run RMSE needs inference context.")
     slide_steps = [int(step) for step in args.slide_steps]
@@ -1921,6 +2383,7 @@ def build_sliding_appendix_cache(
         stacked_by,
         loaded_runs,
         skipped_runs,
+        uq_records,
     ) = compute_sliding_aggregate_rmse(
         ctx,
         args,
@@ -2014,6 +2477,13 @@ def build_sliding_appendix_cache(
             f"from the first {SLIDING_AGGREGATE_N_FRAMES} frames, B condition, "
             "and slide step; then median and 16th-84th percentiles across runs"
         ),
+        "sliding_semantics": (
+            "Each window overwrites its full valid Density prediction. Overlapping prior predictions are reused "
+            "as exact field inputs with their predicted variance; real probes override them. At step=24 windows "
+            "do not overlap, so no previous prediction is reused: independent non-overlapping window inference."
+        ),
+        "uq_records": uq_records,
+        "uq_correlation_sampling": {"seed": int(args.seed), "max_voxels_per_run_step_condition": int(args.uq_voxels_per_window)},
         "source_files": [],
         "source_checkpoint": str(checkpoint_path),
         "source_checkpoint_epoch": int(checkpoint_epoch),
@@ -2029,6 +2499,9 @@ def plot_sliding_window_appendix(
     dpi: int,
 ) -> Dict:
     steps = [int(step) for step in metadata["slide_steps"]]
+    qualitative_steps = [step for step in (1, 12, 24) if step in steps]
+    if len(qualitative_steps) != 3:
+        qualitative_steps = steps[:3]
     frame_ids = arrays["frame_ids"]
     aggregate_frames = arrays.get("aggregate_frame_ids", frame_ids)
     n_runs = metadata.get("aggregate_n_runs")
@@ -2137,8 +2610,8 @@ def plot_sliding_window_appendix(
 
     zmin, zmax, _xmin, _xmax = extent
     tmin, tmax = float(frame_ids.min()) - 0.5, float(frame_ids.max()) + 0.5
-    field_panels = [arrays["target_tz"]] + [arrays[f"step_{step}_tz"] for step in steps]
-    residual_panels = [arrays[f"step_{step}_tz_residual"] for step in steps]
+    field_panels = [arrays["target_tz"]] + [arrays[f"step_{step}_tz"] for step in qualitative_steps]
+    residual_panels = [arrays[f"step_{step}_tz_residual"] for step in qualitative_steps]
     field_vmin, field_vmax = robust_limits(
         field_panels, channel=3, q=99.0, symmetric=False
     )
@@ -2161,7 +2634,7 @@ def plot_sliding_window_appendix(
     ensure_sliding_qualitative_nrmse_metadata(arrays, metadata)
     nrmse_by_step = {
         int(step): float(metadata[qualitative_density_nrmse_key(step)])
-        for step in steps
+        for step in qualitative_steps
     }
 
     pred_axes = []
@@ -2169,7 +2642,7 @@ def plot_sliding_window_appendix(
     pred_im = None
     res_im = None
     panel_titles = ["Target", "RMSE vs global frame"]
-    for index, step in enumerate(steps):
+    for index, step in enumerate(qualitative_steps):
         ax_pred = fig.add_subplot(gs[index, 1])
         pred_im = ax_pred.imshow(
             arrays[f"step_{step}_tz"].T,
@@ -2184,7 +2657,7 @@ def plot_sliding_window_appendix(
         pred_title = f"Prediction (step={step})"
         ax_pred.set_title(pred_title, fontsize=9, pad=2)
         ax_pred.set_ylabel("z [cm]", fontsize=8)
-        if index == len(steps) - 1:
+        if index == len(qualitative_steps) - 1:
             ax_pred.set_xlabel("Global frame")
         else:
             ax_pred.tick_params(labelbottom=False)
@@ -2206,7 +2679,7 @@ def plot_sliding_window_appendix(
         ax_res.set_title(res_title, fontsize=9, pad=2)
         ax_res.set_ylabel("z [cm]", fontsize=8)
         ax_res.tick_params(labelleft=False)
-        if index == len(steps) - 1:
+        if index == len(qualitative_steps) - 1:
             ax_res.set_xlabel("Global frame")
         else:
             ax_res.tick_params(labelbottom=False)
@@ -2228,12 +2701,56 @@ def plot_sliding_window_appendix(
         "legend_labels": [handle.get_label() for handle in color_handles + style_handles],
         "legend_title": "step   mean RMSE (B100 / B0)",
         "slide_steps": list(steps),
+        "qualitative_steps": list(qualitative_steps),
         "qualitative_density_nrmse": nrmse_by_step,
         "mean_rmse": mean_rmse_by_step,
         "target_has_colorbar": False,
         "n_column_colorbars": 2,
         "pred_res_sharey": bool(pred_res_sharey),
     }
+
+
+def plot_sliding_journal_summaries(metadata: Dict, figures_dir: Path, data_dir: Path, dpi: int) -> None:
+    records = metadata.get("uq_records") or []
+    if not records:
+        print("No uncertainty-aware sliding records; skipping Figure 5 UQ companions")
+        return
+    for record in records:
+        if "signed_bias" not in record:
+            record["signed_bias"] = float(record["mean_e2"]) - float(record["mean_variance"])
+    steps=sorted({int(r["step"]) for r in records}); conditions=("B_full","B_hidden")
+    rows=[]; fig,axes=plt.subplots(1,2,figsize=(9.0,3.6))
+    for condition in conditions:
+        for ax,metric,ylabel in ((axes[0],"density_nrmse","Time-averaged Density NRMSE"),(axes[1],"mean_e2","Standardized squared units")):
+            stats_by=[summarize(r[metric] for r in records if r["b_condition"]==condition and int(r["step"])==step) for step in steps]
+            mid=np.array([s["median"] for s in stats_by]);lo=np.array([s["p16"] for s in stats_by]);hi=np.array([s["p84"] for s in stats_by])
+            line=ax.plot(steps,mid,marker="o",label=condition.replace("_"," "))[0];ax.fill_between(steps,lo,hi,color=line.get_color(),alpha=.15);ax.set_ylabel(ylabel)
+            for step,stats in zip(steps,stats_by):rows.append({"panel":"error","condition":condition,"step":step,"metric":metric,**stats})
+        variance_stats=[summarize(r["mean_variance"] for r in records if r["b_condition"]==condition and int(r["step"])==step) for step in steps]
+        vmid=np.array([s["median"] for s in variance_stats]);vlo=np.array([s["p16"] for s in variance_stats]);vhi=np.array([s["p84"] for s in variance_stats])
+        vline=axes[1].plot(steps,vmid,marker="s",linestyle="--",label=f"{condition.replace('_',' ')} predicted variance")[0]
+        axes[1].fill_between(steps,vlo,vhi,color=vline.get_color(),alpha=.10)
+        for step,stats in zip(steps,variance_stats):rows.append({"panel":"uncertainty","condition":condition,"step":step,"metric":"mean_variance",**stats})
+        for step in steps:
+            members=[r for r in records if r["b_condition"]==condition and int(r["step"])==step]
+            for metric in ("pearson","spearman","signed_bias","calibration_gap"):
+                rows.append({"panel":"uq_quality_summary","condition":condition,"step":step,"metric":metric,**summarize(r[metric] for r in members)})
+    for ax in axes:ax.set_xlabel("Sliding step");ax.set_xticks(steps);ax.grid(alpha=.25);ax.legend(frameon=False,fontsize=7)
+    fig.tight_layout();save_png_pdf(fig,figures_dir,"sliding_step_error_uncertainty",dpi)
+    # Temporal diagnostic, median across runs at the three requested strides.
+    fig,axes=plt.subplots(3,1,figsize=(8.2,7.0),sharex=True)
+    for ax,step in zip(axes,(1,12,24)):
+        for condition in conditions:
+            members=[r for r in records if r["b_condition"]==condition and int(r["step"])==step]
+            if not members:continue
+            e=np.asarray([r["frame_e2"] for r in members]);v=np.asarray([r["frame_variance"] for r in members]);frames=np.arange(e.shape[1])
+            ax.plot(frames,np.median(e,axis=0),label=f"{condition}: actual e²");ax.plot(frames,np.median(v,axis=0),"--",label=f"{condition}: predicted variance")
+        ax.set_ylabel(f"step={step}\nstandardized²");ax.grid(alpha=.25)
+    axes[-1].set_xlabel("Long-sequence frame");axes[0].legend(frameon=False,fontsize=6,ncol=2)
+    fig.tight_layout();save_png_pdf(fig,figures_dir,"sliding_error_accumulation",dpi)
+    for record in records:
+        rows.append({k:v for k,v in record.items() if k not in {"frame_e2","frame_variance"}})
+    write_csv(data_dir/"sliding_uncertainty_statistics.csv",rows)
 
 
 # ---------------------------------------------------------------------------
@@ -2282,11 +2799,18 @@ def main() -> None:
     figures = selected_figures(args.figure)
     if "spatial" in figures or "sliding" in figures:
         validate_test_run(run_dir, args.run_name)
-    checkpoint_epoch = read_checkpoint_epoch(checkpoint_path)
+    checkpoint_epoch = read_checkpoint_epoch(
+        checkpoint_path,
+        require_final=not bool(getattr(args, "allow_incomplete_checkpoint", False)),
+    )
+    checkpoint_header = torch.load(checkpoint_path, map_location="cpu", weights_only=False, mmap=True)
+    checkpoint_model_version = checkpoint_header.get("args", {}).get("model_version")
+    del checkpoint_header
     provenance = provenance_for_checkpoint(checkpoint_path, checkpoint_epoch)
+    requested_output = getattr(args, "output_dir", None) or getattr(args, "paper_dir", None)
     paper_dir = (
-        expand_path(args.paper_dir)
-        if args.paper_dir is not None
+        expand_path(requested_output)
+        if requested_output is not None
         else run_dir / PAPER_DIRNAME
     )
     data_dir = paper_dir / "data"
@@ -2295,14 +2819,31 @@ def main() -> None:
     figures_dir.mkdir(parents=True, exist_ok=True)
 
     sig_base = base_signature(args, run_dir, checkpoint_path)
+    sig_base["model_version"] = checkpoint_model_version
     ctx: Dict | None = None
     figure_manifest: List[Dict] = []
+    journal_cache: Tuple[Dict, Dict] | None = None
 
     def ensure_ctx() -> Dict:
         nonlocal ctx
         if ctx is None:
             ctx = load_inference_context(args)
         return ctx
+
+    def ensure_journal_cache() -> Tuple[Dict, Dict]:
+        nonlocal journal_cache
+        if journal_cache is None:
+            signature = {**sig_base, "figure": "journal_statistics", "test_runs_only": True,
+                "uq_domain_version": 2,
+                "window_stride": 24, "max_windows_per_run": args.statistics_max_windows_per_run,
+                "uq_voxels_per_window": int(args.uq_voxels_per_window)}
+            journal_cache = load_or_build_figure_cache(
+                data_dir, "journal_statistics", signature,
+                builder=lambda: build_journal_statistics_cache(ensure_ctx(), args),
+                force=args.force_recompute, provenance=provenance,
+            )
+            write_csv(data_dir / "journal_run_task_statistics.csv", journal_cache[1]["records"])
+        return journal_cache
 
     def spatial_signature() -> Dict:
         return {
@@ -2311,6 +2852,7 @@ def main() -> None:
             "b_visible": 1.0,
             "rows": list(SPATIAL_ROW_ORDER),
             "mask_experiment": "multifunction_standardized_50pct",
+            "uq_domain_version": 2,
         }
 
     def mag_signature() -> Dict:
@@ -2388,6 +2930,7 @@ def main() -> None:
             field_q=args.field_q,
             dpi=args.dpi,
         )
+        plot_spatial_calibration(meta, figures_dir, data_dir, args.dpi)
         figure_manifest.append(
             manifest_figure_entry("spatial", FIGURE_STEMS["spatial"], data_dir, meta)
         )
@@ -2509,9 +3052,33 @@ def main() -> None:
         plot_sliding_window_appendix(
             arrays, meta, figures_dir, extent=args.extent, dpi=args.dpi
         )
+        plot_sliding_journal_summaries(meta, figures_dir, data_dir, args.dpi)
         figure_manifest.append(
             manifest_figure_entry("sliding", FIGURE_STEMS["sliding"], data_dir, meta)
         )
+
+    if any(name in figures for name in ("magnetic_ablation", "superres", "forecast")):
+        _journal_arrays, journal_meta = ensure_journal_cache()
+        plot_uncertainty_companions(journal_meta["records"], figures_dir, data_dir, args.dpi)
+
+    if "parameters" in figures:
+        _journal_arrays, journal_meta = ensure_journal_cache()
+        groups = build_parameter_summary(journal_meta["records"])
+        plot_parameter_summary(groups, figures_dir, data_dir, args.dpi)
+        (data_dir / f"{FIGURE_STEMS['parameters']}.json").write_text(json.dumps(json_ready({
+            "groups": groups, "definition": "marginal grouped performance summaries; macro-average over Figure-1 spatial masks",
+            **provenance, "split": fixed_split_metadata(), "model_version": checkpoint_model_version,
+        }), indent=2))
+        figure_manifest.append(manifest_figure_entry("parameters", FIGURE_STEMS["parameters"], data_dir, {**journal_meta, **provenance}))
+
+    if "global_uq" in figures:
+        journal_arrays, journal_meta = ensure_journal_cache()
+        plot_uncertainty_companions(journal_meta["records"], figures_dir, data_dir, args.dpi)
+        result = plot_global_uncertainty(journal_arrays, journal_meta["records"], figures_dir, data_dir, args.dpi)
+        (data_dir / f"{FIGURE_STEMS['global_uq']}.json").write_text(json.dumps(json_ready({
+            **result, **provenance, "split": fixed_split_metadata(), "model_version": checkpoint_model_version,
+        }), indent=2))
+        figure_manifest.append(manifest_figure_entry("global_uq", FIGURE_STEMS["global_uq"], data_dir, {**journal_meta, **provenance}))
 
     manifest = {
         "paper_dir": str(paper_dir),
@@ -2521,6 +3088,10 @@ def main() -> None:
         "figure_provenance": figure_manifest,
         "cache_version": PAPER_CACHE_VERSION,
         "force_recompute": bool(args.force_recompute),
+        "split_path": fixed_split_metadata().get("path"),
+        "split_sha256": fixed_split_metadata().get("sha256"),
+        "data_role": "test_runs",
+        "model_version": checkpoint_model_version,
     }
     (paper_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
     print(f"Wrote {paper_dir / 'manifest.json'}")

@@ -23,9 +23,11 @@ import torch
 
 from data.vpic_hdf5_dataset import (
     FIXED_SPLIT_PATH,
+    KNOWN_SHORT_TRAIN_RUNS,
     VPICWindowDataset,
     fixed_split_metadata,
     load_fixed_split,
+    validate_checkpoint_split,
     validate_final_checkpoint,
 )
 from data.masking import MASK_PATTERNS, make_fixed_validation_mask, make_uncertain_input, make_visible_input, sample_mask
@@ -625,13 +627,13 @@ def expand_path(path: str | Path) -> Path:
     return Path(os.path.expandvars(str(path))).expanduser().resolve()
 
 
-def load_checkpoint(run_dir: Path, checkpoint_name: str, device: torch.device):
+def load_checkpoint(run_dir: Path, checkpoint_name: str, device: torch.device, require_final: bool = True):
     ckpt_path = Path(checkpoint_name)
     if not ckpt_path.is_absolute():
         ckpt_path = run_dir / checkpoint_name
 
     ckpt = torch.load(ckpt_path, map_location=device)
-    validate_final_checkpoint(ckpt)
+    (validate_final_checkpoint if require_final else validate_checkpoint_split)(ckpt)
     print(f"Loaded checkpoint: {ckpt_path}")
     print(f"Checkpoint epoch: {ckpt.get('epoch', 'N/A')}")
     print(f"Authoritative split: {FIXED_SPLIT_PATH} ({ckpt['split_sha256']})")
@@ -1611,6 +1613,32 @@ def summarize_jy_values(jy: np.ndarray) -> Dict[str, float]:
     }
 
 
+def usable_jy_stat_train_runs(
+    dataset: VPICWindowDataset,
+    declared_train_runs: set[str],
+) -> Tuple[set[str], List[str]]:
+    """Return declared training runs that produce windows in this dataset."""
+    available_runs = {str(run_name) for _file_idx, run_name, _t0 in dataset.samples}
+    missing = set(declared_train_runs) - available_runs
+    unexpected = sorted(missing - KNOWN_SHORT_TRAIN_RUNS)
+    if unexpected:
+        preview = ", ".join(unexpected[:5])
+        extra = "" if len(unexpected) <= 5 else f" (+{len(unexpected) - 5} more)"
+        raise RuntimeError(
+            "Training Jy stats requested unexpected runs that are absent from "
+            f"the current T={dataset.delta_t} window dataset: {preview}{extra}"
+        )
+    skipped = sorted(missing & KNOWN_SHORT_TRAIN_RUNS)
+    usable = set(declared_train_runs) & available_runs
+    print(f"Jy-stat declared train runs = {len(declared_train_runs)}")
+    print(f"Jy-stat usable train runs = {len(usable)}")
+    print(
+        "Jy-stat skipped zero-window runs (T < "
+        f"{dataset.delta_t}) = {', '.join(skipped) if skipped else 'none'}"
+    )
+    return usable, skipped
+
+
 def iter_unique_run_fields(
     dataset: VPICWindowDataset,
     run_names: set[str],
@@ -1739,10 +1767,13 @@ def load_or_compute_jy_training_stats(
     checkpoint_epoch: int | None = None,
 ) -> Dict:
     """Reuse run-dir/jy_stats.json when the physical-unit definition still matches."""
+    usable_train_runs, skipped_zero_window_runs = usable_jy_stat_train_runs(
+        dataset, set(train_runs)
+    )
     cache_path = Path(run_dir) / JY_STATS_FILENAME
     if cache_path.exists():
         cached = json.loads(cache_path.read_text())
-        if jy_stats_cache_matches(cached, train_runs, mean, std, extent):
+        if jy_stats_cache_matches(cached, usable_train_runs, mean, std, extent):
             print(f"Loaded cached Jy training stats from {cache_path}")
             print(
                 "Jy training stats: "
@@ -1759,13 +1790,16 @@ def load_or_compute_jy_training_stats(
 
     stats = compute_jy_training_stats(
         dataset=dataset,
-        train_runs=train_runs,
+        train_runs=usable_train_runs,
         mean=mean,
         std=std,
         extent=extent,
         checkpoint_path=checkpoint_path,
         checkpoint_epoch=checkpoint_epoch,
     )
+    stats["declared_train_run_count"] = int(len(train_runs))
+    stats["usable_train_run_count"] = int(len(usable_train_runs))
+    stats["skipped_zero_window_runs"] = skipped_zero_window_runs
     cache_path.write_text(json.dumps(stats, indent=2))
     print(f"Saved Jy training stats: {cache_path}")
     print(
@@ -1834,9 +1868,12 @@ def aggregate_run_window_profiles(
         "run_names": run_names,
         "window_counts": window_counts,
         "run_profiles": values,
+        "mean": np.mean(values, axis=0),
+        "std": np.std(values, axis=0),
         "median": np.median(values, axis=0),
         "p16": np.percentile(values, 16.0, axis=0),
         "p84": np.percentile(values, 84.0, axis=0),
+        "n": int(values.shape[0]),
     }
 
 
