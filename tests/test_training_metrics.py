@@ -245,6 +245,48 @@ def test_global_cosine_cli_configuration(monkeypatch):
             args.final_epoch, args.stop_after_epochs) == (240, 5, 2e-4, 1e-6, 240, 240)
 
 
+def test_global_cosine_fromscratch_48h_lr_configuration(monkeypatch):
+    from train_masked_unet3d import parse_args
+
+    monkeypatch.setattr(sys, "argv", [
+        "train", "--curriculum-training", "--curriculum-config", "global_cosine",
+        "--uncertainty-aware", "--uncertainty-loss", "gaussian_nll",
+        "--epochs", "1000", "--warmup-epochs", "5", "--lr", "2e-4",
+        "--min-lr", "1e-5", "--variance-ramp-epochs", "40",
+        "--rollout-ramp-epochs", "40", "--final-epoch", "1000",
+        "--stop-after-epochs", "1000",
+        "--no-auto-resume",
+    ])
+    args = parse_args()
+    assert (args.epochs, args.warmup_epochs, args.lr, args.min_lr,
+            args.final_epoch, args.stop_after_epochs) == (1000, 5, 2e-4, 1e-5, 1000, 1000)
+    assert args.init_checkpoint is None
+    lrs = [global_cosine_learning_rate(epoch, 1000, 5, 1e-5, 2e-4)
+           for epoch in range(1, 1001)]
+    assert [lrs[index - 1] for index in (1, 5, 6, 1000)] == pytest.approx(
+        [1e-5, 2e-4, 2e-4, 1e-5]
+    )
+    assert all(left >= right for left, right in zip(lrs[4:], lrs[5:]))
+
+
+def test_fromscratch_launcher_uses_run_local_safe_slurm_handoff():
+    import train_masked_unet3d as train
+
+    launcher = Path(train.__file__).with_name("train_masked_unet3d_4n16g.sbatch").read_text()
+    assert "multi_beta_curriculum_direct_v3_fromscratch_globalcosine_2e4_1e5_1000ep_48h_20261027" in launcher
+    assert "ACTIVE_JOB_REGISTRY=${OUT_DIR}/active_slurm_job_id" in launcher
+    assert 'scancel "${REGISTERED_JOB_ID}"' in launcher
+    assert '"${REGISTERED_JOB_ID}" == "${SLURM_JOB_ID}"' in launcher
+    assert "BatchFlag=0" in launcher
+    assert "HANDOFF_DEADLINE=$((SECONDS + 120))" in launcher
+    assert "scancel --user" not in launcher and "scancel -u" not in launcher
+    assert launcher.index('if [[ "${HANDOFF_ACTIVE_SALLOC}" == 1 ]]') < launcher.index(
+        'echo "Loaded PyTorch environment:"'
+    ) < launcher.index(
+        "# Check the same compatibility rules as the trainer"
+    ) < launcher.index("# One torchrun controller per node")
+
+
 @pytest.mark.parametrize("slope,sign", [(-.02, -1), (0., 0), (.02, 1)])
 def test_nll_convergence_signed_negative_trends(slope, sign):
     history = [{"epoch": e, "val_gaussian_nll": -2. + slope * e} for e in range(1, 61)]
@@ -494,6 +536,22 @@ def test_global_cosine_lr_has_exact_endpoints_and_never_restarts():
                        phase_d_start_epoch=phase_d_start)
         assert [curriculum_learning_rate_for_epoch(epoch, args, changed)
                 for epoch in range(1, 241)] == lrs
+
+
+def test_post_final_continuation_holds_global_cosine_floor():
+    args = _global_cosine_args()
+    args.post_final_continuation = "source/final.pt"
+    state = {
+        "successful_optimizer_steps": 1000,
+        "variance_ramp_start_step": 0,
+        "variance_ramp_steps": 100.,
+        "rollout_ramp_start_step": 200,
+        "rollout_ramp_steps": 100.,
+    }
+    assert [
+        curriculum_learning_rate_for_epoch(epoch, args, state)
+        for epoch in range(241, 321)
+    ] == [1e-6] * 80
 
 
 def test_global_cosine_phase_a_monitors_after_warmup_while_lr_decays():

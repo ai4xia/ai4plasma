@@ -371,6 +371,18 @@ def parse_args():
             "Ignored when auto-resuming from out-dir/latest.pt."
         ),
     )
+    p.add_argument(
+        "--post-final-continuation",
+        type=str,
+        default=None,
+        metavar="FINAL_CHECKPOINT",
+        help=(
+            "Start a separate 80-epoch full-objective continuation from a "
+            "completed epoch-240 global-cosine final checkpoint, restoring "
+            "optimizer state and holding LR at its saved floor. An in-run "
+            "latest.pt still takes precedence for crash recovery."
+        ),
+    )
 
     args = p.parse_args()
 
@@ -406,6 +418,19 @@ def parse_args():
         args.final_epoch = args.stop_after_epochs or args.epochs
     if args.final_epoch < (args.stop_after_epochs or args.epochs):
         p.error("--final-epoch cannot precede the requested stopping epoch")
+    if args.post_final_continuation is not None:
+        if args.init_checkpoint is not None:
+            p.error("--post-final-continuation and --init-checkpoint are mutually exclusive")
+        if (not args.curriculum_training
+                or args.curriculum_config != "global_cosine"):
+            p.error("--post-final-continuation requires the global_cosine curriculum")
+        if (args.epochs, args.stop_after_epochs, args.final_epoch) != (240, 320, 320):
+            p.error(
+                "--post-final-continuation requires --epochs 240 "
+                "--stop-after-epochs 320 --final-epoch 320"
+            )
+        if args.arm_variance_ramp or args.arm_rollout_ramp:
+            p.error("--post-final-continuation does not permit ramp arming")
     if (args.arm_variance_ramp or args.arm_rollout_ramp) and (not args.curriculum_training or not args.auto_resume):
         p.error("Ramp arming requires --curriculum-training and --auto-resume")
     if args.uncertainty_loss == "gaussian_nll" and not args.uncertainty_aware:
@@ -443,16 +468,38 @@ def parse_args():
             if args.final_epoch != 240:
                 p.error("abcd_symmetric_lr requires --final-epoch 240")
         elif args.curriculum_config == "global_cosine":
-            if (args.epochs, args.warmup_epochs) != (240, 5):
-                p.error("global_cosine requires --epochs 240 --warmup-epochs 5")
-            if not (math.isclose(args.lr, 2e-4) and math.isclose(args.min_lr, 1e-6)):
-                p.error("global_cosine requires --lr 2e-4 --min-lr 1e-6")
+            if args.warmup_epochs != 5 or args.epochs not in (240, 1000):
+                p.error(
+                    "global_cosine requires --warmup-epochs 5 and "
+                    "--epochs 240 or 1000"
+                )
+            supported_lr_pairs = ((2e-4, 1e-6), (2e-4, 1e-5))
+            if not any(
+                math.isclose(args.lr, peak) and math.isclose(args.min_lr, floor)
+                for peak, floor in supported_lr_pairs
+            ):
+                p.error(
+                    "global_cosine requires --lr/--min-lr 2e-4/1e-6 "
+                    "or 2e-4/1e-5"
+                )
+            if args.epochs == 1000 and not (
+                math.isclose(args.lr, 2e-4)
+                and math.isclose(args.min_lr, 1e-5)
+            ):
+                p.error(
+                    "1000-epoch global_cosine requires --lr 2e-4 --min-lr 1e-5"
+                )
             if (args.variance_ramp_epochs, args.rollout_ramp_epochs) != (40.0, 40.0):
                 p.error("global_cosine requires 40-epoch variance and rollout ramps")
             if args.variance_ramp_start_epoch is not None or args.rollout_ramp_start_epoch is not None:
                 p.error("global_cosine uses convergence-triggered ramps; scheduled starts are not supported")
-            if args.final_epoch != 240:
-                p.error("global_cosine requires --final-epoch 240")
+            expected_final_epoch = (
+                320 if args.post_final_continuation else args.epochs
+            )
+            if args.final_epoch != expected_final_epoch:
+                p.error(
+                    f"global_cosine requires --final-epoch {expected_final_epoch}"
+                )
     if not (0 <= args.warmup_epochs < args.epochs):
         p.error(
             "--warmup-epochs must lie in [0, epochs), got "
@@ -580,6 +627,8 @@ def global_cosine_learning_rate(
 
 def curriculum_learning_rate_for_epoch(epoch: int, args, state: Dict[str, Any]) -> float:
     """Return the existing LR until Phase D, then its fixed reheat/cosine LR."""
+    if getattr(args, "post_final_continuation", None):
+        return args.min_lr
     phase_d_start = state.get("phase_d_start_epoch")
     if getattr(args, "curriculum_config", "adaptive") == "global_cosine":
         return global_cosine_learning_rate(
@@ -785,17 +834,23 @@ def resolve_checkpoint_plan(
     *,
     auto_resume: bool,
     init_checkpoint: Optional[str] = None,
+    post_final_continuation: Optional[str] = None,
 ) -> CheckpointPlan:
-    """Prefer an in-run latest checkpoint over a one-shot weight initialization.
+    """Prefer in-run crash recovery, then a continuation source or weight init.
 
     Resume is only considered for ``out_dir/latest.pt``. An ``init_checkpoint``
-    never restores optimizer, scheduler, or epoch state, and is ignored once a
+    never restores optimizer, scheduler, or epoch state. A post-final source
+    restores all training state into a distinct run. Both are ignored once a
     resume file exists. Masking-version compatibility is enforced only for
-    resume, not for weight-only initialization.
+    stateful resume/continuation, not for weight-only initialization.
     """
     latest_path = Path(out_dir) / "latest.pt"
     if auto_resume and latest_path.is_file():
         return CheckpointPlan("resume", latest_path)
+    if post_final_continuation:
+        return CheckpointPlan(
+            "continuation", expand_path(post_final_continuation)
+        )
     if init_checkpoint:
         return CheckpointPlan("init", expand_path(init_checkpoint))
     return CheckpointPlan("fresh", None)
@@ -819,6 +874,7 @@ def validate_resume_parameters(args, checkpoint_args: Dict[str, Any]) -> None:
         ("amp_dtype", "float16"),
         ("curriculum_training", False),
         ("curriculum_config", "adaptive"),
+        ("post_final_continuation", None),
     ):
         if key == "amp_dtype" and not getattr(args, "amp", False):
             continue
@@ -858,6 +914,49 @@ def validate_resume_parameters(args, checkpoint_args: Dict[str, Any]) -> None:
             f"  {details}\n"
             "Use a different --out-dir, restore the original parameters, or pass "
             "--no-auto-resume to intentionally start over."
+        )
+
+
+def validate_post_final_continuation(
+    args, checkpoint: Dict[str, Any], source_path: Path, out_dir: Path,
+) -> None:
+    """Validate the one-shot epoch-240 -> 320 full-objective continuation."""
+    source_path = Path(source_path).resolve()
+    if source_path.parent == Path(out_dir).resolve():
+        raise ValueError(
+            "Post-final continuation must write to a different run directory"
+        )
+    for key in ("model", "optimizer", "stats", "epoch", "args", "curriculum_state"):
+        if key not in checkpoint or checkpoint[key] is None:
+            raise ValueError(f"Continuation source is missing checkpoint {key!r}")
+    source_args = checkpoint["args"]
+    source_epoch = int(checkpoint["epoch"])
+    if source_epoch != 240 or source_args.get("final_epoch") != source_epoch:
+        raise ValueError(
+            "Post-final continuation requires a completed epoch-240 final checkpoint"
+        )
+    if args.final_epoch != source_epoch + 80 or args.stop_after_epochs != args.final_epoch:
+        raise ValueError("Post-final continuation must cover exactly epochs 241 through 320")
+
+    compatible_args = argparse.Namespace(**vars(args))
+    compatible_args.final_epoch = source_args["final_epoch"]
+    compatible_args.post_final_continuation = None
+    validate_resume_parameters(compatible_args, source_args)
+
+    if not curriculum_is_complete(checkpoint["curriculum_state"]):
+        raise ValueError("Continuation source curriculum is not fully complete")
+    if tuple(checkpoint["curriculum_state"].get(key) for key in ("lambda_v", "lambda_r")) != (1.0, 1.0):
+        raise ValueError("Continuation source must record lambda_v=lambda_r=1")
+    optimizer = checkpoint["optimizer"]
+    if not optimizer.get("state"):
+        raise ValueError("Continuation source has no optimizer state to restore")
+    group_lrs = [group.get("lr") for group in optimizer.get("param_groups", [])]
+    if not group_lrs or any(
+        lr is None or not math.isclose(float(lr), args.min_lr, rel_tol=0.0, abs_tol=1e-15)
+        for lr in group_lrs
+    ):
+        raise ValueError(
+            f"Continuation source optimizer LR is not the requested floor {args.min_lr:g}"
         )
 
 
@@ -2270,6 +2369,12 @@ def main():
         f"base_lr={args.lr:g}, cosine min_lr={args.min_lr:g}, "
         f"total_epochs={args.epochs}"
     )
+    if args.post_final_continuation:
+        rank_print(
+            "Post-final UQ continuation: epochs 241-320, full objective "
+            f"(lambda_v=lambda_r=1), fixed LR={args.min_lr:g}; no ramps, "
+            "convergence transitions, warmup, or reheat."
+        )
     rank_print("Mask pattern weights:", args.mask_pattern_weights)
     rank_print("Validation mask patterns:", args.val_patterns)
     if args.uncertainty_aware:
@@ -2370,7 +2475,9 @@ def main():
         out_dir,
         auto_resume=args.auto_resume,
         init_checkpoint=args.init_checkpoint,
+        post_final_continuation=args.post_final_continuation,
     )
+    initial_post_final_continuation = checkpoint_plan.mode == "continuation"
     if checkpoint_plan.mode == "resume":
         resume_checkpoint = torch.load(checkpoint_plan.path, map_location=device)
         validate_checkpoint_split(resume_checkpoint)
@@ -2378,6 +2485,21 @@ def main():
         rank_print(
             f"Auto-resuming from {checkpoint_plan.path} "
             f"(completed epoch {resume_checkpoint['epoch']})"
+        )
+    elif checkpoint_plan.mode == "continuation":
+        if checkpoint_plan.path is None or not checkpoint_plan.path.is_file():
+            raise FileNotFoundError(
+                f"Post-final continuation checkpoint not found: {checkpoint_plan.path}"
+            )
+        resume_checkpoint = torch.load(checkpoint_plan.path, map_location=device)
+        validate_checkpoint_split(resume_checkpoint)
+        validate_post_final_continuation(
+            args, resume_checkpoint, checkpoint_plan.path, out_dir,
+        )
+        rank_print(
+            f"Starting isolated post-final continuation from {checkpoint_plan.path} "
+            f"(completed epoch {resume_checkpoint['epoch']}); model and optimizer "
+            f"state restored, full objective fixed, LR={args.min_lr:g}."
         )
     elif checkpoint_plan.mode == "init":
         if checkpoint_plan.path is None or not checkpoint_plan.path.is_file():
@@ -2452,6 +2574,8 @@ def main():
     start_epoch = 1
     curriculum_state = (make_curriculum_state(args, len(train_loader), resume_checkpoint)
                         if args.curriculum_training else None)
+    if args.post_final_continuation and not curriculum_is_complete(curriculum_state):
+        raise ValueError("Post-final continuation restored an incomplete curriculum state")
     if curriculum_state is not None:
         rank_print("Curriculum schedule (successful optimizer updates):", curriculum_state)
     if resume_checkpoint is not None:
@@ -2523,6 +2647,7 @@ def main():
 
     final_epoch = args.stop_after_epochs or args.epochs
     if (curriculum_state is not None and resume_checkpoint is not None
+            and not args.post_final_continuation
             and args.curriculum_config == "adaptive"):
         if start_phase_d_if_ready(curriculum_state, start_epoch - 1, args.final_epoch):
             rank_print(
@@ -2541,7 +2666,7 @@ def main():
         return
 
     resume_run_id = None
-    if resume_checkpoint is not None:
+    if resume_checkpoint is not None and not initial_post_final_continuation:
         resume_run_id = resume_checkpoint.get("wandb_run_id")
     wandb_run = (
         init_wandb(args, out_dir, resume_run_id=resume_run_id)
@@ -2759,7 +2884,7 @@ def main():
         transition_diagnostic = None
         if is_main_process():
             history.append(row)
-            if curriculum_state is not None:
+            if curriculum_state is not None and not args.post_final_continuation:
                 diagnostic = phase_a_convergence(history, args, curriculum_state)
                 if diagnostic["phase_a"]:
                     row["phase_convergence"] = diagnostic
@@ -2821,7 +2946,7 @@ def main():
                             if diagnostic["ready_for_phase_d"]:
                                 epoch_log("READY_FOR_PHASE_D=true")
 
-        if curriculum_state is not None:
+        if curriculum_state is not None and not args.post_final_continuation:
             synchronized = [transition_diagnostic]
             if distributed_is_initialized():
                 dist.broadcast_object_list(synchronized, src=0)

@@ -14,6 +14,7 @@ from train_masked_unet3d import (  # noqa: E402
     resolve_checkpoint_plan,
     sample_mixed_magnetic_visible_counts,
     sample_mixed_density_probe_counts,
+    validate_post_final_continuation,
     validate_resume_parameters,
 )
 
@@ -180,6 +181,78 @@ def test_checkpoint_plan_is_fresh_when_new_out_dir_has_no_latest(tmp_path):
     )
     assert plan.mode == "fresh"
     assert plan.path is None
+
+
+def test_checkpoint_plan_uses_post_final_source_then_in_run_latest(tmp_path):
+    source = tmp_path / "source" / "final.pt"
+    source.parent.mkdir()
+    source.write_bytes(b"source")
+    out_dir = tmp_path / "continuation"
+
+    plan = resolve_checkpoint_plan(
+        out_dir,
+        auto_resume=False,
+        post_final_continuation=str(source),
+    )
+    assert plan == ("continuation", source.resolve())
+
+    out_dir.mkdir()
+    latest = out_dir / "latest.pt"
+    latest.write_bytes(b"latest")
+    plan = resolve_checkpoint_plan(
+        out_dir,
+        auto_resume=True,
+        post_final_continuation=str(source),
+    )
+    assert plan == ("resume", latest)
+
+
+def test_post_final_continuation_validates_full_state_and_separate_output(
+    monkeypatch, tmp_path,
+):
+    source = tmp_path / "source" / "final.pt"
+    source.parent.mkdir()
+    out_dir = tmp_path / "continuation"
+    monkeypatch.setattr(sys, "argv", [
+        "train", "--curriculum-training", "--curriculum-config", "global_cosine",
+        "--uncertainty-aware", "--uncertainty-loss", "gaussian_nll",
+        "--epochs", "240", "--warmup-epochs", "5", "--lr", "2e-4",
+        "--min-lr", "1e-6", "--stop-after-epochs", "320",
+        "--final-epoch", "320", "--post-final-continuation", str(source),
+        "--out-dir", str(out_dir),
+    ])
+    args = parse_args()
+    source_args = vars(args).copy()
+    source_args.update(
+        final_epoch=240, stop_after_epochs=240,
+        post_final_continuation=None,
+        out_dir=str(source.parent),
+    )
+    state = {
+        "updates_per_epoch": 10,
+        "variance_ramp_steps": 400., "rollout_ramp_steps": 400.,
+        "variance_ramp_start_step": 100, "rollout_ramp_start_step": 600,
+        "variance_ramp_armed": True, "rollout_ramp_armed": True,
+        "successful_optimizer_steps": 1000,
+        "lambda_v": 1., "lambda_r": 1.,
+    }
+    checkpoint = {
+        "model": {}, "optimizer": {
+            "state": {0: {"step": 1}},
+            "param_groups": [{"lr": 1e-6, "params": [0]}],
+        },
+        "stats": {"mean": [0.] * 4, "std": [1.] * 4},
+        "epoch": 240, "args": source_args, "curriculum_state": state,
+    }
+    validate_post_final_continuation(args, checkpoint, source, out_dir)
+
+    checkpoint["optimizer"]["param_groups"][0]["lr"] = 2e-6
+    try:
+        validate_post_final_continuation(args, checkpoint, source, out_dir)
+    except ValueError as exc:
+        assert "optimizer LR" in str(exc)
+    else:
+        raise AssertionError("Expected a non-floor continuation LR to fail")
 
 
 def test_masking_version_mismatch_blocks_resume_but_not_weight_init():
