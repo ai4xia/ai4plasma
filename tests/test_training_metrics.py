@@ -452,6 +452,7 @@ def test_phase_d_restores_old_checkpoint_and_has_exact_lr_trajectory():
     }
     state = make_curriculum_state(args, 1069, {"curriculum_state": saved})
     assert state["phase_d_start_epoch"] is None
+    assert state["phase_d_trajectory_resume_policy"] == "reset_on_resume"
     assert state["successful_optimizer_steps"] == 129349
     assert curriculum_learning_rate_for_epoch(122, args, state) == 2e-6
     assert not start_phase_d_if_ready(state, completed_epoch=121, final_epoch=200)
@@ -608,7 +609,7 @@ def test_global_cosine_phase_b_controls_existing_rollout_ramp_and_resume():
     assert curriculum_phase(60, state, .5, 0., "global_cosine") == (
         1, "variance_ramp_or_settle")
     assert curriculum_phase(100, state, 1., .5, "global_cosine") == (2, "rollout_ramp")
-    assert curriculum_phase(140, state, 1., 1., "global_cosine") == (3, "full_objective")
+    assert curriculum_phase(140, state, 1., 1., "global_cosine") == (3, "sliding_rollout")
 
 
 def test_abcd_phase_a_and_phase_d_use_identical_fixed_lr_cycles():

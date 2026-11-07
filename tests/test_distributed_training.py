@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from train_masked_unet3d import (  # noqa: E402
     DistributedEvalSampler,
     RESUME_PARAMETER_KEYS,
+    curriculum_learning_rate_for_epoch,
     learning_rate_for_epoch,
     parse_args,
     resolve_checkpoint_plan,
@@ -253,6 +254,45 @@ def test_post_final_continuation_validates_full_state_and_separate_output(
         assert "optimizer LR" in str(exc)
     else:
         raise AssertionError("Expected a non-floor continuation LR to fail")
+
+
+def test_post_final_continuation_accepts_1000_to_1020_probe(monkeypatch, tmp_path):
+    source = tmp_path / "source" / "final.pt"
+    source.parent.mkdir()
+    out_dir = tmp_path / "probe"
+    monkeypatch.setattr(sys, "argv", [
+        "train", "--curriculum-training", "--curriculum-config", "global_cosine",
+        "--uncertainty-aware", "--uncertainty-loss", "gaussian_nll",
+        "--epochs", "1000", "--warmup-epochs", "5", "--lr", "2e-4",
+        "--min-lr", "1e-5", "--stop-after-epochs", "1020",
+        "--final-epoch", "1020", "--post-final-continuation", str(source),
+        "--out-dir", str(out_dir),
+    ])
+    args = parse_args()
+    source_args = vars(args).copy()
+    source_args.update(
+        final_epoch=1000, stop_after_epochs=1000,
+        post_final_continuation=None, out_dir=str(source.parent),
+    )
+    state = {
+        "updates_per_epoch": 1069,
+        "variance_ramp_steps": 42760., "rollout_ramp_steps": 42760.,
+        "variance_ramp_start_step": 100, "rollout_ramp_start_step": 50000,
+        "variance_ramp_armed": True, "rollout_ramp_armed": True,
+        "successful_optimizer_steps": 1069000,
+        "lambda_v": 1., "lambda_r": 1.,
+    }
+    checkpoint = {
+        "model": {}, "optimizer": {
+            "state": {0: {"step": 1}},
+            "param_groups": [{"lr": 1e-5, "params": [0]}],
+        },
+        "stats": {"mean": [0.] * 4, "std": [1.] * 4},
+        "epoch": 1000, "args": source_args, "curriculum_state": state,
+    }
+    validate_post_final_continuation(args, checkpoint, source, out_dir)
+    assert curriculum_learning_rate_for_epoch(1001, args, state) == 1e-5
+    assert curriculum_learning_rate_for_epoch(1020, args, state) == 1e-5
 
 
 def test_masking_version_mismatch_blocks_resume_but_not_weight_init():

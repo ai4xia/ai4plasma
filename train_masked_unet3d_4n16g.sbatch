@@ -24,6 +24,7 @@ CURRICULUM=false
 ABCD_SYMMETRIC=false
 GLOBAL_COSINE=false
 POST_FINAL_CONTINUATION=false
+PHASE_D_PROBE=false
 FROMSCRATCH_48H=false
 RESUMING=true
 CURRICULUM_STOP=200
@@ -55,6 +56,16 @@ case "${1:-}" in
         CURRICULUM=true; GLOBAL_COSINE=true; POST_FINAL_CONTINUATION=true
         CURRICULUM_STOP=320; FINAL_EPOCH=320
         MODEL_ARGS=(--model-version direct_unet3d_no_activation_norm_v3); shift ;;
+    --phase-d-stateful-probe)
+        CURRICULUM=true; GLOBAL_COSINE=true; POST_FINAL_CONTINUATION=true
+        PHASE_D_PROBE=true; RESUMING=false
+        CURRICULUM_STOP=1020; FINAL_EPOCH=1020
+        MODEL_ARGS=(--model-version direct_unet3d_no_activation_norm_v3); shift ;;
+    --resume-phase-d-stateful-probe)
+        CURRICULUM=true; GLOBAL_COSINE=true; POST_FINAL_CONTINUATION=true
+        PHASE_D_PROBE=true
+        CURRICULUM_STOP=1020; FINAL_EPOCH=1020
+        MODEL_ARGS=(--model-version direct_unet3d_no_activation_norm_v3); shift ;;
     --fromscratch-global-cosine-48h)
         CURRICULUM=true; GLOBAL_COSINE=true; FROMSCRATCH_48H=true; RESUMING=false
         CURRICULUM_STOP=1000; FINAL_EPOCH=1000
@@ -76,7 +87,7 @@ while (( $# )); do
     elif [[ "$1" == --model-version ]] && (( $# >= 2 )); then
         MODEL_ARGS=(--model-version "$2"); shift 2
     else
-        echo "Usage: bash $0 [--stage1-gaussian-nll|--resume-stage1-gaussian-nll|--curriculum|--resume-curriculum|--abcd-symmetric-lr|--resume-abcd-symmetric-lr|--global-cosine-lr|--resume-global-cosine-lr|--post-final-continuation|--resume-post-final-continuation|--fromscratch-global-cosine-48h|--resume-fromscratch-global-cosine-48h] [--arm-variance-ramp|--arm-rollout-ramp] [--stop-after-epochs N] [--final-epoch N] [--model-version VERSION]" >&2
+        echo "Usage: bash $0 [--stage1-gaussian-nll|--resume-stage1-gaussian-nll|--curriculum|--resume-curriculum|--abcd-symmetric-lr|--resume-abcd-symmetric-lr|--global-cosine-lr|--resume-global-cosine-lr|--post-final-continuation|--resume-post-final-continuation|--phase-d-stateful-probe|--resume-phase-d-stateful-probe|--fromscratch-global-cosine-48h|--resume-fromscratch-global-cosine-48h] [--arm-variance-ramp|--arm-rollout-ramp] [--stop-after-epochs N] [--final-epoch N] [--model-version VERSION]" >&2
         exit 2
     fi
 done
@@ -136,6 +147,8 @@ H5_DIR=/pscratch/sd/b/binxia/VPIC_PPPL_HDF5_by_beta_official2500_none_compat
 RUN_NAME=multi_beta_smoothl1_6ep_horizon20_20261018
 if ${FROMSCRATCH_48H}; then
     RUN_NAME=${FROMSCRATCH_RUN_NAME:-multi_beta_curriculum_direct_v3_fromscratch_globalcosine_2e4_1e5_1000ep_48h_20261027}
+elif ${PHASE_D_PROBE}; then
+    RUN_NAME=${CONTINUATION_RUN_NAME:-phase_d_stateful_sliding_probe_from_1000ep_20261105}
 elif ${POST_FINAL_CONTINUATION}; then
     RUN_NAME=${CONTINUATION_RUN_NAME:-multi_beta_curriculum_direct_v3_globalcosine_uqcontinue_e240_e320_20261027}
 elif ${STAGE1_NLL}; then
@@ -162,6 +175,7 @@ EPOCHS=20
 if ${ABCD_SYMMETRIC}; then EPOCHS=45; fi
 if ${GLOBAL_COSINE}; then EPOCHS=240; fi
 if ${FROMSCRATCH_48H}; then EPOCHS=1000; fi
+if ${PHASE_D_PROBE}; then EPOCHS=1000; fi
 STOP_EPOCH=${EPOCHS}
 if ${STAGE1_NLL} && ! ${RESUME_STAGE1_NLL}; then
     STOP_EPOCH=6
@@ -181,6 +195,7 @@ if ${FROMSCRATCH_48H}; then
     LR=2e-4
     MIN_LR=1e-5
 fi
+if ${PHASE_D_PROBE}; then MIN_LR=1e-5; fi
 WEIGHT_DECAY=1e-4
 DENSITY_PROBE_MIN=0
 DENSITY_PROBE_MAX=30
@@ -202,7 +217,11 @@ MASK_PATTERNS=(
 OUT_DIR=runs/${RUN_NAME}
 CHECKPOINT=${OUT_DIR}/latest.pt
 ACTIVE_JOB_REGISTRY=${OUT_DIR}/active_slurm_job_id
-CONTINUATION_SOURCE_CHECKPOINT=${CONTINUATION_SOURCE_CHECKPOINT:-runs/multi_beta_curriculum_direct_v3_fixedsplit_globalcosine_2e4_1e6_20261026/final.pt}
+if ${PHASE_D_PROBE}; then
+    CONTINUATION_SOURCE_CHECKPOINT=${CONTINUATION_SOURCE_CHECKPOINT:-runs/multi_beta_curriculum_direct_v3_fromscratch_globalcosine_2e4_1e5_1000ep_48h_20261027/final.pt}
+else
+    CONTINUATION_SOURCE_CHECKPOINT=${CONTINUATION_SOURCE_CHECKPOINT:-runs/multi_beta_curriculum_direct_v3_fixedsplit_globalcosine_2e4_1e6_20261026/final.pt}
+fi
 LOG=logs/train_${RUN_NAME}_${SLURM_JOB_ID}.out
 
 slurm_job_is_active() {
@@ -335,10 +354,12 @@ if ${STAGE1_NLL} || ${CURRICULUM}; then
             TRAIN_ARGS+=(--curriculum-config global_cosine)
         fi
         if ${POST_FINAL_CONTINUATION}; then
-            TRAIN_ARGS+=(
-                --post-final-continuation "${CONTINUATION_SOURCE_CHECKPOINT}"
-                --wandb-tags post-final-continuation uq-convergence
-            )
+            TRAIN_ARGS+=(--post-final-continuation "${CONTINUATION_SOURCE_CHECKPOINT}")
+            if ${PHASE_D_PROBE}; then
+                TRAIN_ARGS+=(--wandb-tags post-final-continuation phase-d-stateful sliding-probe from-1000ep)
+            else
+                TRAIN_ARGS+=(--wandb-tags post-final-continuation uq-convergence)
+            fi
         fi
         if ${FROMSCRATCH_48H}; then
             TRAIN_ARGS+=(
@@ -464,7 +485,7 @@ else:
     validate_resume_parameters(args, checkpoint["args"])
 epoch = int(checkpoint["epoch"])
 limit = (args.stop_after_epochs or args.epochs) if args.curriculum_training else args.epochs
-minimum_epoch = 240 if args.post_final_continuation else (1 if args.curriculum_training else 6)
+minimum_epoch = args.epochs if args.post_final_continuation else (1 if args.curriculum_training else 6)
 if not minimum_epoch <= epoch <= limit:
     raise ValueError(f"Unexpected completed epoch {epoch} for final epoch {limit}")
 if args.curriculum_training:
@@ -480,18 +501,22 @@ if args.uncertainty_loss == "gaussian_nll":
             raise ValueError("Fresh continuation output unexpectedly contains history.json")
     else:
         history = json.loads(history_path.read_text())
-        first_epoch = 241 if args.post_final_continuation else 1
+        if args.post_final_continuation:
+            source = torch.load(args.post_final_continuation, map_location="cpu", weights_only=False, mmap=True)
+            first_epoch = int(source["epoch"]) + 1
+        else:
+            first_epoch = 1
         if [row["epoch"] for row in history] != list(range(first_epoch, epoch + 1)):
             raise ValueError("Cannot resume: history does not match completed checkpoint epochs.")
 if args.post_final_continuation:
     group_lrs = [float(group["lr"]) for group in checkpoint["optimizer"]["param_groups"]]
-    if not group_lrs or any(not math.isclose(lr, 1e-6, rel_tol=0., abs_tol=1e-15) for lr in group_lrs):
-        raise ValueError(f"Continuation optimizer LR is not fixed at 1e-6: {group_lrs}")
+    if not group_lrs or any(not math.isclose(lr, args.min_lr, rel_tol=0., abs_tol=1e-15) for lr in group_lrs):
+        raise ValueError(f"Continuation optimizer LR is not fixed at {args.min_lr:g}: {group_lrs}")
     print(
         f"Continuation preflight confirmed: source/completed epoch={epoch}, "
         f"next epoch={epoch + 1}, final epoch={limit}, lambda_v=lambda_r=1, "
         f"optimizer restored ({len(checkpoint['optimizer']['state'])} parameter states), "
-        f"LR=1e-6, split_sha256={checkpoint['split_sha256']}, "
+        f"LR={args.min_lr:g}, split_sha256={checkpoint['split_sha256']}, "
         f"output={args.out_dir}",
         file=sys.stderr,
     )
@@ -547,7 +572,7 @@ if ${CURRICULUM}; then
             echo "True from-scratch run: random model; fresh optimizer/epoch/curriculum/W&B; no init checkpoint"
             echo "Global cosine LR: epochs 1-5 ${MIN_LR}->${LR}; epochs 6-${FINAL_EPOCH} cosine decay to ${MIN_LR}"
         elif ${POST_FINAL_CONTINUATION}; then
-            echo "Post-final UQ continuation: source epoch 240; epochs 241-320; lambda_v=lambda_r=1"
+            echo "Post-final continuation: source epoch ${EPOCHS}; epochs $((EPOCHS + 1))-${FINAL_EPOCH}; lambda_v=lambda_r=1"
             echo "Fixed LR=${MIN_LR}; no warmup, reheat, convergence detector, or curriculum ramp"
             echo "Source checkpoint: ${CONTINUATION_SOURCE_CHECKPOINT}"
         else

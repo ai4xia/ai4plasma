@@ -377,8 +377,8 @@ def parse_args():
         default=None,
         metavar="FINAL_CHECKPOINT",
         help=(
-            "Start a separate 80-epoch full-objective continuation from a "
-            "completed epoch-240 global-cosine final checkpoint, restoring "
+            "Start a separate fixed-LR full-objective continuation from a "
+            "completed global-cosine final checkpoint, restoring "
             "optimizer state and holding LR at its saved floor. An in-run "
             "latest.pt still takes precedence for crash recovery."
         ),
@@ -424,10 +424,11 @@ def parse_args():
         if (not args.curriculum_training
                 or args.curriculum_config != "global_cosine"):
             p.error("--post-final-continuation requires the global_cosine curriculum")
-        if (args.epochs, args.stop_after_epochs, args.final_epoch) != (240, 320, 320):
+        if (args.stop_after_epochs != args.final_epoch
+                or args.final_epoch <= args.epochs):
             p.error(
-                "--post-final-continuation requires --epochs 240 "
-                "--stop-after-epochs 320 --final-epoch 320"
+                "--post-final-continuation requires matching --stop-after-epochs "
+                "and --final-epoch beyond the completed --epochs horizon"
             )
         if args.arm_variance_ramp or args.arm_rollout_ramp:
             p.error("--post-final-continuation does not permit ramp arming")
@@ -493,12 +494,9 @@ def parse_args():
                 p.error("global_cosine requires 40-epoch variance and rollout ramps")
             if args.variance_ramp_start_epoch is not None or args.rollout_ramp_start_epoch is not None:
                 p.error("global_cosine uses convergence-triggered ramps; scheduled starts are not supported")
-            expected_final_epoch = (
-                320 if args.post_final_continuation else args.epochs
-            )
-            if args.final_epoch != expected_final_epoch:
+            if args.post_final_continuation is None and args.final_epoch != args.epochs:
                 p.error(
-                    f"global_cosine requires --final-epoch {expected_final_epoch}"
+                    f"global_cosine requires --final-epoch {args.epochs}"
                 )
     if not (0 <= args.warmup_epochs < args.epochs):
         p.error(
@@ -920,7 +918,7 @@ def validate_resume_parameters(args, checkpoint_args: Dict[str, Any]) -> None:
 def validate_post_final_continuation(
     args, checkpoint: Dict[str, Any], source_path: Path, out_dir: Path,
 ) -> None:
-    """Validate the one-shot epoch-240 -> 320 full-objective continuation."""
+    """Validate a separate fixed-LR continuation of a completed curriculum."""
     source_path = Path(source_path).resolve()
     if source_path.parent == Path(out_dir).resolve():
         raise ValueError(
@@ -931,12 +929,15 @@ def validate_post_final_continuation(
             raise ValueError(f"Continuation source is missing checkpoint {key!r}")
     source_args = checkpoint["args"]
     source_epoch = int(checkpoint["epoch"])
-    if source_epoch != 240 or source_args.get("final_epoch") != source_epoch:
+    if source_args.get("final_epoch") != source_epoch or args.epochs != source_epoch:
         raise ValueError(
-            "Post-final continuation requires a completed epoch-240 final checkpoint"
+            "Post-final continuation requires --epochs to match the completed "
+            "source checkpoint's predetermined final epoch"
         )
-    if args.final_epoch != source_epoch + 80 or args.stop_after_epochs != args.final_epoch:
-        raise ValueError("Post-final continuation must cover exactly epochs 241 through 320")
+    if args.final_epoch <= source_epoch or args.stop_after_epochs != args.final_epoch:
+        raise ValueError(
+            "Post-final continuation requires a later matching stop/final epoch"
+        )
 
     compatible_args = argparse.Namespace(**vars(args))
     compatible_args.final_epoch = source_args["final_epoch"]
@@ -1129,6 +1130,7 @@ def make_curriculum_state(args, updates_per_epoch: int, checkpoint=None) -> Dict
             raise ValueError("Curriculum ramp durations must be positive")
     state["successful_optimizer_steps"] = 0
     state["phase_d_start_epoch"] = None
+    state["phase_d_trajectory_resume_policy"] = "reset_on_resume"
     state["variance_phase_start_epoch"] = None
     state["rollout_phase_start_epoch"] = None
     if checkpoint is not None:
@@ -1160,6 +1162,10 @@ def make_curriculum_state(args, updates_per_epoch: int, checkpoint=None) -> Dict
         ):
             raise ValueError("Invalid saved Phase-D start epoch")
         state["phase_d_start_epoch"] = phase_d_start
+        policy = saved.get("phase_d_trajectory_resume_policy", "reset_on_resume")
+        if policy != "reset_on_resume":
+            raise ValueError(f"Unsupported Phase-D trajectory resume policy: {policy!r}")
+        state["phase_d_trajectory_resume_policy"] = policy
         for prefix in ("variance", "rollout"):
             phase_key = f"{prefix}_phase_start_epoch"
             phase_start = saved.get(phase_key)
@@ -1240,7 +1246,7 @@ def curriculum_phase(
             return 1, "variance_ramp_or_settle"
         if lambda_r < 1:
             return 2, "rollout_ramp"
-        return 3, "full_objective"
+        return 3, "sliding_rollout"
     phase_d_start = state.get("phase_d_start_epoch")
     if phase_d_start is not None and epoch >= phase_d_start:
         return 3, "joint_refinement"
@@ -1531,6 +1537,243 @@ def sample_training_mask(y, pattern_weights, density_p_zero, density_p_full,
             density_fractions, magnetic_counts, density_counts)
 
 
+class PhaseDTrajectory:
+    """One local batch slot in the stateful Phase-D sliding stream."""
+
+    def __init__(self, run_name: str, target: torch.Tensor, slide_step: int, start: int):
+        self.run_name = run_name
+        self.target = target
+        self.slide_step = int(slide_step)
+        self.start = int(start)
+        self.reuse_depth = 0
+        self.previous_mean: Optional[torch.Tensor] = None
+        self.previous_variance: Optional[torch.Tensor] = None
+
+
+class PhaseDStreamingBatch:
+    """Maintain independent recursive trajectories across optimizer steps.
+
+    Trajectory tensors intentionally are not checkpointed. A process resume
+    starts fresh local slots while retaining model/optimizer/curriculum state.
+    """
+
+    def __init__(
+        self, dataset, train_runs: Sequence[str], batch_size: int,
+        window_size: int, device: torch.device, mean: torch.Tensor,
+        std: torch.Tensor, seed: int,
+    ):
+        if window_size != 24:
+            raise ValueError("Stateful Phase D requires the production T=24 window")
+        available = set(getattr(dataset, "run_file_indices", train_runs))
+        self.train_runs = tuple(sorted(set(train_runs) & available))
+        missing = set(train_runs) - available
+        if missing:
+            raise ValueError(f"Phase-D train runs are absent from the dataset: {sorted(missing)[:5]}")
+        if not self.train_runs:
+            raise ValueError("Phase D requires at least one training run")
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.window_size = int(window_size)
+        self.device = device
+        self.mean = mean[0]
+        self.std = std[0]
+        self.generator = torch.Generator().manual_seed(int(seed))
+        self.slots: List[Optional[PhaseDTrajectory]] = [None] * self.batch_size
+        self.begin_epoch()
+
+    def begin_epoch(self) -> None:
+        self._s_sum = 0.0
+        self._abs_s_sum = 0.0
+        self._reuse_sum = 0.0
+        self._reuse_max = 0
+        self._overlap_sum = 0.0
+        self._resets = 0
+        self._sign_counts = [0, 0, 0]  # negative, zero, positive
+        self._finite_count = 0
+        self._target_count = 0
+        self._slot_steps = 0
+        self._s_counts = [0] * (2 * self.window_size + 1)
+
+    def reset_slot(
+        self, slot: int, run_name: Optional[str] = None,
+        slide_step: Optional[int] = None, window_start: Optional[int] = None,
+    ) -> PhaseDTrajectory:
+        if run_name is None:
+            index = int(torch.randint(len(self.train_runs), (1,), generator=self.generator))
+            run_name = self.train_runs[index]
+        elif run_name not in self.train_runs:
+            raise ValueError(f"Phase-D slot reset requested a non-training run: {run_name}")
+        if slide_step is None:
+            slide_step = int(torch.randint(
+                -self.window_size, self.window_size + 1, (1,), generator=self.generator,
+            ))
+        if not -self.window_size <= slide_step <= self.window_size:
+            raise ValueError(f"Invalid Phase-D slide step: {slide_step}")
+
+        physical = self.dataset.get_run(run_name).to(self.device, non_blocking=True)
+        if physical.ndim != 4 or physical.shape[0] != 4:
+            raise ValueError(f"Expected complete run shape (4,L,X,Z), got {tuple(physical.shape)}")
+        target = (physical - self.mean) / (self.std + 1e-8)
+        length = int(target.shape[1])
+        if slide_step > 0:
+            start = -(self.window_size - 1)
+        elif slide_step < 0:
+            start = length - 1
+        else:
+            start = int(torch.randint(
+                -(self.window_size - 1), length, (1,), generator=self.generator,
+            ))
+        if window_start is not None:
+            start = int(window_start)
+        if slide_step == 0 and not -(self.window_size - 1) <= start <= length - 1:
+            raise ValueError(f"Invalid Phase-D refinement window start {start} for length {length}")
+
+        trajectory = PhaseDTrajectory(run_name, target, slide_step, start)
+        self.slots[slot] = trajectory
+        self._resets += 1
+        return trajectory
+
+    def _ensure_slots(self) -> None:
+        for slot, trajectory in enumerate(self.slots):
+            if trajectory is None:
+                self.reset_slot(slot)
+
+    def _window(self, trajectory: PhaseDTrajectory) -> torch.Tensor:
+        target = trajectory.target
+        length, start = int(target.shape[1]), trajectory.start
+        window = target.new_full(
+            (4, self.window_size, target.shape[2], target.shape[3]), float("nan")
+        )
+        source_start = max(start, 0)
+        source_end = min(start + self.window_size, length)
+        if source_start < source_end:
+            destination_start = source_start - start
+            window[:, destination_start:destination_start + source_end - source_start] = (
+                target[:, source_start:source_end]
+            )
+        return window
+
+    def current_targets(self) -> Tuple[torch.Tensor, Dict[str, List[Any]]]:
+        self._ensure_slots()
+        trajectories = [slot for slot in self.slots if slot is not None]
+        targets = torch.stack([self._window(slot) for slot in trajectories])
+        metadata = {
+            "run_name": [slot.run_name for slot in trajectories],
+            "beta": [float(parse_run_name(slot.run_name)["beta"]) for slot in trajectories],
+            "t0": [slot.start for slot in trajectories],
+            "slide_step": [slot.slide_step for slot in trajectories],
+            "reuse_depth": [slot.reuse_depth for slot in trajectories],
+        }
+        return targets, metadata
+
+    @staticmethod
+    def overlap_slices(slide_step: int, window_size: int = 24) -> Tuple[slice, slice]:
+        """Return (current, previous) time slices for one regular shift."""
+        if not -window_size <= slide_step <= window_size:
+            raise ValueError(f"Invalid slide step: {slide_step}")
+        if slide_step > 0:
+            return slice(0, window_size - slide_step), slice(slide_step, window_size)
+        if slide_step < 0:
+            distance = -slide_step
+            return slice(distance, window_size), slice(0, window_size - distance)
+        return slice(0, window_size), slice(0, window_size)
+
+    def make_model_input(
+        self, targets: torch.Tensor, observation_mask: torch.Tensor,
+        noise: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Create finite input values/u and reuse detached temporal overlap."""
+        if noise is None:
+            noise = torch.randn_like(targets)
+        values = noise.clone()
+        input_variance = torch.ones_like(targets)
+        for index, trajectory in enumerate(self.slots):
+            assert trajectory is not None
+            if trajectory.previous_mean is not None:
+                current_slice, previous_slice = self.overlap_slices(
+                    trajectory.slide_step, self.window_size
+                )
+                values[index, :, current_slice] = trajectory.previous_mean[:, previous_slice]
+                input_variance[index, :, current_slice] = (
+                    trajectory.previous_variance[:, previous_slice]
+                )
+
+        finite = torch.isfinite(targets)
+        exact = finite & (observation_mask > 0.5)
+        values[exact] = targets[exact]
+        input_variance[exact] = 0.0
+        if not torch.isfinite(values).all() or not torch.isfinite(input_variance).all():
+            raise FloatingPointError("Phase-D construction passed a non-finite value to the model")
+
+        for trajectory in self.slots:
+            assert trajectory is not None
+            slide_step = trajectory.slide_step
+            self._s_sum += slide_step
+            self._abs_s_sum += abs(slide_step)
+            self._reuse_sum += trajectory.reuse_depth
+            self._reuse_max = max(self._reuse_max, trajectory.reuse_depth)
+            overlap = (self.window_size - abs(slide_step)) / self.window_size
+            self._overlap_sum += overlap if trajectory.reuse_depth > 0 else 0.0
+            self._sign_counts[(slide_step > 0) + (slide_step >= 0)] += 1
+            self._s_counts[slide_step + self.window_size] += 1
+            self._slot_steps += 1
+        self._finite_count += int(finite.sum().item())
+        self._target_count += finite.numel()
+        return torch.cat([values, input_variance], dim=1), exact.to(targets.dtype)
+
+    def advance(self, prediction: torch.Tensor, variance: torch.Tensor) -> None:
+        """Detach one successful update and independently advance/reset slots."""
+        for index, trajectory in enumerate(self.slots):
+            assert trajectory is not None
+            mean = prediction[index].detach().float().clone()
+            output_variance = variance[index].detach().float().clone()
+            if mean.grad_fn is not None or output_variance.grad_fn is not None:
+                raise RuntimeError("Phase-D state must be detached between optimizer steps")
+
+            if trajectory.slide_step == 0:
+                if trajectory.reuse_depth == 0:
+                    trajectory.previous_mean = mean
+                    trajectory.previous_variance = output_variance
+                    trajectory.reuse_depth = 1
+                else:
+                    self.slots[index] = None
+                continue
+
+            length = int(trajectory.target.shape[1])
+            reached_end = (
+                trajectory.start + self.window_size - 1 >= length - 1
+                if trajectory.slide_step > 0 else trajectory.start <= 0
+            )
+            if reached_end:
+                self.slots[index] = None
+                continue
+            trajectory.previous_mean = mean
+            trajectory.previous_variance = output_variance
+            trajectory.start += trajectory.slide_step
+            trajectory.reuse_depth += 1
+
+    def local_epoch_metrics(self) -> Dict[str, Any]:
+        count = max(self._slot_steps, 1)
+        negative, zero, positive = self._sign_counts
+        return {
+            "s_mean": self._s_sum / count,
+            "abs_s_mean": self._abs_s_sum / count,
+            "reuse_depth_mean": self._reuse_sum / count,
+            "reuse_depth_max": self._reuse_max,
+            "overlap_fraction_mean": self._overlap_sum / count,
+            "trajectory_resets": self._resets,
+            "s_zero_fraction": zero / count,
+            "s_positive_fraction": positive / count,
+            "s_negative_fraction": negative / count,
+            "finite_target_fraction": self._finite_count / max(self._target_count, 1),
+            "slot_steps": self._slot_steps,
+            "s_counts": {
+                str(step): self._s_counts[step + self.window_size]
+                for step in range(-self.window_size, self.window_size + 1)
+            },
+        }
+
+
 def curriculum_forward_loss(model, model_input, target, mask, lambda_v, lambda_r, reuse_mask=None):
     """One/two passes with the original balanced reconstruction MSE and FP32 NLL."""
     pred, variance = model(model_input, detach_variance_features=True)
@@ -1600,6 +1843,7 @@ def train_one_epoch(
     uncertainty_loss: str = "smooth_l1",
     curriculum_state: Optional[Dict[str, Any]] = None,
     curriculum_log_every: int = 50,
+    phase_d_stream: Optional[PhaseDStreamingBatch] = None,
 ) -> Dict[str, Any]:
     model.train()
     stage1 = uncertainty_aware and uncertainty_loss == "gaussian_nll"
@@ -1644,6 +1888,11 @@ def train_one_epoch(
     curriculum_totals = (torch.zeros(8, device=device, dtype=torch.float64)
                          if curriculum_state is not None else None)
     lambda_start = lambda_end = None
+    phase_d_active = phase_d_stream is not None
+    if phase_d_active:
+        if curriculum_state is None or not curriculum_is_complete(curriculum_state):
+            raise ValueError("Stateful Phase D requires a complete curriculum")
+        phase_d_stream.begin_epoch()
 
     def count_optimizer_step(_optimizer, _args, _kwargs):
         nonlocal applied_steps
@@ -1653,13 +1902,18 @@ def train_one_epoch(
 
     batches_per_epoch = max(len(loader), 1)
 
-    for step, batch in enumerate(loader):
+    batches = range(len(loader)) if phase_d_active else loader
+    for step, batch in enumerate(batches):
         data_wait_seconds += time.perf_counter() - last_batch_end
+        if phase_d_active:
+            y, metadata = phase_d_stream.current_targets()
+            batch = {"metadata": metadata}
+        else:
+            y = batch["block"].to(device, non_blocking=True)
+            y = normalize(y, mean, std)
         for beta in batch.get("metadata", {}).get("beta", []):
             key = str(float(beta))
             beta_sample_counts[key] = beta_sample_counts.get(key, 0) + 1
-        y = batch["block"].to(device, non_blocking=True)
-        y = normalize(y, mean, std)
 
         batch_size = y.shape[0]
         time_steps = int(y.shape[-3])
@@ -1683,7 +1937,10 @@ def train_one_epoch(
             magnetic_sample_count += 1
             magnetic_zero_sample_count += int(count == 0)
             magnetic_full_sample_count += int(count == spatial_sites)
-        if uncertainty_aware:
+        if phase_d_active:
+            model_input, mask = phase_d_stream.make_model_input(y, mask)
+            input_variance = model_input[:, 4:]
+        elif uncertainty_aware:
             input_variance = 1.0 - mask
             if stage1:
                 check_stage1(((input_variance == 0) | (input_variance == 1)).all(),
@@ -1697,20 +1954,36 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
         if stage1:
-            check_stage1(torch.isfinite(model_input).all() & torch.isfinite(y).all(),
+            finite_target_ok = (torch.isfinite(y).any() if phase_d_active
+                                else torch.isfinite(y).all())
+            check_stage1(torch.isfinite(model_input).all() & finite_target_ok,
                          f"Nonfinite input/target: epoch {epoch_number}, batch {step + 1}")
 
         if curriculum_state is not None:
             lambda_v, lambda_r = curriculum_weights(curriculum_state)
             lambda_start = lambda_start or (lambda_v, lambda_r)
             lambda_end = (lambda_v, lambda_r)
-            # Do not even sample a rollout mask until the second pass is active.
+            # Phase D is already a recursive state, so it performs one forward.
             reuse_mask = (sample_training_mask(
                 y, pattern_weights, density_visible_p_zero, density_visible_p_full,
-                magnetic_visible_p_zero, magnetic_visible_p_full)[0] if lambda_r > 0 else None)
+                magnetic_visible_p_zero, magnetic_visible_p_full)[0]
+                if lambda_r > 0 and not phase_d_active else None)
 
         with torch.cuda.amp.autocast(enabled=(amp and device.type == "cuda"), dtype=amp_dtype):
-            if curriculum_state is not None:
+            if phase_d_active:
+                pred, output_variance = model(model_input, detach_variance_features=True)
+                reconstruction_loss = full_mse_loss(pred, y, mask)
+                variance_loss = predicted_error_mse_loss(
+                    output_variance, pred, y, "gaussian_nll"
+                )
+                loss = reconstruction_loss + variance_loss
+                components = {
+                    "L_mu_1": reconstruction_loss,
+                    "L_var_1": variance_loss,
+                    "forwards": 1,
+                    "total_loss": loss,
+                }
+            elif curriculum_state is not None:
                 loss, pred, output_variance, components = curriculum_forward_loss(
                     model, model_input, y, mask, lambda_v, lambda_r, reuse_mask)
                 reconstruction_loss, variance_loss = components["L_mu_1"], components["L_var_1"]
@@ -1757,6 +2030,8 @@ def train_one_epoch(
                 dist.all_reduce(bounds, op=dist.ReduceOp.MAX)
                 if bounds[0].item() != -bounds[1].item():
                     raise RuntimeError("Curriculum optimizer updates disagree across ranks; stopping")
+            if phase_d_active and applied:
+                phase_d_stream.advance(pred, output_variance)
             coordinate = curriculum_state["successful_optimizer_steps"]
             curriculum_state["successful_optimizer_steps"] += applied
             with torch.no_grad():
@@ -1768,8 +2043,7 @@ def train_one_epoch(
                     loss.new_tensor(components["forwards"] == 2),
                 ]).detach().double()
             if step % curriculum_log_every == 0 or step + 1 == len(loader):
-                phase_d_start = curriculum_state.get("phase_d_start_epoch")
-                region = ("D" if phase_d_start is not None and epoch_number >= phase_d_start else
+                region = ("D" if phase_d_active else
                           ("A" if lambda_v == 0 else ("B" if lambda_r == 0 else "C")))
                 message = (f"Curriculum {region}: successful_step={coordinate} "
                            f"next_successful_step={curriculum_state['successful_optimizer_steps']} "
@@ -1930,13 +2204,51 @@ def train_one_epoch(
         metrics["curriculum"].update(lambda_v_start=lambda_start[0], lambda_r_start=lambda_start[1],
                                      lambda_v_end=lambda_end[0], lambda_r_end=lambda_end[1],
                                      successful_optimizer_steps=curriculum_state["successful_optimizer_steps"])
+    if phase_d_active:
+        local = phase_d_stream.local_epoch_metrics()
+        count = local["slot_steps"]
+        sums = torch.tensor([
+            local["s_mean"] * count,
+            local["abs_s_mean"] * count,
+            local["reuse_depth_mean"] * count,
+            local["overlap_fraction_mean"] * count,
+            local["trajectory_resets"],
+            local["s_zero_fraction"] * count,
+            local["s_positive_fraction"] * count,
+            local["s_negative_fraction"] * count,
+            local["finite_target_fraction"] * count,
+            count,
+            *[local["s_counts"][str(step)] for step in range(-24, 25)],
+        ], dtype=torch.float64, device=device)
+        reuse_max = torch.tensor(local["reuse_depth_max"], device=device, dtype=torch.int64)
+        if distributed_is_initialized():
+            dist.all_reduce(sums, op=dist.ReduceOp.SUM)
+            dist.all_reduce(reuse_max, op=dist.ReduceOp.MAX)
+        values = sums.cpu().tolist()
+        global_slot_steps = max(values[9], 1.0)
+        metrics["phase_d"] = {
+            "s_mean": values[0] / global_slot_steps,
+            "abs_s_mean": values[1] / global_slot_steps,
+            "reuse_depth_mean": values[2] / global_slot_steps,
+            "reuse_depth_max": int(reuse_max.cpu()),
+            "overlap_fraction_mean": values[3] / global_slot_steps,
+            "trajectory_resets": int(values[4]),
+            "s_zero_fraction": values[5] / global_slot_steps,
+            "s_positive_fraction": values[6] / global_slot_steps,
+            "s_negative_fraction": values[7] / global_slot_steps,
+            "finite_target_fraction": values[8] / global_slot_steps,
+            "s_counts": {
+                str(step): int(values[10 + step + 24]) for step in range(-24, 25)
+            },
+        }
     if stage1:
         if distributed_is_initialized():
             dist.all_reduce(gradient_norm_sum, op=dist.ReduceOp.SUM)
             dist.all_reduce(gradient_norm_max, op=dist.ReduceOp.MAX)
         metrics.update(gradient_norm_mean=float(gradient_norm_sum.cpu()) / max(global_batches, 1),
                        gradient_norm_max=float(gradient_norm_max.cpu()),
-                       binary_input_variance_verified=True, nonfinite_events=0,
+                       binary_input_variance_verified=not phase_d_active,
+                       finite_model_input_verified=True, nonfinite_events=0,
                        optimizer_updates=global_applied_steps / (dist.get_world_size() if distributed_is_initialized() else 1))
     if distributed_is_initialized():
         rank_counts = [None] * dist.get_world_size()
@@ -2243,6 +2555,16 @@ def build_epoch_wandb_log(
         log_data["curriculum/ready_for_variance_ramp"] = False
         log_data["curriculum/ready_for_rollout_ramp"] = False
         log_data["curriculum/ready_for_phase_d"] = False
+    if "phase_d" in row:
+        log_data.update({
+            f"phase_d/{key}": value for key, value in row["phase_d"].items()
+            if key != "s_counts"
+        })
+        for step, count in row["phase_d"]["s_counts"].items():
+            label = f"neg_{step[1:]}" if step.startswith("-") else f"pos_{step}"
+            if step == "0":
+                label = "zero"
+            log_data[f"phase_d/s_count/{label}"] = count
     if "phase_convergence" in row:
         log_data.update({f"phase_convergence/{key}": value for key, value in row["phase_convergence"].items()
                          if value is not None})
@@ -2371,7 +2693,7 @@ def main():
     )
     if args.post_final_continuation:
         rank_print(
-            "Post-final UQ continuation: epochs 241-320, full objective "
+            f"Post-final continuation: epochs {args.epochs + 1}-{args.final_epoch}, full objective "
             f"(lambda_v=lambda_r=1), fixed LR={args.min_lr:g}; no ramps, "
             "convergence transitions, warmup, or reheat."
         )
@@ -2384,7 +2706,8 @@ def main():
             rank_print(f"{input_label}: binary input variance checked every batch; FP32 NLL floor={GAUSSIAN_NLL_VARIANCE_FLOOR:g}; no upper cap")
     if args.curriculum_training:
         rank_print("Curriculum: binary first pass; detached variance features; direct, unclipped rollout reuse; "
-                   "no calibration scale. Validation retains the standard single-pass benchmark.")
+                   "no calibration scale. Phase D uses per-slot stateful T=24 sliding with reset-on-resume; "
+                   "validation retains the standard single-pass benchmark.")
     rank_print(
         f"Distributed: world_size={world_size}, rank={rank}, "
         f"local_rank={local_rank}, device={device}"
@@ -2641,6 +2964,28 @@ def main():
             find_unused_parameters=args.curriculum_training,
         )
 
+    phase_d_stream = None
+    if curriculum_state is not None:
+        phase_d_stream = PhaseDStreamingBatch(
+            dataset=dataset,
+            train_runs=sorted(selected_train_runs),
+            batch_size=args.batch_size,
+            window_size=args.delta_t,
+            device=device,
+            mean=mean,
+            std=std,
+            seed=args.seed + rank,
+        )
+        if (resume_checkpoint is not None
+                and curriculum_phase(
+                    start_epoch, curriculum_state, *curriculum_weights(curriculum_state),
+                    args.curriculum_config,
+                )[0] == 3):
+            rank_print(
+                "Phase-D resume: local streaming trajectory slots reset safely; "
+                "model, optimizer, LR, and curriculum state remain restored."
+            )
+
     if is_main_process():
         with open(out_dir / "config.json", "w") as f:
             json.dump({**vars(args), "data_split": split_metadata}, f, indent=2)
@@ -2699,6 +3044,7 @@ def main():
         wandb_run.define_metric("phase_convergence/*", step_metric="epoch")
         wandb_run.define_metric("phase_b_convergence/*", step_metric="epoch")
         wandb_run.define_metric("phase_c_convergence/*", step_metric="epoch")
+        wandb_run.define_metric("phase_d/*", step_metric="epoch")
 
     history = []
     history_path = out_dir / "history.json"
@@ -2746,6 +3092,15 @@ def main():
         if epoch_progress is not None:
             epoch_progress.set_postfix(phase="train", lr=f"{epoch_lr:.8g}")
 
+        active_phase_d_stream = None
+        if curriculum_state is not None:
+            phase_index_at_start = curriculum_phase(
+                epoch, curriculum_state, *curriculum_weights(curriculum_state),
+                args.curriculum_config,
+            )[0]
+            if phase_index_at_start == 3:
+                active_phase_d_stream = phase_d_stream
+
         train_metrics = train_one_epoch(
             model=model,
             loader=train_loader,
@@ -2769,6 +3124,7 @@ def main():
             uncertainty_loss=args.uncertainty_loss,
             curriculum_state=curriculum_state,
             curriculum_log_every=args.curriculum_log_every,
+            phase_d_stream=active_phase_d_stream,
         )
 
         rollout_validation = bool(
@@ -2865,6 +3221,9 @@ def main():
             )
             epoch_log("  curriculum (second-pass losses averaged over all batches, inactive = 0): "
                       + json.dumps(row["curriculum"]))
+        if "phase_d" in train_metrics:
+            row["phase_d"] = train_metrics["phase_d"]
+            epoch_log("  Phase-D streaming diagnostics: " + json.dumps(row["phase_d"]))
         if args.uncertainty_aware:
             row["uncertainty_objective"] = args.uncertainty_loss
             key = "gaussian_nll" if args.uncertainty_loss == "gaussian_nll" else "uncertainty_mse"
@@ -2873,7 +3232,7 @@ def main():
             if args.uncertainty_loss == "gaussian_nll":
                 row.update({key: train_metrics[key] for key in (
                     "gradient_norm_mean", "gradient_norm_max", "binary_input_variance_verified",
-                    "nonfinite_events", "optimizer_updates")})
+                    "finite_model_input_verified", "nonfinite_events", "optimizer_updates")})
                 row["val_variance_statistics"] = val_metrics["variance_statistics"]
                 row["val_per_beta"] = val_metrics["per_beta"]
                 if rollout_validation:
@@ -3050,8 +3409,10 @@ def main():
             label = "Gaussian NLL" if args.uncertainty_loss == "gaussian_nll" else "uncertainty Smooth L1"
             epoch_log(f"  {label}: train={row[f'train_{key}']:.6f} val={row[f'val_{key}']:.6f}")
             if args.uncertainty_loss == "gaussian_nll":
+                input_check = ("binary v_in verified" if row["binary_input_variance_verified"]
+                               else "finite stateful Phase-D input verified")
                 epoch_log(f"  synchronized preclip gradient norm: mean={row['gradient_norm_mean']:.6g} "
-                          f"max={row['gradient_norm_max']:.6g}; binary v_in verified; nonfinite_events=0")
+                          f"max={row['gradient_norm_max']:.6g}; {input_check}; nonfinite_events=0")
                 epoch_log("  validation variance statistics: " + json.dumps(row["val_variance_statistics"]))
                 epoch_log("  validation per beta: " + json.dumps(row["val_per_beta"]))
         epoch_log(f"  epoch_seconds={row['epoch_seconds']:.2f} "

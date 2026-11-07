@@ -15,7 +15,8 @@ from data.masking import (
 )
 from models.unet3d import DIRECT_MODEL_VERSION, MODEL_VERSION, UNet3D
 from train_masked_unet3d import (
-    RESUME_PARAMETER_KEYS, parse_args, train_one_epoch, validate,
+    PhaseDStreamingBatch, RESUME_PARAMETER_KEYS, make_curriculum_state,
+    parse_args, train_one_epoch, validate,
     validate_resume_parameters,
 )
 from visualize_sliding_density_reconstruction import (
@@ -54,6 +55,251 @@ def test_reconstruction_keeps_balanced_mse():
     mask = torch.tensor([[1.0, 0.0, 0.0, 0.0]] * 3 + [[1.0, 1.0, 1.0, 0.0]]).view_as(prediction)
     # Equal B/Density weighting, each balanced across visible/hidden regions.
     torch.testing.assert_close(full_mse_loss(prediction, torch.zeros_like(prediction), mask), torch.tensor(70.0 / 3))
+
+
+class _PhaseDRunDataset:
+    def __init__(self, lengths=(30, 31), spatial_shape=(2, 2)):
+        self.names = [
+            "beta0.01_nu0_Bz0_dt2_tau100",
+            "beta0.02_nu1_Bz0.1_dt2_tau150",
+        ]
+        self.run_file_indices = {name: index for index, name in enumerate(self.names)}
+        self.runs = {}
+        for run_index, (name, length) in enumerate(zip(self.names, lengths)):
+            time = torch.arange(length, dtype=torch.float32).view(1, length, 1, 1)
+            channel = torch.arange(4, dtype=torch.float32).view(4, 1, 1, 1)
+            self.runs[name] = (
+                time + 10 * channel + 100 * run_index
+            ).expand(4, length, *spatial_shape).clone() / 100.0
+
+    def get_run(self, run_name):
+        return self.runs[run_name].clone()
+
+
+def _phase_d_stream(dataset=None, batch_size=1, seed=1234):
+    dataset = dataset or _PhaseDRunDataset()
+    mean = torch.zeros(1, 4, 1, 1, 1)
+    std = torch.ones_like(mean)
+    return PhaseDStreamingBatch(
+        dataset, dataset.names, batch_size, 24, torch.device("cpu"), mean, std, seed,
+    )
+
+
+def test_phase_d_finite_target_losses_exclude_nan_before_arithmetic():
+    target = torch.full((1, 4, 24, 2, 2), float("nan"))
+    target[:, :, 20:] = torch.randn(1, 4, 4, 2, 2)
+    prediction = torch.randn_like(target, requires_grad=True)
+    variance = torch.full_like(target, 2.0, requires_grad=True)
+    mask = torch.randint(2, target.shape).float()
+    finite = torch.isfinite(target)
+    mse = full_mse_loss(prediction, target, mask)
+    nll = predicted_error_mse_loss(variance, prediction, target, "gaussian_nll")
+    assert torch.isfinite(mse) and torch.isfinite(nll)
+    safe_error = (prediction.detach()[finite] - target[finite]).square()
+    expected_nll = 0.5 * (torch.log(torch.tensor(2.0)) + safe_error / 2.0).mean()
+    torch.testing.assert_close(nll, expected_nll)
+    (mse + nll).backward()
+    assert torch.isfinite(prediction.grad).all() and torch.isfinite(variance.grad).all()
+    assert (variance.grad[~finite] == 0).all()
+
+
+def test_phase_d_positive_and_zero_overlap_input_construction():
+    stream = _phase_d_stream()
+    name = stream.train_runs[0]
+    trajectory = stream.reset_slot(0, name, slide_step=1)
+    assert trajectory.start == -23
+    target, _ = stream.current_targets()
+    finite_times = torch.isfinite(target[0, 0, :, 0, 0]).nonzero().flatten().tolist()
+    assert finite_times == [23]  # only physical frame zero
+    hidden = torch.zeros_like(target)
+    inputs, exact = stream.make_model_input(target, hidden, torch.full_like(target, 7.0))
+    assert torch.isfinite(inputs).all() and not exact.any()
+    assert (inputs[:, :4] == 7).all() and (inputs[:, 4:] == 1).all()
+
+    prediction = torch.full_like(target, 3.0, requires_grad=True)
+    variance = torch.full_like(target, 2.0, requires_grad=True)
+    stream.advance(prediction, variance)
+    trajectory = stream.slots[0]
+    assert trajectory.start == -22 and trajectory.reuse_depth == 1
+    assert trajectory.previous_mean.grad_fn is None
+    target, _ = stream.current_targets()
+    observation = torch.zeros_like(target)
+    observation[:, :, 22] = 1  # physical frame zero overrides overlap reuse
+    inputs, exact = stream.make_model_input(target, observation, torch.full_like(target, -5.0))
+    assert (inputs[:, :4, :22] == 3).all()  # padded predictions persist
+    assert (inputs[:, 4:, :22] == 2).all()  # raw u > 1 is retained
+    assert (inputs[:, :4, 23] == -5).all() and (inputs[:, 4:, 23] == 1).all()
+    assert exact[:, :, 22].all() and (inputs[:, 4:, 22] == 0).all()
+
+    zero_overlap = _phase_d_stream()
+    zero_overlap.reset_slot(0, name, slide_step=24)
+    first, _ = zero_overlap.current_targets()
+    zero_overlap.advance(torch.full_like(first, 9.0), torch.full_like(first, 4.0))
+    assert zero_overlap.slots[0].start == 1
+    second, _ = zero_overlap.current_targets()
+    inputs, _ = zero_overlap.make_model_input(
+        second, torch.zeros_like(second), torch.full_like(second, -2.0)
+    )
+    assert (inputs[:, :4] == -2).all() and (inputs[:, 4:] == 1).all()
+    current, previous = PhaseDStreamingBatch.overlap_slices(24)
+    assert (current.start, current.stop) == (0, 0)
+    assert (previous.start, previous.stop) == (24, 24)
+
+
+def test_phase_d_negative_sliding_is_exact_mirror():
+    stream = _phase_d_stream()
+    name = stream.train_runs[0]
+    length = stream.dataset.runs[name].shape[1]
+    trajectory = stream.reset_slot(0, name, slide_step=-1)
+    assert trajectory.start == length - 1
+    target, _ = stream.current_targets()
+    assert torch.isfinite(target[0, 0, :, 0, 0]).nonzero().flatten().tolist() == [0]
+    stream.advance(torch.full_like(target, 6.0), torch.full_like(target, 3.0))
+    assert stream.slots[0].start == length - 2
+    target, _ = stream.current_targets()
+    inputs, _ = stream.make_model_input(
+        target, torch.zeros_like(target), torch.full_like(target, -4.0)
+    )
+    assert (inputs[:, :4, 0] == -4).all() and (inputs[:, 4:, 0] == 1).all()
+    assert (inputs[:, :4, 1:] == 6).all() and (inputs[:, 4:, 1:] == 3).all()
+
+    zero_overlap = _phase_d_stream()
+    zero_overlap.reset_slot(0, name, slide_step=-24)
+    first, _ = zero_overlap.current_targets()
+    zero_overlap.advance(torch.full_like(first, 8.0), torch.full_like(first, 5.0))
+    assert zero_overlap.slots[0].start == length - 25
+    second, _ = zero_overlap.current_targets()
+    inputs, _ = zero_overlap.make_model_input(
+        second, torch.zeros_like(second), torch.full_like(second, -3.0)
+    )
+    assert (inputs[:, :4] == -3).all() and (inputs[:, 4:] == 1).all()
+
+
+def test_phase_d_zero_step_range_refines_once_then_resets():
+    stream = _phase_d_stream()
+    name = stream.train_runs[0]
+    length = stream.dataset.runs[name].shape[1]
+    finite_counts = set()
+    for start in range(-23, length):
+        stream.reset_slot(0, name, slide_step=0, window_start=start)
+        target, _ = stream.current_targets()
+        finite_counts.add(int(torch.isfinite(target[0, 0, :, 0, 0]).sum()))
+    assert finite_counts == set(range(1, 25))
+
+    stream.reset_slot(0, name, slide_step=0, window_start=-10)
+    target, _ = stream.current_targets()
+    prediction = torch.full_like(target, 4.0, requires_grad=True)
+    variance = torch.full_like(target, 2.5, requires_grad=True)
+    stream.advance(prediction, variance)
+    assert stream.slots[0].start == -10 and stream.slots[0].reuse_depth == 1
+    target, _ = stream.current_targets()
+    inputs, _ = stream.make_model_input(target, torch.zeros_like(target))
+    assert (inputs[:, :4] == 4).all() and (inputs[:, 4:] == 2.5).all()
+    stream.advance(torch.zeros_like(target), torch.ones_like(target))
+    assert stream.slots[0] is None
+
+
+class _TinyPhaseDModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.mean = torch.nn.Conv3d(8, 4, 1)
+        self.variance = torch.nn.Conv3d(8, 4, 1)
+        torch.nn.init.zeros_(self.variance.weight)
+        torch.nn.init.constant_(self.variance.bias, 2.0)
+        self.seen_inputs = []
+
+    def forward(self, inputs, detach_variance_features=False):
+        self.seen_inputs.append(inputs.detach().clone())
+        prediction = self.mean(inputs)
+        variance = F.softplus(self.variance(inputs).float()).clamp_min(1e-6)
+        return prediction, variance
+
+
+def test_phase_d_streaming_optimizer_smoke_all_slide_cases_and_independent_slots():
+    dataset = _PhaseDRunDataset(lengths=(30, 31))
+    stream = _phase_d_stream(dataset, batch_size=5)
+    for slot, slide_step in enumerate((-24, -1, 0, 1, 24)):
+        stream.reset_slot(slot, dataset.names[slot % 2], slide_step=slide_step)
+    assert len({slot.run_name for slot in stream.slots}) == 2
+    assert {slot.slide_step for slot in stream.slots} == {-24, -1, 0, 1, 24}
+
+    model = _TinyPhaseDModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    before = model.mean.weight.detach().clone()
+    args = type("Args", (), dict(
+        variance_ramp_start_epoch=0.0, variance_ramp_epochs=1.0,
+        rollout_ramp_start_epoch=1.0, rollout_ramp_epochs=1.0,
+        arm_variance_ramp=False, arm_rollout_ramp=False,
+    ))()
+    state = make_curriculum_state(args, updates_per_epoch=1)
+    state["successful_optimizer_steps"] = 2
+    metrics = train_one_epoch(
+        model, [None, None, None], optimizer, torch.device("cpu"),
+        torch.zeros(1, 4, 1, 1, 1), torch.ones(1, 4, 1, 1, 1),
+        {"spatial_random": 1.0}, .05, .05, .05, .05, False, 1.0,
+        uncertainty_aware=True, uncertainty_loss="gaussian_nll",
+        curriculum_state=state, phase_d_stream=stream,
+    )
+    assert metrics["optimizer_updates"] == 3 and metrics["amp_skipped_steps"] == 0
+    assert not torch.equal(model.mean.weight, before)
+    assert torch.isfinite(torch.tensor(metrics["mse"]))
+    assert metrics["curriculum"]["two_forward_fraction"] == 0
+    assert metrics["phase_d"]["finite_target_fraction"] < 1
+    assert metrics["phase_d"]["reuse_depth_max"] >= 1
+    assert all(metrics["phase_d"]["s_counts"][str(step)] > 0
+               for step in (-24, -1, 0, 1, 24))
+    assert all(torch.isfinite(inputs).all() for inputs in model.seen_inputs)
+    assert any((inputs[:, 4:] > 1).any() for inputs in model.seen_inputs[1:])
+    assert all(slot is None or slot.previous_mean is None
+               or slot.previous_mean.grad_fn is None for slot in stream.slots)
+
+
+def _phase_d_ddp_worker(rank, rendezvous):
+    import datetime
+    import torch.distributed as dist
+
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2,
+        timeout=datetime.timedelta(seconds=45),
+    )
+    try:
+        dataset = _PhaseDRunDataset(lengths=(30, 31))
+        stream = _phase_d_stream(dataset, batch_size=2, seed=1234 + rank)
+        stream.reset_slot(0, dataset.names[0], slide_step=-1)
+        stream.reset_slot(1, dataset.names[1], slide_step=1)
+        model = torch.nn.parallel.DistributedDataParallel(
+            _TinyPhaseDModel(), find_unused_parameters=True,
+        )
+        args = type("Args", (), dict(
+            variance_ramp_start_epoch=0.0, variance_ramp_epochs=1.0,
+            rollout_ramp_start_epoch=1.0, rollout_ramp_epochs=1.0,
+            arm_variance_ramp=False, arm_rollout_ramp=False,
+        ))()
+        state = make_curriculum_state(args, updates_per_epoch=1)
+        state["successful_optimizer_steps"] = 2
+        metrics = train_one_epoch(
+            model, [None, None], torch.optim.AdamW(model.parameters(), lr=1e-3),
+            torch.device("cpu"), torch.zeros(1, 4, 1, 1, 1),
+            torch.ones(1, 4, 1, 1, 1), {"spatial_random": 1.0},
+            .05, .05, .05, .05, False, 1.0, uncertainty_aware=True,
+            uncertainty_loss="gaussian_nll", curriculum_state=state,
+            phase_d_stream=stream,
+        )
+        assert state["successful_optimizer_steps"] == 4
+        assert metrics["optimizer_updates"] == 2
+        assert metrics["phase_d"]["s_negative_fraction"] == pytest.approx(.5)
+        assert metrics["phase_d"]["s_positive_fraction"] == pytest.approx(.5)
+        assert metrics["phase_d"]["finite_target_fraction"] < 1
+    finally:
+        dist.destroy_process_group()
+
+
+def test_phase_d_two_rank_ddp_keeps_optimizer_step_control_flow_synchronized(tmp_path):
+    torch.multiprocessing.start_processes(
+        _phase_d_ddp_worker, args=(str(tmp_path / "phase_d_rendezvous"),),
+        nprocs=2, join=True, start_method="spawn",
+    )
 
 
 def test_unet_head_and_checkpoint_roundtrip(tmp_path):
@@ -695,15 +941,20 @@ def test_curriculum_compressed_main_save_resume_smoke(monkeypatch, tmp_path, cap
         assert torch.cuda.is_available(), "GPU smoke explicitly requested but CUDA is unavailable"
     class Dataset(torch.utils.data.Dataset):
         samples = []
+        run_file_indices = {}
         def __len__(self): return 5
         def __getitem__(self, i):
             block = torch.randn(4, 2, 8, 8, generator=torch.Generator().manual_seed(i))
             return {"block": block, "metadata": {"beta": .01}}
+        def get_run(self, run_name):
+            generator = torch.Generator().manual_seed(sum(map(ord, run_name)))
+            return torch.randn(4, 30, 8, 8, generator=generator)
     from data.vpic_hdf5_dataset import load_fixed_split
     split = load_fixed_split()
     train_name = next(name for name in split["train_runs"] if name.startswith("beta0.2_"))
     val_name = next(name for name in split["val_runs"] if name.startswith("beta0.2_"))
     Dataset.samples = [(0, train_name, i) for i in range(4)] + [(0, val_name, 0)]
+    Dataset.run_file_indices = {train_name: 0, val_name: 0}
     monkeypatch.setattr(train, "initialize_distributed", lambda: (device, 0, 1, 0))
     monkeypatch.setattr(train, "VPICWindowDataset", lambda **kw: Dataset())
     monkeypatch.setattr(train, "split_by_run", lambda *a, **kw: ([0, 1, 2, 3], [4], [train_name], [val_name]))
@@ -784,10 +1035,10 @@ def test_curriculum_compressed_main_save_resume_smoke(monkeypatch, tmp_path, cap
     assert len(full_rows) == 16 and full_rows == resumed_rows
     for region, step, next_step, lv, lr, forwards in full_rows:
         assert int(next_step) == int(step) + 1
-        assert int(forwards) == (2 if float(lr) > 0 else 1)
+        assert int(forwards) == (2 if float(lr) > 0 and region != "D" else 1)
         if float(lr) > 0: assert float(lv) == 1
     assert full_rows[0][3:] == ("0", "0", "1")
-    assert full_rows[-1][3:] == ("1", "1", "2")
+    assert full_rows[-1][3:] == ("1", "1", "1")
     checkpoint = torch.load(resumed / "latest.pt", map_location="cpu", weights_only=False)
     assert checkpoint["epoch"] == 8 and checkpoint["args"]["epochs"] == 20
     assert checkpoint["curriculum_state"]["successful_optimizer_steps"] == 16
@@ -802,7 +1053,8 @@ def test_curriculum_compressed_main_save_resume_smoke(monkeypatch, tmp_path, cap
     assert "best_val_mse" not in checkpoint and not (resumed / "best.pt").exists()
     assert all(r["amp_skipped_steps"] == r["nonfinite_events"] == 0 for r in history)
     assert all(torch.isfinite(torch.tensor(r["gradient_norm_max"])) for r in history)
-    assert history[-1]["curriculum"]["two_forward_fraction"] == 1
+    assert history[-1]["curriculum"]["two_forward_fraction"] == 0
+    assert history[-1]["phase_d"]["finite_target_fraction"] < 1
     assert all(r["learning_rate"] == train.learning_rate_for_epoch(r["epoch"], 20, 2e-5, 1, 2e-6)
                for r in history[:6])
     assert [r["learning_rate"] for r in history[6:]] == pytest.approx([3.6e-6, 5.2e-6])

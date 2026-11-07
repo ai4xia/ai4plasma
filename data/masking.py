@@ -1072,11 +1072,17 @@ def predicted_error_mse_loss(
     objective: str = "smooth_l1",
 ) -> torch.Tensor:
     """Variance objective in FP32; retain the legacy name and Smooth L1 default."""
-    squared_error = (pred.detach().float() - target.float()).square()
+    valid = torch.isfinite(target)
+    if not valid.any():
+        raise ValueError("The uncertainty objective requires at least one finite target")
+    pred_valid = pred.detach().float()[valid]
+    target_valid = target.float()[valid]
+    variance_valid = output_variance.float()[valid]
+    squared_error = (pred_valid - target_valid).square()
     if objective == "smooth_l1":
-        return F.smooth_l1_loss(output_variance.float(), squared_error, beta=1.0, reduction="mean")
+        return F.smooth_l1_loss(variance_valid, squared_error, beta=1.0, reduction="mean")
     if objective == "gaussian_nll":
-        variance = output_variance.float().clamp_min(GAUSSIAN_NLL_VARIANCE_FLOOR)
+        variance = variance_valid.clamp_min(GAUSSIAN_NLL_VARIANCE_FLOOR)
         return 0.5 * (variance.log() + squared_error / variance).mean()
     raise ValueError(f"Unknown uncertainty objective: {objective!r}")
 
@@ -1125,31 +1131,29 @@ def full_mse_loss(
 ) -> torch.Tensor:
     """
     MSE balanced across B/Density groups and visible/hidden regions.
+
+    Non-finite targets are absent supervision (Phase-D temporal padding) and
+    are indexed out before subtraction, so NaNs cannot contaminate the loss.
     """
-    squared_error = (pred - target) ** 2
     group_losses = []
 
     for channel_slice in (slice(0, 3), slice(3, 4)):
-        group_error = squared_error[:, channel_slice]
+        group_pred = pred[:, channel_slice]
+        group_target = target[:, channel_slice]
         group_visible_mask = visible_mask[:, channel_slice]
-        group_hidden_mask = 1.0 - group_visible_mask
+        finite = torch.isfinite(group_target)
+        component_losses = []
+        for selected in (finite & (group_visible_mask > 0.5),
+                         finite & (group_visible_mask <= 0.5)):
+            if selected.any():
+                component_losses.append(
+                    (group_pred[selected] - group_target[selected]).square().mean()
+                )
+        if component_losses:
+            group_losses.append(torch.stack(component_losses).mean())
 
-        visible_count = group_visible_mask.sum()
-        hidden_count = group_hidden_mask.sum()
-        component_counts = torch.stack([visible_count, hidden_count])
-        component_losses = torch.stack(
-            [
-                (group_error * group_visible_mask).sum()
-                / visible_count.clamp_min(1.0),
-                (group_error * group_hidden_mask).sum()
-                / hidden_count.clamp_min(1.0),
-            ]
-        )
-        valid_components = (component_counts > 0).to(component_losses.dtype)
-        group_losses.append(
-            (component_losses * valid_components).sum() / valid_components.sum()
-        )
-
+    if not group_losses:
+        raise ValueError("The reconstruction objective requires at least one finite target")
     return torch.stack(group_losses).mean()
 
 

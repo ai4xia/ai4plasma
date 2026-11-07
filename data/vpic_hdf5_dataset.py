@@ -208,6 +208,7 @@ class VPICWindowDataset(Dataset):
         self._file_handles: Dict[int, h5py.File] = {}
         self.file_infos: List[Dict] = []
         self.samples: List[Tuple[int, str, int]] = []
+        self.run_file_indices: Dict[str, int] = {}
 
         self.h5_dir = Path(os.path.expandvars(str(h5_dir))).expanduser().resolve()
         self.h5_files = find_h5_files(self.h5_dir, betas=betas)
@@ -249,6 +250,9 @@ class VPICWindowDataset(Dataset):
                     run_name = str(run_names[i])
                     if self.include_runs is not None and run_name not in self.include_runs:
                         continue
+                    if run_name in self.run_file_indices:
+                        raise ValueError(f"Duplicate HDF5 run name: {run_name}")
+                    self.run_file_indices[run_name] = file_idx
                     Ti = int(T[i])
 
                     if Ti < self.delta_t:
@@ -325,6 +329,22 @@ class VPICWindowDataset(Dataset):
             "block": block,
             "metadata": metadata,
         }
+
+    def get_run(self, run_name: str) -> torch.Tensor:
+        """Load one complete included run with the ordinary spatial preprocessing."""
+        if run_name not in self.run_file_indices:
+            raise KeyError(f"Run is not available in this dataset: {run_name}")
+        file_idx = self.run_file_indices[run_name]
+        fields = self._get_file(file_idx)["runs"][run_name]["fields"]
+        block = torch.from_numpy(np.asarray(fields, dtype=np.float32))
+        if block.shape[-2:] != TARGET_SPATIAL_SHAPE:
+            block = F.interpolate(
+                block, size=TARGET_SPATIAL_SHAPE, mode="bicubic",
+                antialias=True, align_corners=False,
+            )
+        if self.layout == "C T X Z":
+            return block.permute(1, 0, 2, 3)
+        return block.permute(1, 2, 3, 0)
 
     def close(self) -> None:
         for f in self._file_handles.values():
