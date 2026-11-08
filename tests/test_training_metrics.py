@@ -906,9 +906,11 @@ class TinyUncertaintyModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.scale = torch.nn.Parameter(torch.tensor(0.5))
+        self.calls = 0
 
     def forward(self, model_input, detach_variance_features=False):
         del detach_variance_features
+        self.calls += 1
         prediction = model_input[:, :4] * self.scale
         variance = torch.ones_like(prediction)
         return prediction, variance
@@ -979,7 +981,7 @@ def test_validate_returns_mse_only_and_mean_is_average():
     assert abs(metrics["mean"]["mse"] - expected_mean) < 1e-12
 
 
-def test_validate_emits_second_pass_rollout_objectives_for_phase_c():
+def test_validate_emits_final_k2_reuse_objectives_for_phase_c():
     device = torch.device("cpu")
     model = TinyUncertaintyModel()
     loader = DataLoader(TinyBlockDataset(n=1), batch_size=1)
@@ -997,6 +999,7 @@ def test_validate_emits_second_pass_rollout_objectives_for_phase_c():
         }
         assert metrics[scope]["rollout_mse"] >= 0
         assert all(math.isfinite(value) for value in metrics[scope].values())
+    assert model.calls == 3
 
 
 def test_wandb_epoch_log_has_no_mae_and_keeps_mse_and_sampling_stats():

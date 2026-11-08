@@ -40,7 +40,6 @@ from data.masking import (
     full_mse_loss,
     make_visible_input,
     make_uncertain_input,
-    make_rollout_input,
     predicted_error_mse_loss,
     GAUSSIAN_NLL_VARIANCE_FLOOR,
     parse_pattern_weights,
@@ -1442,7 +1441,7 @@ def phase_b_convergence(history, args, curriculum_state):
 
 
 def phase_c_convergence(history, args, curriculum_state):
-    """Detect rollout stability after its ramp using second-pass validation metrics."""
+    """Detect rollout stability after its ramp using final K=2 reuse metrics."""
     state = curriculum_state or {}
     start = state.get("rollout_ramp_start_step")
     duration = state.get("rollout_ramp_steps")
@@ -1540,14 +1539,20 @@ def sample_training_mask(y, pattern_weights, density_p_zero, density_p_full,
 class PhaseDTrajectory:
     """One local batch slot in the stateful Phase-D sliding stream."""
 
-    def __init__(self, run_name: str, target: torch.Tensor, slide_step: int, start: int):
+    def __init__(
+        self, run_name: str, target: torch.Tensor, slide_step: int, start: int,
+        rehearsal_length: Optional[int] = None,
+    ):
         self.run_name = run_name
         self.target = target
         self.slide_step = int(slide_step)
         self.start = int(start)
+        self.rehearsal_length = rehearsal_length
         self.reuse_depth = 0
         self.previous_mean: Optional[torch.Tensor] = None
         self.previous_variance: Optional[torch.Tensor] = None
+        self.rehearsal_magnetic_pattern: Optional[str] = None
+        self.rehearsal_density_pattern: Optional[str] = None
 
 
 class PhaseDStreamingBatch:
@@ -1571,6 +1576,20 @@ class PhaseDStreamingBatch:
             raise ValueError(f"Phase-D train runs are absent from the dataset: {sorted(missing)[:5]}")
         if not self.train_runs:
             raise ValueError("Phase D requires at least one training run")
+        if hasattr(dataset, "samples"):
+            window_runs = {str(sample[1]) for sample in dataset.samples}
+            self.full_window_runs = tuple(
+                name for name in self.train_runs if name in window_runs
+            )
+        elif hasattr(dataset, "runs"):
+            self.full_window_runs = tuple(
+                name for name in self.train_runs
+                if int(dataset.runs[name].shape[1]) >= window_size
+            )
+        else:
+            self.full_window_runs = self.train_runs
+        if not self.full_window_runs:
+            raise ValueError("Phase-D s=0 rehearsal requires a full physical window")
         self.dataset = dataset
         self.batch_size = int(batch_size)
         self.window_size = int(window_size)
@@ -1593,44 +1612,97 @@ class PhaseDStreamingBatch:
         self._target_count = 0
         self._slot_steps = 0
         self._s_counts = [0] * (2 * self.window_size + 1)
+        self._s_zero_rehearsal_steps = 0
+        self._s_zero_rehearsal_trajectories = 0
+        self._s_zero_rehearsal_length_sum = 0
+        self._s_zero_mask_counts = {name: 0 for name in MASK_PATTERNS}
+
+    @staticmethod
+    def can_advance_start(
+        start: int, slide_step: int, length: int, window_size: int = 24,
+    ) -> bool:
+        """Whether the existing boundary semantics permit one regular shift."""
+        if slide_step == 0:
+            return False
+        reached_end = (
+            start + window_size - 1 >= length - 1
+            if slide_step > 0 else start <= 0
+        )
+        next_start = start + slide_step
+        return (
+            not reached_end
+            and -(window_size - 1) <= next_start <= length - 1
+        )
 
     def reset_slot(
         self, slot: int, run_name: Optional[str] = None,
         slide_step: Optional[int] = None, window_start: Optional[int] = None,
     ) -> PhaseDTrajectory:
-        if run_name is None:
-            index = int(torch.randint(len(self.train_runs), (1,), generator=self.generator))
-            run_name = self.train_runs[index]
-        elif run_name not in self.train_runs:
-            raise ValueError(f"Phase-D slot reset requested a non-training run: {run_name}")
         if slide_step is None:
             slide_step = int(torch.randint(
                 -self.window_size, self.window_size + 1, (1,), generator=self.generator,
             ))
         if not -self.window_size <= slide_step <= self.window_size:
             raise ValueError(f"Invalid Phase-D slide step: {slide_step}")
+        if run_name is None:
+            candidates = self.full_window_runs if slide_step == 0 else self.train_runs
+            index = int(torch.randint(len(candidates), (1,), generator=self.generator))
+            run_name = candidates[index]
+        elif run_name not in self.train_runs:
+            raise ValueError(f"Phase-D slot reset requested a non-training run: {run_name}")
 
         physical = self.dataset.get_run(run_name).to(self.device, non_blocking=True)
         if physical.ndim != 4 or physical.shape[0] != 4:
             raise ValueError(f"Expected complete run shape (4,L,X,Z), got {tuple(physical.shape)}")
         target = (physical - self.mean) / (self.std + 1e-8)
         length = int(target.shape[1])
-        if slide_step > 0:
-            start = -(self.window_size - 1)
-        elif slide_step < 0:
-            start = length - 1
-        else:
+        rehearsal_length = None
+        if slide_step == 0:
+            if length < self.window_size:
+                raise ValueError(
+                    f"Phase-D s=0 rehearsal requires at least {self.window_size} "
+                    f"physical frames, got {length} for {run_name}"
+                )
             start = int(torch.randint(
-                -(self.window_size - 1), length, (1,), generator=self.generator,
+                0, length - self.window_size + 1, (1,), generator=self.generator,
             ))
+            rehearsal_length = int(torch.randint(16, 49, (1,), generator=self.generator))
+        else:
+            starts = [
+                candidate for candidate in range(-(self.window_size - 1), length)
+                if self.can_advance_start(
+                    candidate, slide_step, length, self.window_size
+                )
+            ]
+            if not starts:
+                raise ValueError(
+                    f"No Phase-D start permits a slide of {slide_step} for "
+                    f"run {run_name} with length {length}"
+                )
+            start = starts[int(torch.randint(
+                len(starts), (1,), generator=self.generator,
+            ))]
         if window_start is not None:
             start = int(window_start)
-        if slide_step == 0 and not -(self.window_size - 1) <= start <= length - 1:
-            raise ValueError(f"Invalid Phase-D refinement window start {start} for length {length}")
+        if slide_step == 0:
+            if not 0 <= start <= length - self.window_size:
+                raise ValueError(
+                    f"Invalid Phase-D rehearsal window start {start} for length {length}"
+                )
+        elif not self.can_advance_start(start, slide_step, length, self.window_size):
+            raise ValueError(
+                f"Phase-D window start {start} cannot perform a slide of "
+                f"{slide_step} for length {length}"
+            )
 
-        trajectory = PhaseDTrajectory(run_name, target, slide_step, start)
+        trajectory = PhaseDTrajectory(
+            run_name, target, slide_step, start, rehearsal_length,
+        )
         self.slots[slot] = trajectory
         self._resets += 1
+        if slide_step == 0:
+            self._s_zero_rehearsal_trajectories += 1
+            self._s_zero_rehearsal_length_sum += rehearsal_length
         return trajectory
 
     def _ensure_slots(self) -> None:
@@ -1681,6 +1753,8 @@ class PhaseDStreamingBatch:
     def make_model_input(
         self, targets: torch.Tensor, observation_mask: torch.Tensor,
         noise: Optional[torch.Tensor] = None,
+        magnetic_patterns: Optional[Sequence[str]] = None,
+        density_patterns: Optional[Sequence[str]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Create finite input values/u and reuse detached temporal overlap."""
         if noise is None:
@@ -1689,6 +1763,11 @@ class PhaseDStreamingBatch:
         input_variance = torch.ones_like(targets)
         for index, trajectory in enumerate(self.slots):
             assert trajectory is not None
+            if trajectory.slide_step == 0:
+                if magnetic_patterns is not None:
+                    trajectory.rehearsal_magnetic_pattern = magnetic_patterns[index]
+                if density_patterns is not None:
+                    trajectory.rehearsal_density_pattern = density_patterns[index]
             if trajectory.previous_mean is not None:
                 current_slice, previous_slice = self.overlap_slices(
                     trajectory.slide_step, self.window_size
@@ -1731,20 +1810,34 @@ class PhaseDStreamingBatch:
                 raise RuntimeError("Phase-D state must be detached between optimizer steps")
 
             if trajectory.slide_step == 0:
-                if trajectory.reuse_depth == 0:
+                if trajectory.rehearsal_length is None:
+                    raise RuntimeError("Phase-D s=0 trajectory has no rehearsal length")
+                self._s_zero_rehearsal_steps += 1
+                # Ordinary training draws B and Density patterns independently;
+                # the per-pattern diagnostics count both standard-mask draws.
+                for pattern in (
+                    trajectory.rehearsal_magnetic_pattern,
+                    trajectory.rehearsal_density_pattern,
+                ):
+                    if pattern is not None:
+                        if pattern not in self._s_zero_mask_counts:
+                            raise ValueError(f"Unknown Phase-D rehearsal mask: {pattern}")
+                        self._s_zero_mask_counts[pattern] += 1
+                trajectory.rehearsal_magnetic_pattern = None
+                trajectory.rehearsal_density_pattern = None
+                completed = trajectory.reuse_depth + 1
+                if completed >= trajectory.rehearsal_length:
+                    self.slots[index] = None
+                else:
                     trajectory.previous_mean = mean
                     trajectory.previous_variance = output_variance
-                    trajectory.reuse_depth = 1
-                else:
-                    self.slots[index] = None
+                    trajectory.reuse_depth = completed
                 continue
 
             length = int(trajectory.target.shape[1])
-            reached_end = (
-                trajectory.start + self.window_size - 1 >= length - 1
-                if trajectory.slide_step > 0 else trajectory.start <= 0
-            )
-            if reached_end:
+            if not self.can_advance_start(
+                trajectory.start, trajectory.slide_step, length, self.window_size
+            ):
                 self.slots[index] = None
                 continue
             trajectory.previous_mean = mean
@@ -1766,6 +1859,16 @@ class PhaseDStreamingBatch:
             "s_positive_fraction": positive / count,
             "s_negative_fraction": negative / count,
             "finite_target_fraction": self._finite_count / max(self._target_count, 1),
+            "s_zero_rehearsal_steps": self._s_zero_rehearsal_steps,
+            "s_zero_rehearsal_trajectories": self._s_zero_rehearsal_trajectories,
+            "s_zero_rehearsal_length_mean": (
+                self._s_zero_rehearsal_length_sum
+                / max(self._s_zero_rehearsal_trajectories, 1)
+            ),
+            **{
+                f"s_zero_mask_count_{name}": self._s_zero_mask_counts[name]
+                for name in MASK_PATTERNS
+            },
             "slot_steps": self._slot_steps,
             "s_counts": {
                 str(step): self._s_counts[step + self.window_size]
@@ -1774,8 +1877,35 @@ class PhaseDStreamingBatch:
         }
 
 
-def curriculum_forward_loss(model, model_input, target, mask, lambda_v, lambda_r, reuse_mask=None):
-    """One/two passes with the original balanced reconstruction MSE and FP32 NLL."""
+def phase_c_geometric_weights(lambda_r: float) -> Tuple[float, float, float]:
+    """Normalized K=2 reuse weights: 1, lambda_r, lambda_r squared."""
+    lambda_r = float(lambda_r)
+    if not math.isfinite(lambda_r) or not 0.0 <= lambda_r <= 1.0:
+        raise ValueError(f"Phase-C lambda_r must be finite and in [0,1], got {lambda_r}")
+    normalizer = 1.0 + lambda_r + lambda_r ** 2
+    return 1.0 / normalizer, lambda_r / normalizer, lambda_r ** 2 / normalizer
+
+
+def make_phase_c_reuse_input(
+    target: torch.Tensor,
+    prediction: torch.Tensor,
+    output_variance: torch.Tensor,
+    observation_mask: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Reuse detached same-window state; a fresh mask supplies exact observations."""
+    exact = observation_mask > 0.5
+    values = torch.where(exact, target, prediction.detach())
+    input_variance = torch.where(
+        exact, torch.zeros_like(target), output_variance.detach(),
+    )
+    return torch.cat([values, input_variance], dim=1), observation_mask
+
+
+def curriculum_forward_loss(
+    model, model_input, target, mask, lambda_v, lambda_r, reuse_masks=None,
+):
+    """Phase A/B pass or Phase-C K=2 detached reuse with geometric weighting."""
+    weights = phase_c_geometric_weights(lambda_r)
     pred, variance = model(model_input, detach_variance_features=True)
     mu_loss = full_mse_loss(pred, target, mask)
     var_loss = (predicted_error_mse_loss(variance, pred, target, "gaussian_nll")
@@ -1783,20 +1913,48 @@ def curriculum_forward_loss(model, model_input, target, mask, lambda_v, lambda_r
     check_stage1(torch.isfinite(pred).all() & torch.isfinite(variance).all() & (variance > 0).all()
                  & torch.isfinite(mu_loss) & (mu_loss <= 100) & torch.isfinite(var_loss),
                  "Invalid curriculum first-pass prediction/variance/loss or catastrophic reconstruction MSE (>100)")
-    loss = mu_loss + lambda_v * var_loss
-    components = {"L_mu_1": mu_loss, "L_var_1": var_loss, "forwards": 1}
+    pass_losses = [mu_loss + lambda_v * var_loss]
+    zero = mu_loss.new_zeros(())
+    components = {
+        "L_mu_0": mu_loss, "L_var_0": var_loss,
+        "L_mu_1": zero, "L_var_1": zero,
+        "L_mu_2": zero, "L_var_2": zero,
+        "reuse_weight_0": mu_loss.new_tensor(weights[0]),
+        "reuse_weight_1": mu_loss.new_tensor(weights[1]),
+        "reuse_weight_2": mu_loss.new_tensor(weights[2]),
+        "forwards": 1,
+    }
     if lambda_r > 0:
-        if reuse_mask is None:
-            raise ValueError("Positive rollout weight requires a new mask")
-        second_input, exact_mask = make_rollout_input(target, pred, variance, mask, reuse_mask)
-        pred2, variance2 = model(second_input, detach_variance_features=True)
-        mu_loss2 = full_mse_loss(pred2, target, exact_mask)
-        var_loss2 = predicted_error_mse_loss(variance2, pred2, target, "gaussian_nll")
-        check_stage1(torch.isfinite(pred2).all() & torch.isfinite(variance2).all() & (variance2 > 0).all()
-                     & torch.isfinite(mu_loss2) & (mu_loss2 <= 100) & torch.isfinite(var_loss2),
-                     "Invalid curriculum second-pass prediction/variance/loss or catastrophic reconstruction MSE (>100)")
-        loss = loss + lambda_r * (mu_loss2 + lambda_v * var_loss2)
-        components.update(L_mu_2=mu_loss2, L_var_2=var_loss2, forwards=2)
+        if reuse_masks is None or len(reuse_masks) != 2:
+            raise ValueError("Positive Phase-C rollout weight requires exactly two new masks")
+        previous_mean, previous_variance = pred, variance
+        for pass_index, reuse_mask in enumerate(reuse_masks, 1):
+            reuse_input, exact_mask = make_phase_c_reuse_input(
+                target, previous_mean, previous_variance, reuse_mask,
+            )
+            next_mean, next_variance = model(
+                reuse_input, detach_variance_features=True,
+            )
+            next_mu_loss = full_mse_loss(next_mean, target, exact_mask)
+            next_var_loss = predicted_error_mse_loss(
+                next_variance, next_mean, target, "gaussian_nll",
+            )
+            check_stage1(
+                torch.isfinite(next_mean).all()
+                & torch.isfinite(next_variance).all()
+                & (next_variance > 0).all()
+                & torch.isfinite(next_mu_loss)
+                & (next_mu_loss <= 100)
+                & torch.isfinite(next_var_loss),
+                f"Invalid curriculum pass-{pass_index} prediction/variance/loss "
+                "or catastrophic reconstruction MSE (>100)",
+            )
+            components[f"L_mu_{pass_index}"] = next_mu_loss
+            components[f"L_var_{pass_index}"] = next_var_loss
+            pass_losses.append(next_mu_loss + lambda_v * next_var_loss)
+            previous_mean, previous_variance = next_mean, next_variance
+        components["forwards"] = 3
+    loss = sum(weight * pass_loss for weight, pass_loss in zip(weights, pass_losses))
     components["total_loss"] = loss
     return loss, pred, variance, components
 
@@ -1885,7 +2043,7 @@ def train_one_epoch(
     scale_start = scaler.get_scale()
     gradient_norm_sum = torch.zeros((), device=device, dtype=torch.float64)
     gradient_norm_max = torch.zeros_like(gradient_norm_sum)
-    curriculum_totals = (torch.zeros(8, device=device, dtype=torch.float64)
+    curriculum_totals = (torch.zeros(15, device=device, dtype=torch.float64)
                          if curriculum_state is not None else None)
     lambda_start = lambda_end = None
     phase_d_active = phase_d_stream is not None
@@ -1938,7 +2096,10 @@ def train_one_epoch(
             magnetic_zero_sample_count += int(count == 0)
             magnetic_full_sample_count += int(count == spatial_sites)
         if phase_d_active:
-            model_input, mask = phase_d_stream.make_model_input(y, mask)
+            model_input, mask = phase_d_stream.make_model_input(
+                y, mask, magnetic_patterns=magnetic_patterns,
+                density_patterns=density_patterns,
+            )
             input_variance = model_input[:, 4:]
         elif uncertainty_aware:
             input_variance = 1.0 - mask
@@ -1964,10 +2125,13 @@ def train_one_epoch(
             lambda_start = lambda_start or (lambda_v, lambda_r)
             lambda_end = (lambda_v, lambda_r)
             # Phase D is already a recursive state, so it performs one forward.
-            reuse_mask = (sample_training_mask(
-                y, pattern_weights, density_visible_p_zero, density_visible_p_full,
-                magnetic_visible_p_zero, magnetic_visible_p_full)[0]
-                if lambda_r > 0 and not phase_d_active else None)
+            reuse_masks = (tuple(
+                sample_training_mask(
+                    y, pattern_weights, density_visible_p_zero, density_visible_p_full,
+                    magnetic_visible_p_zero, magnetic_visible_p_full,
+                )[0]
+                for _ in range(2)
+            ) if lambda_r > 0 and not phase_d_active else None)
 
         with torch.cuda.amp.autocast(enabled=(amp and device.type == "cuda"), dtype=amp_dtype):
             if phase_d_active:
@@ -1985,8 +2149,9 @@ def train_one_epoch(
                 }
             elif curriculum_state is not None:
                 loss, pred, output_variance, components = curriculum_forward_loss(
-                    model, model_input, y, mask, lambda_v, lambda_r, reuse_mask)
-                reconstruction_loss, variance_loss = components["L_mu_1"], components["L_var_1"]
+                    model, model_input, y, mask, lambda_v, lambda_r, reuse_masks)
+                reconstruction_loss = components["L_mu_0"]
+                variance_loss = components["L_var_0"]
             else:
                 pred = model(model_input)
                 if uncertainty_aware:
@@ -2035,12 +2200,24 @@ def train_one_epoch(
             coordinate = curriculum_state["successful_optimizer_steps"]
             curriculum_state["successful_optimizer_steps"] += applied
             with torch.no_grad():
+                component_zero = loss.new_zeros(())
+                mu_0 = components.get("L_mu_0", components.get("L_mu_1", component_zero))
+                var_0 = components.get("L_var_0", components.get("L_var_1", component_zero))
+                # Preserve Phase-D's existing single-forward L_mu_1/L_var_1
+                # diagnostics while also exposing that loss as pass 0.
+                mu_1 = components.get("L_mu_1", component_zero)
+                var_1 = components.get("L_var_1", component_zero)
                 curriculum_totals += torch.stack([
-                    components["L_mu_1"], components["L_var_1"],
-                    components.get("L_mu_2", loss.new_zeros(())),
-                    components.get("L_var_2", loss.new_zeros(())), loss,
+                    mu_0, var_0, mu_1, var_1,
+                    components.get("L_mu_2", component_zero),
+                    components.get("L_var_2", component_zero), loss,
                     loss.new_tensor(lambda_v), loss.new_tensor(lambda_r),
+                    components.get("reuse_weight_0", loss.new_tensor(1.0)),
+                    components.get("reuse_weight_1", component_zero),
+                    components.get("reuse_weight_2", component_zero),
+                    loss.new_tensor(components["forwards"]),
                     loss.new_tensor(components["forwards"] == 2),
+                    loss.new_tensor(components["forwards"] == 3),
                 ]).detach().double()
             if step % curriculum_log_every == 0 or step + 1 == len(loader):
                 region = ("D" if phase_d_active else
@@ -2198,9 +2375,14 @@ def train_one_epoch(
     if curriculum_state is not None:
         if distributed_is_initialized():
             dist.all_reduce(curriculum_totals, op=dist.ReduceOp.SUM)
-        names = ("L_mu_1", "L_var_1", "L_mu_2", "L_var_2", "total_loss",
-                 "lambda_v_mean", "lambda_r_mean", "two_forward_fraction")
+        names = (
+            "L_mu_0", "L_var_0", "L_mu_1", "L_var_1", "L_mu_2", "L_var_2",
+            "total_loss", "lambda_v_mean", "lambda_r_mean",
+            "reuse_weight_0", "reuse_weight_1", "reuse_weight_2",
+            "phase_c_forwards", "two_forward_fraction", "three_forward_fraction",
+        )
         metrics["curriculum"] = dict(zip(names, (curriculum_totals / max(global_batches, 1)).cpu().tolist()))
+        metrics["curriculum"]["lambda_r"] = metrics["curriculum"]["lambda_r_mean"]
         metrics["curriculum"].update(lambda_v_start=lambda_start[0], lambda_r_start=lambda_start[1],
                                      lambda_v_end=lambda_end[0], lambda_r_end=lambda_end[1],
                                      successful_optimizer_steps=curriculum_state["successful_optimizer_steps"])
@@ -2219,6 +2401,11 @@ def train_one_epoch(
             local["finite_target_fraction"] * count,
             count,
             *[local["s_counts"][str(step)] for step in range(-24, 25)],
+            local["s_zero_rehearsal_steps"],
+            local["s_zero_rehearsal_trajectories"],
+            (local["s_zero_rehearsal_length_mean"]
+             * local["s_zero_rehearsal_trajectories"]),
+            *[local[f"s_zero_mask_count_{name}"] for name in MASK_PATTERNS],
         ], dtype=torch.float64, device=device)
         reuse_max = torch.tensor(local["reuse_depth_max"], device=device, dtype=torch.int64)
         if distributed_is_initialized():
@@ -2226,6 +2413,8 @@ def train_one_epoch(
             dist.all_reduce(reuse_max, op=dist.ReduceOp.MAX)
         values = sums.cpu().tolist()
         global_slot_steps = max(values[9], 1.0)
+        rehearsal_offset = 10 + 2 * 24 + 1
+        rehearsal_trajectories = values[rehearsal_offset + 1]
         metrics["phase_d"] = {
             "s_mean": values[0] / global_slot_steps,
             "abs_s_mean": values[1] / global_slot_steps,
@@ -2237,6 +2426,15 @@ def train_one_epoch(
             "s_positive_fraction": values[6] / global_slot_steps,
             "s_negative_fraction": values[7] / global_slot_steps,
             "finite_target_fraction": values[8] / global_slot_steps,
+            "s_zero_rehearsal_steps": int(values[rehearsal_offset]),
+            "s_zero_rehearsal_trajectories": int(rehearsal_trajectories),
+            "s_zero_rehearsal_length_mean": (
+                values[rehearsal_offset + 2] / max(rehearsal_trajectories, 1.0)
+            ),
+            **{
+                f"s_zero_mask_count_{name}": int(values[rehearsal_offset + 3 + index])
+                for index, name in enumerate(MASK_PATTERNS)
+            },
             "s_counts": {
                 str(step): int(values[10 + step + 24]) for step in range(-24, 25)
             },
@@ -2355,17 +2553,27 @@ def validate(
                     variance_loss = (predicted_error_mse_loss(output_variance, pred, y, objective=uncertainty_loss)
                                      if stage1 else predicted_error_mse_loss(output_variance, pred, y))
                 if rollout_validation:
-                    reuse_mask, _ = make_fixed_validation_mask(
+                    reuse_mask_1, _ = make_fixed_validation_mask(
                         rollout_validation_reuse_pattern(pattern), y.shape,
                         device=device, dtype=y.dtype,
                     )
-                    second_input, exact_mask = make_rollout_input(
-                        y, pred, output_variance, mask, reuse_mask,
+                    second_input, exact_mask_1 = make_phase_c_reuse_input(
+                        y, pred, output_variance, reuse_mask_1,
                     )
                     pred2, variance2 = model(second_input, detach_variance_features=True)
-                    rollout_mse = full_mse_loss(pred2, y, exact_mask)
+                    reuse_mask_2, _ = make_fixed_validation_mask(
+                        rollout_validation_reuse_pattern(
+                            rollout_validation_reuse_pattern(pattern)
+                        ),
+                        y.shape, device=device, dtype=y.dtype,
+                    )
+                    third_input, exact_mask_2 = make_phase_c_reuse_input(
+                        y, pred2, variance2, reuse_mask_2,
+                    )
+                    pred3, variance3 = model(third_input, detach_variance_features=True)
+                    rollout_mse = full_mse_loss(pred3, y, exact_mask_2)
                     rollout_nll = predicted_error_mse_loss(
-                        variance2, pred2, y, objective="gaussian_nll",
+                        variance3, pred3, y, objective="gaussian_nll",
                     )
 
             if stage1:
@@ -2380,6 +2588,8 @@ def validate(
                     check_stage1(
                         torch.isfinite(second_input).all() & torch.isfinite(pred2).all()
                         & torch.isfinite(variance2).all() & (variance2 > 0).all()
+                        & torch.isfinite(third_input).all() & torch.isfinite(pred3).all()
+                        & torch.isfinite(variance3).all() & (variance3 > 0).all()
                         & torch.isfinite(rollout_mse) & (rollout_mse <= 100)
                         & torch.isfinite(rollout_nll),
                         f"Invalid rollout validation values or catastrophic reconstruction MSE (>100): "

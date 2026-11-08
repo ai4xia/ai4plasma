@@ -106,7 +106,7 @@ def test_phase_d_finite_target_losses_exclude_nan_before_arithmetic():
 def test_phase_d_positive_and_zero_overlap_input_construction():
     stream = _phase_d_stream()
     name = stream.train_runs[0]
-    trajectory = stream.reset_slot(0, name, slide_step=1)
+    trajectory = stream.reset_slot(0, name, slide_step=1, window_start=-23)
     assert trajectory.start == -23
     target, _ = stream.current_targets()
     finite_times = torch.isfinite(target[0, 0, :, 0, 0]).nonzero().flatten().tolist()
@@ -132,7 +132,7 @@ def test_phase_d_positive_and_zero_overlap_input_construction():
     assert exact[:, :, 22].all() and (inputs[:, 4:, 22] == 0).all()
 
     zero_overlap = _phase_d_stream()
-    zero_overlap.reset_slot(0, name, slide_step=24)
+    zero_overlap.reset_slot(0, name, slide_step=24, window_start=-23)
     first, _ = zero_overlap.current_targets()
     zero_overlap.advance(torch.full_like(first, 9.0), torch.full_like(first, 4.0))
     assert zero_overlap.slots[0].start == 1
@@ -150,7 +150,9 @@ def test_phase_d_negative_sliding_is_exact_mirror():
     stream = _phase_d_stream()
     name = stream.train_runs[0]
     length = stream.dataset.runs[name].shape[1]
-    trajectory = stream.reset_slot(0, name, slide_step=-1)
+    trajectory = stream.reset_slot(
+        0, name, slide_step=-1, window_start=length - 1,
+    )
     assert trajectory.start == length - 1
     target, _ = stream.current_targets()
     assert torch.isfinite(target[0, 0, :, 0, 0]).nonzero().flatten().tolist() == [0]
@@ -164,7 +166,9 @@ def test_phase_d_negative_sliding_is_exact_mirror():
     assert (inputs[:, :4, 1:] == 6).all() and (inputs[:, 4:, 1:] == 3).all()
 
     zero_overlap = _phase_d_stream()
-    zero_overlap.reset_slot(0, name, slide_step=-24)
+    zero_overlap.reset_slot(
+        0, name, slide_step=-24, window_start=length - 1,
+    )
     first, _ = zero_overlap.current_targets()
     zero_overlap.advance(torch.full_like(first, 8.0), torch.full_like(first, 5.0))
     assert zero_overlap.slots[0].start == length - 25
@@ -175,28 +179,125 @@ def test_phase_d_negative_sliding_is_exact_mirror():
     assert (inputs[:, :4] == -3).all() and (inputs[:, 4:] == 1).all()
 
 
-def test_phase_d_zero_step_range_refines_once_then_resets():
+def test_phase_d_zero_step_uses_full_windows_and_exact_sampled_length():
     stream = _phase_d_stream()
     name = stream.train_runs[0]
     length = stream.dataset.runs[name].shape[1]
-    finite_counts = set()
-    for start in range(-23, length):
-        stream.reset_slot(0, name, slide_step=0, window_start=start)
+    starts, lengths = set(), set()
+    for _ in range(200):
+        trajectory = stream.reset_slot(0, name, slide_step=0)
+        starts.add(trajectory.start)
+        lengths.add(trajectory.rehearsal_length)
         target, _ = stream.current_targets()
-        finite_counts.add(int(torch.isfinite(target[0, 0, :, 0, 0]).sum()))
-    assert finite_counts == set(range(1, 25))
+        assert torch.isfinite(target).all()
+    assert min(starts) >= 0 and max(starts) <= length - 24
+    assert min(lengths) >= 16 and max(lengths) <= 48
+    assert len(lengths) > 1
+    with pytest.raises(ValueError, match="Invalid Phase-D rehearsal window start"):
+        stream.reset_slot(0, name, slide_step=0, window_start=-1)
+    with pytest.raises(ValueError, match="Invalid Phase-D rehearsal window start"):
+        stream.reset_slot(0, name, slide_step=0, window_start=length - 23)
 
-    stream.reset_slot(0, name, slide_step=0, window_start=-10)
+    trajectory = stream.reset_slot(0, name, slide_step=0, window_start=2)
+    rehearsal_length = trajectory.rehearsal_length
     target, _ = stream.current_targets()
-    prediction = torch.full_like(target, 4.0, requires_grad=True)
-    variance = torch.full_like(target, 2.5, requires_grad=True)
-    stream.advance(prediction, variance)
-    assert stream.slots[0].start == -10 and stream.slots[0].reuse_depth == 1
+    for update in range(rehearsal_length):
+        prediction = torch.full_like(target, 4.0, requires_grad=True)
+        variance = torch.full_like(target, 2.5, requires_grad=True)
+        stream.advance(prediction, variance)
+        if update + 1 < rehearsal_length:
+            assert stream.slots[0] is trajectory
+            assert trajectory.reuse_depth == update + 1
+            assert trajectory.previous_mean.grad_fn is None
+            assert trajectory.previous_variance.grad_fn is None
+        else:
+            assert stream.slots[0] is None
+
+
+def test_phase_d_zero_step_selects_only_runs_with_full_physical_windows():
+    dataset = _PhaseDRunDataset(lengths=(8, 30))
+    stream = _phase_d_stream(dataset)
+    assert stream.full_window_runs == (dataset.names[1],)
+    for _ in range(20):
+        trajectory = stream.reset_slot(0, slide_step=0)
+        assert trajectory.run_name == dataset.names[1]
+        target, _ = stream.current_targets()
+        assert torch.isfinite(target).all()
+    with pytest.raises(ValueError, match="requires at least 24 physical frames"):
+        stream.reset_slot(0, dataset.names[0], slide_step=0)
+
+
+def test_phase_d_zero_step_reuses_detached_state_and_new_exact_observations():
+    stream = _phase_d_stream()
+    name = stream.train_runs[0]
+    trajectory = stream.reset_slot(0, name, slide_step=0, window_start=0)
+    trajectory.rehearsal_length = 16
     target, _ = stream.current_targets()
-    inputs, _ = stream.make_model_input(target, torch.zeros_like(target))
-    assert (inputs[:, :4] == 4).all() and (inputs[:, 4:] == 2.5).all()
+    first_mask = torch.zeros_like(target)
+    first_mask[:, :, :, 0, 0] = 1
+    first_input, first_exact = stream.make_model_input(
+        target, first_mask, torch.full_like(target, -7.0),
+        magnetic_patterns=["spatial_random"],
+        density_patterns=["temporal_block"],
+    )
+    first_exact = first_exact.bool()
+    assert first_exact.any()
+    assert (first_input[:, :4][first_exact] == target[first_exact]).all()
+    assert (first_input[:, 4:][first_exact] == 0).all()
+    assert (first_input[:, :4][~first_exact] == -7).all()
+    stream.advance(
+        torch.full_like(target, 4.0, requires_grad=True),
+        torch.full_like(target, 2.5, requires_grad=True),
+    )
+    assert trajectory.previous_mean.grad_fn is None
+    assert trajectory.previous_variance.grad_fn is None
+
+    second_mask = torch.zeros_like(target)
+    second_mask[:, :, :, 1, 1] = 1
+    second_input, second_exact = stream.make_model_input(
+        target, second_mask, torch.full_like(target, 99.0),
+        magnetic_patterns=["spatial_grid"],
+        density_patterns=["temporal_random"],
+    )
+    second_exact = second_exact.bool()
+    unknown = ~second_exact
+    assert (second_input[:, :4][unknown] == 4).all()
+    assert (second_input[:, 4:][unknown] == 2.5).all()
+    assert (second_input[:, :4][second_exact] == target[second_exact]).all()
+    assert (second_input[:, 4:][second_exact] == 0).all()
+    assert not (second_input[:, :4][unknown] == 99).any()
     stream.advance(torch.zeros_like(target), torch.ones_like(target))
-    assert stream.slots[0] is None
+    local = stream.local_epoch_metrics()
+    assert local["s_zero_rehearsal_steps"] == 2
+    assert local["s_zero_mask_count_spatial_random"] == 1
+    assert local["s_zero_mask_count_spatial_grid"] == 1
+    assert local["s_zero_mask_count_temporal_random"] == 1
+    assert local["s_zero_mask_count_temporal_block"] == 1
+
+
+def test_phase_d_nonzero_start_sampling_permits_at_least_one_slide():
+    stream = _phase_d_stream()
+    name = stream.train_runs[0]
+    length = stream.dataset.runs[name].shape[1]
+    positive, negative = set(), set()
+    for _ in range(200):
+        for step, seen in (
+            (1, positive), (-1, negative), (24, positive), (-24, negative),
+        ):
+            trajectory = stream.reset_slot(0, name, slide_step=step)
+            seen.add(trajectory.start)
+            assert -23 <= trajectory.start <= length - 1
+            assert stream.can_advance_start(trajectory.start, step, length)
+            old_start = trajectory.start
+            target, _ = stream.current_targets()
+            stream.advance(torch.zeros_like(target), torch.ones_like(target))
+            assert stream.slots[0].start == old_start + step
+    assert min(positive) < 0
+    assert max(negative) > length - 24
+    with pytest.raises(ValueError, match="cannot perform a slide"):
+        stream.reset_slot(0, name, slide_step=1, window_start=length - 24)
+    with pytest.raises(ValueError, match="cannot perform a slide"):
+        stream.reset_slot(0, name, slide_step=-1, window_start=0)
 
 
 class _TinyPhaseDModel(torch.nn.Module):
@@ -220,6 +321,7 @@ def test_phase_d_streaming_optimizer_smoke_all_slide_cases_and_independent_slots
     stream = _phase_d_stream(dataset, batch_size=5)
     for slot, slide_step in enumerate((-24, -1, 0, 1, 24)):
         stream.reset_slot(slot, dataset.names[slot % 2], slide_step=slide_step)
+    stream.slots[2].rehearsal_length = 20
     assert len({slot.run_name for slot in stream.slots}) == 2
     assert {slot.slide_step for slot in stream.slots} == {-24, -1, 0, 1, 24}
 
@@ -233,21 +335,32 @@ def test_phase_d_streaming_optimizer_smoke_all_slide_cases_and_independent_slots
     ))()
     state = make_curriculum_state(args, updates_per_epoch=1)
     state["successful_optimizer_steps"] = 2
+    torch.manual_seed(1234)
     metrics = train_one_epoch(
-        model, [None, None, None], optimizer, torch.device("cpu"),
+        model, [None] * 20, optimizer, torch.device("cpu"),
         torch.zeros(1, 4, 1, 1, 1), torch.ones(1, 4, 1, 1, 1),
-        {"spatial_random": 1.0}, .05, .05, .05, .05, False, 1.0,
+        {name: 1.0 for name in MASK_PATTERNS}, .05, .05, .05, .05, False, 1.0,
         uncertainty_aware=True, uncertainty_loss="gaussian_nll",
         curriculum_state=state, phase_d_stream=stream,
     )
-    assert metrics["optimizer_updates"] == 3 and metrics["amp_skipped_steps"] == 0
+    assert metrics["optimizer_updates"] == 20 and metrics["amp_skipped_steps"] == 0
+    assert stream.slots[2] is None  # the forced K=20 rehearsal reset exactly here
     assert not torch.equal(model.mean.weight, before)
     assert torch.isfinite(torch.tensor(metrics["mse"]))
     assert metrics["curriculum"]["two_forward_fraction"] == 0
+    assert metrics["curriculum"]["L_mu_1"] == pytest.approx(metrics["mse"])
+    assert metrics["curriculum"]["L_mu_0"] == pytest.approx(metrics["mse"])
     assert metrics["phase_d"]["finite_target_fraction"] < 1
     assert metrics["phase_d"]["reuse_depth_max"] >= 1
     assert all(metrics["phase_d"]["s_counts"][str(step)] > 0
                for step in (-24, -1, 0, 1, 24))
+    assert metrics["phase_d"]["s_zero_rehearsal_steps"] >= 20
+    mask_counts = [
+        metrics["phase_d"][f"s_zero_mask_count_{name}"]
+        for name in MASK_PATTERNS
+    ]
+    assert sum(mask_counts) == 2 * metrics["phase_d"]["s_zero_rehearsal_steps"]
+    assert sum(count > 0 for count in mask_counts) > 1
     assert all(torch.isfinite(inputs).all() for inputs in model.seen_inputs)
     assert any((inputs[:, 4:] > 1).any() for inputs in model.seen_inputs[1:])
     assert all(slot is None or slot.previous_mean is None
@@ -758,10 +871,23 @@ def test_curriculum_rollout_input_exact_reuse_noise_and_detach(reused_variance):
     assert torch.equal(exact, observed * available)
 
 
-@pytest.mark.parametrize("lambda_v,lambda_r,forwards", [(0., 0., 1), (.3, 0., 1), (1., .4, 2)])
+@pytest.mark.parametrize(
+    "lambda_r,expected",
+    [
+        (0.0, (1.0, 0.0, 0.0)),
+        (0.5, (1.0 / 1.75, 0.5 / 1.75, 0.25 / 1.75)),
+        (1.0, (1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0)),
+    ],
+)
+def test_phase_c_k2_geometric_weights(lambda_r, expected):
+    from train_masked_unet3d import phase_c_geometric_weights
+    assert phase_c_geometric_weights(lambda_r) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("lambda_v,lambda_r,forwards", [(0., 0., 1), (.3, 0., 1), (1., .4, 3)])
 @pytest.mark.parametrize("architecture", [MODEL_VERSION, DIRECT_MODEL_VERSION])
 def test_curriculum_phases_formula_and_gradient_routing(lambda_v, lambda_r, forwards, monkeypatch, architecture):
-    from train_masked_unet3d import curriculum_forward_loss
+    from train_masked_unet3d import curriculum_forward_loss, phase_c_geometric_weights
     if lambda_v == 0:
         monkeypatch.setattr("train_masked_unet3d.predicted_error_mse_loss",
                             lambda *a, **kw: pytest.fail("Phase A must not compute a variance loss"))
@@ -775,27 +901,37 @@ def test_curriculum_phases_formula_and_gradient_routing(lambda_v, lambda_r, forw
             tensor.retain_grad()
         outputs.append(out)
     hook = model.register_forward_hook(record)
-    reuse = torch.randint(2, truth.shape).float() if lambda_r else None
+    reuse = tuple(torch.randint(2, truth.shape).float() for _ in range(2)) if lambda_r else None
     loss, pred, variance, parts = curriculum_forward_loss(model, inputs, truth, mask, lambda_v, lambda_r, reuse)
     assert len(outputs) == parts["forwards"] == forwards
     assert variance.min() > 0 and torch.isfinite(variance).all()
-    torch.testing.assert_close(parts["L_mu_1"], full_mse_loss(pred, truth, mask))
-    expected = parts["L_mu_1"] + lambda_v * parts["L_var_1"]
+    torch.testing.assert_close(parts["L_mu_0"], full_mse_loss(pred, truth, mask))
+    pass_losses = [parts[f"L_mu_{index}"] + lambda_v * parts[f"L_var_{index}"]
+                   for index in range(3)]
+    weights = phase_c_geometric_weights(lambda_r)
+    expected = sum(weight * value for weight, value in zip(weights, pass_losses))
+    for index, weight in enumerate(weights):
+        assert parts[f"reuse_weight_{index}"].item() == pytest.approx(weight)
     if lambda_r:
-        expected = expected + lambda_r * (parts["L_mu_2"] + lambda_v * parts["L_var_2"])
-        # Backward of pass two alone cannot reach either first-pass output.
-        (parts["L_mu_2"] + parts["L_var_2"]).backward(retain_graph=True)
+        # Backward of either reuse pass cannot reach an earlier pass output.
+        (parts["L_mu_1"] + parts["L_var_1"]).backward(retain_graph=True)
         assert pred.grad is None and variance.grad is None
         model.zero_grad(set_to_none=True)
-    torch.testing.assert_close(loss, expected)  # No weight-sum normalization.
+        for output in outputs:
+            for tensor in output:
+                tensor.grad = None
+        (parts["L_mu_2"] + parts["L_var_2"]).backward(retain_graph=True)
+        assert all(tensor.grad is None for tensor in outputs[0] + outputs[1])
+        model.zero_grad(set_to_none=True)
+    torch.testing.assert_close(loss, expected)
     if lambda_v:
-        parts["L_var_1"].backward(retain_graph=True)
+        parts["L_var_0"].backward(retain_graph=True)
         assert model.variance_out.weight.grad.abs().sum() > 0
         assert model.out.weight.grad is None
         assert all(p.grad is None for n, p in model.named_parameters() if not n.startswith("variance_out."))
         model.zero_grad(set_to_none=True)
     else:
-        assert parts["L_var_1"].item() == 0
+        assert parts["L_var_0"].item() == 0
     loss.backward()
     assert model.out.weight.grad.abs().sum() > 0
     assert all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters())
@@ -812,7 +948,7 @@ def test_curriculum_phases_formula_and_gradient_routing(lambda_v, lambda_r, forw
 
 
 @pytest.mark.parametrize("bf16", [False, True])
-def test_direct_two_pass_optimization_preserves_gaussian_inputs_and_raw_variance(monkeypatch, bf16):
+def test_direct_three_pass_optimization_preserves_reuse_and_raw_variance(monkeypatch, bf16):
     from train_masked_unet3d import curriculum_forward_loss
 
     model = UNet3D(base_channels=2, channel_mults=(1, 2, 4), use_attention=True,
@@ -822,9 +958,11 @@ def test_direct_two_pass_optimization_preserves_gaussian_inputs_and_raw_variance
         model.variance_out.bias.fill_(torch.log(torch.expm1(torch.tensor(1.5))).item())
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5)
     target = torch.randn(1, 4, 4, 8, 8)
-    observed, reuse = torch.zeros_like(target), torch.zeros_like(target)
+    observed = torch.zeros_like(target)
     observed[..., ::2] = 1
-    reuse[..., :4] = 1
+    reuse_1, reuse_2 = torch.zeros_like(target), torch.zeros_like(target)
+    reuse_1[..., :4] = 1
+    reuse_2[..., 4:] = 1
     draw_noise, noises, inputs, outputs = torch.randn_like, [], [], []
 
     def record_noise(values):
@@ -837,34 +975,91 @@ def test_direct_two_pass_optimization_preserves_gaussian_inputs_and_raw_variance
     post = model.register_forward_hook(lambda m, a, out: outputs.append(out))
     model_input = torch.cat([make_uncertain_input(target, 1 - observed), 1 - observed], dim=1)
     with torch.autocast("cpu", dtype=torch.bfloat16, enabled=bf16):
-        loss, _, _, parts = curriculum_forward_loss(model, model_input, target, observed, 1., 1., reuse)
+        loss, _, _, parts = curriculum_forward_loss(
+            model, model_input, target, observed, 1., 1., (reuse_1, reuse_2),
+        )
     pre.remove()
     post.remove()
-    assert len(inputs) == len(outputs) == len(noises) == 2
-    first, second = inputs[0][0], inputs[1][0]
-    exact, retained, unknown = (observed * reuse).bool(), ((1 - observed) * reuse).bool(), (1 - reuse).bool()
-    assert not inputs[1][1]  # No BPTT through either first-pass output.
+    assert len(inputs) == len(outputs) == 3
+    assert len(noises) == 1  # Gaussian initialization occurs only in pass 0.
+    first, second, third = (entry[0] for entry in inputs)
+    assert not inputs[1][1] and not inputs[2][1]
     assert torch.equal(first[:, 4:], 1 - observed)
     assert torch.equal(first[:, :4][observed.bool()], target[observed.bool()])
     assert torch.equal(first[:, :4][~observed.bool()], noises[0][~observed.bool()])
     assert torch.count_nonzero(first[:, :4][~observed.bool()]) > 0
-    assert torch.equal(second[:, :4][exact], target[exact]) and (second[:, 4:][exact] == 0).all()
-    torch.testing.assert_close(second[:, :4][retained], outputs[0][0].float()[retained], rtol=0, atol=0)
-    torch.testing.assert_close(second[:, 4:][retained], outputs[0][1].float()[retained], rtol=0, atol=0)
-    assert (second[:, 4:][retained] > 1).all()
-    assert torch.equal(second[:, :4][unknown], noises[1][unknown]) and (second[:, 4:][unknown] == 1).all()
+    assert torch.equal(second[:, :4][reuse_1.bool()], target[reuse_1.bool()])
+    assert (second[:, 4:][reuse_1.bool()] == 0).all()
+    torch.testing.assert_close(second[:, :4][~reuse_1.bool()], outputs[0][0].float()[~reuse_1.bool()], rtol=0, atol=0)
+    torch.testing.assert_close(second[:, 4:][~reuse_1.bool()], outputs[0][1].float()[~reuse_1.bool()], rtol=0, atol=0)
+    assert (second[:, 4:][~reuse_1.bool()] > 1).all()
+    assert torch.equal(third[:, :4][reuse_2.bool()], target[reuse_2.bool()])
+    assert (third[:, 4:][reuse_2.bool()] == 0).all()
+    torch.testing.assert_close(third[:, :4][~reuse_2.bool()], outputs[1][0].float()[~reuse_2.bool()], rtol=0, atol=0)
+    torch.testing.assert_close(third[:, 4:][~reuse_2.bool()], outputs[1][1].float()[~reuse_2.bool()], rtol=0, atol=0)
+    assert (third[:, 4:][~reuse_2.bool()] > 1).all()
     for mean, variance in outputs:
         assert mean.shape == variance.shape == target.shape
         assert torch.isfinite(mean).all() and torch.isfinite(variance).all() and (variance > 0).all()
         assert mean.dtype == (torch.bfloat16 if bf16 else torch.float32)
-    assert torch.isfinite(loss) and all(torch.isfinite(parts[k]) for k in ("L_mu_1", "L_var_1", "L_mu_2", "L_var_2"))
-    assert parts["L_var_1"].dtype == parts["L_var_2"].dtype == torch.float32
+    assert torch.isfinite(loss) and all(
+        torch.isfinite(parts[f"L_{kind}_{index}"])
+        for kind in ("mu", "var") for index in range(3)
+    )
+    assert all(parts[f"L_var_{index}"].dtype == torch.float32 for index in range(3))
     loss.backward()
     assert all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters())
     before = model.out.weight.detach().clone()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
     optimizer.step()
     assert not torch.equal(model.out.weight, before)
+
+
+def test_phase_c_resamples_two_masks_and_uses_one_optimizer_update(monkeypatch):
+    from types import SimpleNamespace
+    import train_masked_unet3d as train
+
+    original_sampler = train.sample_training_mask
+    sampled_masks = []
+
+    def record_sampler(*args, **kwargs):
+        result = original_sampler(*args, **kwargs)
+        sampled_masks.append(result[0].detach().clone())
+        return result
+
+    monkeypatch.setattr(train, "sample_training_mask", record_sampler)
+    model = UNet3D(
+        base_channels=2, channel_mults=(1, 2, 4),
+        uncertainty_aware=True, architecture=DIRECT_MODEL_VERSION,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5)
+    args = SimpleNamespace(
+        variance_ramp_start_epoch=0.0, variance_ramp_epochs=1.0,
+        rollout_ramp_start_epoch=1.0, rollout_ramp_epochs=1.0,
+        arm_variance_ramp=False, arm_rollout_ramp=False,
+    )
+    state = make_curriculum_state(args, updates_per_epoch=1)
+    state["successful_optimizer_steps"] = 2
+    metrics = train_one_epoch(
+        model, [{"block": torch.randn(1, 4, 4, 4, 4)}], optimizer,
+        torch.device("cpu"), torch.zeros(1, 4, 1, 1, 1),
+        torch.ones(1, 4, 1, 1, 1), {name: 1.0 for name in MASK_PATTERNS},
+        .05, .05, .05, .05, False, 1.0,
+        uncertainty_aware=True, uncertainty_loss="gaussian_nll",
+        curriculum_state=state,
+    )
+    assert len(sampled_masks) == 3  # pass 0 plus two independently sampled reuse masks
+    assert len({mask.data_ptr() for mask in sampled_masks}) == 3
+    assert metrics["optimizer_updates"] == 1
+    assert metrics["curriculum"]["phase_c_forwards"] == 3
+    assert metrics["curriculum"]["three_forward_fraction"] == 1
+    assert metrics["curriculum"]["two_forward_fraction"] == 0
+    expected_keys = {
+        "L_mu_0", "L_var_0", "L_mu_1", "L_var_1", "L_mu_2", "L_var_2",
+        "reuse_weight_0", "reuse_weight_1", "reuse_weight_2", "lambda_r",
+        "phase_c_forwards",
+    }
+    assert expected_keys <= metrics["curriculum"].keys()
 
 
 def test_curriculum_skipped_updates_do_not_advance_ramps():
@@ -918,7 +1113,8 @@ def _curriculum_ddp_worker(rank, rendezvous):
                                    uncertainty_loss="gaussian_nll", curriculum_state=state)
         assert state["successful_optimizer_steps"] == 5
         assert metrics["optimizer_updates"] == 5 and metrics["amp_skipped_steps"] == 0
-        assert metrics["curriculum"]["two_forward_fraction"] == pytest.approx(2 / 5)
+        assert metrics["curriculum"]["two_forward_fraction"] == 0
+        assert metrics["curriculum"]["three_forward_fraction"] == pytest.approx(2 / 5)
     finally:
         dist.destroy_process_group()
 
@@ -1035,7 +1231,7 @@ def test_curriculum_compressed_main_save_resume_smoke(monkeypatch, tmp_path, cap
     assert len(full_rows) == 16 and full_rows == resumed_rows
     for region, step, next_step, lv, lr, forwards in full_rows:
         assert int(next_step) == int(step) + 1
-        assert int(forwards) == (2 if float(lr) > 0 and region != "D" else 1)
+        assert int(forwards) == (3 if float(lr) > 0 and region != "D" else 1)
         if float(lr) > 0: assert float(lv) == 1
     assert full_rows[0][3:] == ("0", "0", "1")
     assert full_rows[-1][3:] == ("1", "1", "1")

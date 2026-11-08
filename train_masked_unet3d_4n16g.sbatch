@@ -25,6 +25,7 @@ ABCD_SYMMETRIC=false
 GLOBAL_COSINE=false
 POST_FINAL_CONTINUATION=false
 PHASE_D_PROBE=false
+PHASE_C_K2_PROBE=false
 FROMSCRATCH_48H=false
 RESUMING=true
 CURRICULUM_STOP=200
@@ -66,6 +67,8 @@ case "${1:-}" in
         PHASE_D_PROBE=true
         CURRICULUM_STOP=1020; FINAL_EPOCH=1020
         MODEL_ARGS=(--model-version direct_unet3d_no_activation_norm_v3); shift ;;
+    --phase-c-k2-probe)
+        CURRICULUM=true; PHASE_C_K2_PROBE=true; shift ;;
     --fromscratch-global-cosine-48h)
         CURRICULUM=true; GLOBAL_COSINE=true; FROMSCRATCH_48H=true; RESUMING=false
         CURRICULUM_STOP=1000; FINAL_EPOCH=1000
@@ -87,7 +90,7 @@ while (( $# )); do
     elif [[ "$1" == --model-version ]] && (( $# >= 2 )); then
         MODEL_ARGS=(--model-version "$2"); shift 2
     else
-        echo "Usage: bash $0 [--stage1-gaussian-nll|--resume-stage1-gaussian-nll|--curriculum|--resume-curriculum|--abcd-symmetric-lr|--resume-abcd-symmetric-lr|--global-cosine-lr|--resume-global-cosine-lr|--post-final-continuation|--resume-post-final-continuation|--phase-d-stateful-probe|--resume-phase-d-stateful-probe|--fromscratch-global-cosine-48h|--resume-fromscratch-global-cosine-48h] [--arm-variance-ramp|--arm-rollout-ramp] [--stop-after-epochs N] [--final-epoch N] [--model-version VERSION]" >&2
+        echo "Usage: bash $0 [--stage1-gaussian-nll|--resume-stage1-gaussian-nll|--curriculum|--resume-curriculum|--abcd-symmetric-lr|--resume-abcd-symmetric-lr|--global-cosine-lr|--resume-global-cosine-lr|--post-final-continuation|--resume-post-final-continuation|--phase-d-stateful-probe|--resume-phase-d-stateful-probe|--phase-c-k2-probe|--fromscratch-global-cosine-48h|--resume-fromscratch-global-cosine-48h] [--arm-variance-ramp|--arm-rollout-ramp] [--stop-after-epochs N] [--final-epoch N] [--model-version VERSION]" >&2
         exit 2
     fi
 done
@@ -129,6 +132,76 @@ mkdir -p logs
 ml load pytorch
 PYTHON=$(command -v python)
 
+if ${PHASE_C_K2_PROBE}; then
+    : "${PHASE_C_PROBE_CHECKPOINT:?ERROR: PHASE_C_PROBE_CHECKPOINT must name an absolute checkpoint path}"
+    : "${CURRICULUM_RUN_NAME:?ERROR: CURRICULUM_RUN_NAME must be set for --phase-c-k2-probe}"
+    if [[ "${PHASE_C_PROBE_CHECKPOINT}" != /* || ! -f "${PHASE_C_PROBE_CHECKPOINT}" ]]; then
+        echo "ERROR: PHASE_C_PROBE_CHECKPOINT must be an existing absolute file." >&2
+        exit 2
+    fi
+    if [[ "${CURRICULUM_RUN_NAME}" == */* || "${CURRICULUM_RUN_NAME}" == "." || "${CURRICULUM_RUN_NAME}" == ".." ]]; then
+        echo "ERROR: CURRICULUM_RUN_NAME must be a single run-directory name." >&2
+        exit 2
+    fi
+    IFS=$'\t' read -r PROBE_SOURCE_EPOCH PROBE_EPOCHS PROBE_FINAL_EPOCH \
+        PROBE_LR PROBE_WARMUP_EPOCHS PROBE_MIN_LR PROBE_CURRICULUM_CONFIG \
+        PROBE_MODEL_VERSION PROBE_SOURCE_PHASE PROBE_LAMBDA_V PROBE_LAMBDA_R \
+        PROBE_OPTIMIZER_LR < <(
+        "${PYTHON}" - "${PHASE_C_PROBE_CHECKPOINT}" <<'PY'
+from pathlib import Path
+import sys
+import torch
+
+from train_masked_unet3d import curriculum_phase, curriculum_weights
+
+path = Path(sys.argv[1])
+checkpoint = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+args = checkpoint["args"]
+state = checkpoint["curriculum_state"]
+epoch = int(checkpoint["epoch"])
+lambda_v, lambda_r = curriculum_weights(state)
+config = args.get("curriculum_config", "adaptive")
+phase_index, phase_name = curriculum_phase(epoch + 1, state, lambda_v, lambda_r, config)
+if phase_index != 2 or not (lambda_v == 1.0 and 0.0 < lambda_r < 1.0):
+    raise ValueError(
+        f"Phase-C K=2 probe requires an in-ramp Phase-C checkpoint; got "
+        f"phase={phase_name}, lambda_v={lambda_v}, lambda_r={lambda_r}"
+    )
+if state.get("phase_d_start_epoch") is not None:
+    raise ValueError("Phase-C K=2 probe source already contains Phase-D state")
+stop_epoch = epoch + 20
+if stop_epoch >= int(args["final_epoch"]):
+    raise ValueError(
+        f"Twenty probe epochs would reach/exceed final_epoch={args['final_epoch']}"
+    )
+completion_step = state["rollout_ramp_start_step"] + state["rollout_ramp_steps"]
+maximum_probe_step = state["successful_optimizer_steps"] + 20 * state["updates_per_epoch"]
+if maximum_probe_step >= completion_step:
+    raise ValueError(
+        "Twenty probe epochs could complete the rollout ramp and enter Phase D; "
+        f"maximum_probe_step={maximum_probe_step}, completion_step={completion_step}"
+    )
+group_lrs = {float(group["lr"]) for group in checkpoint["optimizer"]["param_groups"]}
+if len(group_lrs) != 1:
+    raise ValueError(f"Expected one optimizer LR, got {sorted(group_lrs)}")
+print("\t".join(map(str, (
+    epoch, args["epochs"], args["final_epoch"], args["lr"],
+    args["warmup_epochs"], args["min_lr"], config, args["model_version"],
+    phase_name, lambda_v, lambda_r, group_lrs.pop(),
+))))
+PY
+    )
+    CURRICULUM_STOP=$((PROBE_SOURCE_EPOCH + 20))
+    FINAL_EPOCH=${PROBE_FINAL_EPOCH}
+    MODEL_ARGS=(--model-version "${PROBE_MODEL_VERSION}")
+    case "${PROBE_CURRICULUM_CONFIG}" in
+        adaptive) ;;
+        abcd_symmetric_lr) ABCD_SYMMETRIC=true ;;
+        global_cosine) GLOBAL_COSINE=true ;;
+        *) echo "ERROR: unsupported source curriculum config: ${PROBE_CURRICULUM_CONFIG}" >&2; exit 2 ;;
+    esac
+fi
+
 mapfile -t SLURM_HOSTS < <(scontrol show hostnames "${SLURM_JOB_NODELIST}")
 MASTER_ADDR=${SLURM_HOSTS[0]}
 JOB_NUMBER=${SLURM_JOB_ID%%_*}
@@ -145,10 +218,12 @@ export NCCL_ASYNC_ERROR_HANDLING=1
 
 H5_DIR=/pscratch/sd/b/binxia/VPIC_PPPL_HDF5_by_beta_official2500_none_compat
 RUN_NAME=multi_beta_smoothl1_6ep_horizon20_20261018
-if ${FROMSCRATCH_48H}; then
+if ${PHASE_C_K2_PROBE}; then
+    RUN_NAME=${CURRICULUM_RUN_NAME}
+elif ${FROMSCRATCH_48H}; then
     RUN_NAME=${FROMSCRATCH_RUN_NAME:-multi_beta_curriculum_direct_v3_fromscratch_globalcosine_2e4_1e5_1000ep_48h_20261027}
 elif ${PHASE_D_PROBE}; then
-    RUN_NAME=${CONTINUATION_RUN_NAME:-phase_d_stateful_sliding_probe_from_1000ep_20261105}
+    RUN_NAME=${CURRICULUM_RUN_NAME:-phase_d_stateful_sliding_probe_from_1000ep_20261105}
 elif ${POST_FINAL_CONTINUATION}; then
     RUN_NAME=${CONTINUATION_RUN_NAME:-multi_beta_curriculum_direct_v3_globalcosine_uqcontinue_e240_e320_20261027}
 elif ${STAGE1_NLL}; then
@@ -176,6 +251,7 @@ if ${ABCD_SYMMETRIC}; then EPOCHS=45; fi
 if ${GLOBAL_COSINE}; then EPOCHS=240; fi
 if ${FROMSCRATCH_48H}; then EPOCHS=1000; fi
 if ${PHASE_D_PROBE}; then EPOCHS=1000; fi
+if ${PHASE_C_K2_PROBE}; then EPOCHS=${PROBE_EPOCHS}; fi
 STOP_EPOCH=${EPOCHS}
 if ${STAGE1_NLL} && ! ${RESUME_STAGE1_NLL}; then
     STOP_EPOCH=6
@@ -196,6 +272,11 @@ if ${FROMSCRATCH_48H}; then
     MIN_LR=1e-5
 fi
 if ${PHASE_D_PROBE}; then MIN_LR=1e-5; fi
+if ${PHASE_C_K2_PROBE}; then
+    LR=${PROBE_LR}
+    WARMUP_EPOCHS=${PROBE_WARMUP_EPOCHS}
+    MIN_LR=${PROBE_MIN_LR}
+fi
 WEIGHT_DECAY=1e-4
 DENSITY_PROBE_MIN=0
 DENSITY_PROBE_MAX=30
@@ -296,11 +377,14 @@ if [[ ! -f "${PROJECT_DIR}/split.json" ]]; then
     echo "ERROR: authoritative split not found: ${PROJECT_DIR}/split.json" >&2
     exit 2
 fi
-if ! ${RESUMING} && [[ -e "${OUT_DIR}" ]]; then
+if ${PHASE_C_K2_PROBE} && [[ -e "${OUT_DIR}" ]]; then
+    echo "ERROR: fresh output directory already exists: ${OUT_DIR}; refusing overwrite/resume." >&2
+    exit 2
+elif ! ${RESUMING} && [[ -e "${OUT_DIR}" ]]; then
     echo "ERROR: fresh output directory already exists: ${OUT_DIR}; refusing overwrite/resume." >&2
     exit 2
 fi
-if ${RESUMING} && [[ ! -f "${CHECKPOINT}" ]]; then
+if ${RESUMING} && ! ${PHASE_C_K2_PROBE} && [[ ! -f "${CHECKPOINT}" ]]; then
     echo "ERROR: required resume checkpoint not found: ${CHECKPOINT}; refusing fresh training." >&2
     exit 2
 fi
@@ -366,6 +450,9 @@ if ${STAGE1_NLL} || ${CURRICULUM}; then
                 --wandb-tags from-scratch global-cosine-2e4-1e5 48h
             )
         fi
+        if ${PHASE_C_K2_PROBE}; then
+            TRAIN_ARGS+=(--wandb-tags phase-c-k2-probe)
+        fi
     fi
     if ${RESUMING}; then
         TRAIN_ARGS+=(--auto-resume)
@@ -374,6 +461,65 @@ if ${STAGE1_NLL} || ${CURRICULUM}; then
     fi
 else
     TRAIN_ARGS+=(--auto-resume)
+fi
+
+if ${PHASE_C_K2_PROBE}; then
+    "${PYTHON}" - "${PHASE_C_PROBE_CHECKPOINT}" "${OUT_DIR}" "${TRAIN_ARGS[@]}" <<'PY'
+from pathlib import Path
+import json
+import os
+import shutil
+import sys
+import torch
+
+from data.vpic_hdf5_dataset import validate_checkpoint_split
+from train_masked_unet3d import (
+    curriculum_learning_rate_for_epoch, curriculum_phase, curriculum_weights,
+    parse_args, validate_resume_parameters,
+)
+
+source = Path(sys.argv[1]).resolve()
+out_dir = Path(sys.argv[2])
+sys.argv = [sys.argv[0], *sys.argv[3:]]
+args = parse_args()
+checkpoint = torch.load(source, map_location="cpu", weights_only=False)
+validate_checkpoint_split(checkpoint)
+validate_resume_parameters(args, checkpoint["args"])
+state = checkpoint["curriculum_state"]
+epoch = int(checkpoint["epoch"])
+lambda_v, lambda_r = curriculum_weights(state)
+phase_index, phase_name = curriculum_phase(
+    epoch + 1, state, lambda_v, lambda_r, args.curriculum_config,
+)
+if phase_index != 2 or state.get("phase_d_start_epoch") is not None:
+    raise ValueError(f"Source is not pre-Phase-D Phase C: {phase_name}")
+completion_step = state["rollout_ramp_start_step"] + state["rollout_ramp_steps"]
+maximum_probe_step = state["successful_optimizer_steps"] + 20 * state["updates_per_epoch"]
+if maximum_probe_step >= completion_step:
+    raise ValueError("Probe could complete the rollout ramp and enter Phase D")
+if args.stop_after_epochs != epoch + 20:
+    raise ValueError("Probe must stop exactly 20 epochs after the source checkpoint")
+source_history = source.parent / "history.json"
+if source_history.is_file():
+    history = json.loads(source_history.read_text())
+    if not history or int(history[-1]["epoch"]) != epoch:
+        raise ValueError("Source history does not end at the checkpoint epoch")
+next_lr = curriculum_learning_rate_for_epoch(epoch + 1, args, state)
+out_dir.mkdir(parents=True, exist_ok=False)
+checkpoint.pop("wandb_run_id", None)  # keep the source W&B run isolated
+temporary = out_dir / "latest.pt.tmp"
+torch.save(checkpoint, temporary)
+os.replace(temporary, out_dir / "latest.pt")
+if source_history.is_file():
+    shutil.copy2(source_history, out_dir / "history.json")
+print(f"Phase-C K=2 probe source checkpoint: {source}", file=sys.stderr)
+print(f"Phase-C K=2 probe source epoch/phase: {epoch} / {phase_name}", file=sys.stderr)
+print(f"Phase-C K=2 probe output directory: {out_dir}", file=sys.stderr)
+print(f"Phase-C K=2 probe epochs: {epoch + 1}-{epoch + 20} (20 additional)", file=sys.stderr)
+print(f"Phase-C K=2 probe LR next/current optimizer: {next_lr:g} / "
+      f"{checkpoint['optimizer']['param_groups'][0]['lr']:g}", file=sys.stderr)
+print(f"Phase-C K=2 probe lambda_v/lambda_r: {lambda_v:g} / {lambda_r:g}", file=sys.stderr)
+PY
 fi
 
 # Check the same compatibility rules as the trainer before starting workers.
@@ -455,6 +601,8 @@ print(0)
 PY
 )
 COMPLETED_EPOCH=${FROMSCRATCH_PREFLIGHT_RESULT}
+elif ${PHASE_C_K2_PROBE}; then
+    COMPLETED_EPOCH=${PROBE_SOURCE_EPOCH}
 elif ${RESUMING} || ${POST_FINAL_CONTINUATION}; then
 COMPLETED_EPOCH=$("${PYTHON}" - "${TRAIN_ARGS[@]}" <<'PY'
 from pathlib import Path
@@ -560,7 +708,15 @@ echo "Global batch size: $((BATCH_SIZE * WORLD_SIZE))"
 echo "Epochs: $((COMPLETED_EPOCH + 1)) through ${STOP_EPOCH} (original ${EPOCHS}-epoch LR horizon)"
 echo "Predetermined official final epoch: ${FINAL_EPOCH}"
 if ${CURRICULUM}; then
-    if ${FROMSCRATCH_48H}; then
+    if ${PHASE_C_K2_PROBE}; then
+        echo "Phase-C K=2 probe source checkpoint: ${PHASE_C_PROBE_CHECKPOINT}"
+        echo "Phase-C K=2 probe source epoch/phase: ${PROBE_SOURCE_EPOCH} / ${PROBE_SOURCE_PHASE}"
+        echo "Phase-C K=2 probe output directory: ${OUT_DIR}"
+        echo "Phase-C K=2 probe duration: 20 additional epochs"
+        echo "Phase-C K=2 probe optimizer LR: ${PROBE_OPTIMIZER_LR}"
+        echo "Phase-C K=2 probe lambda_v/lambda_r: ${PROBE_LAMBDA_V} / ${PROBE_LAMBDA_R}"
+        echo "Phase-C K=2 probe guard: rollout ramp cannot complete; Phase D remains inactive"
+    elif ${FROMSCRATCH_48H}; then
         echo "Curriculum state: fresh adaptive Phase A from random model initialization"
     elif ${POST_FINAL_CONTINUATION}; then
         echo "Curriculum state: fixed full objective; adaptive transitions disabled"
