@@ -316,7 +316,8 @@ class _TinyPhaseDModel(torch.nn.Module):
         return prediction, variance
 
 
-def test_phase_d_streaming_optimizer_smoke_all_slide_cases_and_independent_slots():
+@pytest.mark.parametrize("objective", ["gaussian_nll", "student_t_nll"])
+def test_phase_d_streaming_optimizer_smoke_all_slide_cases_and_independent_slots(objective):
     dataset = _PhaseDRunDataset(lengths=(30, 31))
     stream = _phase_d_stream(dataset, batch_size=5)
     for slot, slide_step in enumerate((-24, -1, 0, 1, 24)):
@@ -340,7 +341,7 @@ def test_phase_d_streaming_optimizer_smoke_all_slide_cases_and_independent_slots
         model, [None] * 20, optimizer, torch.device("cpu"),
         torch.zeros(1, 4, 1, 1, 1), torch.ones(1, 4, 1, 1, 1),
         {name: 1.0 for name in MASK_PATTERNS}, .05, .05, .05, .05, False, 1.0,
-        uncertainty_aware=True, uncertainty_loss="gaussian_nll",
+        uncertainty_aware=True, uncertainty_loss=objective,
         curriculum_state=state, phase_d_stream=stream,
     )
     assert metrics["optimizer_updates"] == 20 and metrics["amp_skipped_steps"] == 0
@@ -465,7 +466,8 @@ def test_returned_variance_fp32_floor_and_gradients(architecture, bf16):
     assert model.variance_out.weight.grad is not None
 
 
-@pytest.mark.parametrize("objective,pattern", [("smooth_l1", "spatial_random")] +
+@pytest.mark.parametrize("objective,pattern", [("smooth_l1", "spatial_random"),
+                         ("student_t_nll", "spatial_random")] +
                          [("gaussian_nll", p) for p in MASK_PATTERNS])
 def test_one_synthetic_batch_and_validation(objective, pattern):
     model = UNet3D(base_channels=2, channel_mults=(1, 2, 4), uncertainty_aware=True)
@@ -488,9 +490,9 @@ def test_one_synthetic_batch_and_validation(objective, pattern):
         uncertainty_loss=objective,
     )
     assert torch.isfinite(torch.tensor(metrics["mse"]))
-    key = "gaussian_nll" if objective == "gaussian_nll" else "uncertainty_mse"
+    key = objective if objective in ("gaussian_nll", "student_t_nll") else "uncertainty_mse"
     assert torch.isfinite(torch.tensor(metrics[key]))
-    if objective == "gaussian_nll":
+    if objective in ("gaussian_nll", "student_t_nll"):
         assert metrics["binary_input_variance_verified"] and metrics["nonfinite_events"] == 0
         assert metrics["gradient_norm_max"] >= metrics["gradient_norm_mean"] > 0
         assert metrics["optimizer_updates"] == 1 and metrics["amp_skipped_steps"] == 0
@@ -505,7 +507,7 @@ def test_one_synthetic_batch_and_validation(objective, pattern):
     assert torch.isfinite(torch.tensor(metrics["mean"][key]))
     hook.remove()
     output_hook.remove()
-    if objective == "gaussian_nll":
+    if objective in ("gaussian_nll", "student_t_nll"):
         assert metrics["per_beta"]["0.01"]["mse"] == pytest.approx(metrics["mean"]["mse"])
         assert set(metrics["variance_statistics"]) == {"Bx", "By", "Bz", "Density"}
         for i, row in enumerate(metrics["variance_statistics"].values()):
@@ -533,6 +535,17 @@ def test_cli_and_old_checkpoint_resume(monkeypatch):
     with pytest.raises(ValueError, match="uncertainty_loss:"):
         validate_resume_parameters(args, compatible)
     validate_resume_parameters(args, dict(compatible, uncertainty_loss="gaussian_nll"))
+
+    monkeypatch.setattr(sys, "argv", [
+        "train", "--uncertainty-aware", "--uncertainty-loss", "student_t_nll",
+        "--student-t-df", "5",
+    ])
+    student_args = parse_args()
+    assert student_args.student_t_df == 5.0
+    with pytest.raises(ValueError, match="student_t_df"):
+        validate_resume_parameters(student_args, {
+            **vars(student_args), "student_t_df": 3.0,
+        })
 
 
 def test_direct_model_cli_records_version_and_rejects_cross_version_resume(monkeypatch):
@@ -568,6 +581,82 @@ def test_gaussian_nll_matches_fp32_formula_detaches_mu_and_keeps_backbone_gradie
     assert model.variance_out.weight.grad.abs().sum() > 0
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.enc0.parameters())
     assert all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters())
+
+
+@pytest.mark.parametrize("df", [3.0, 5.0])
+def test_student_t_nll_matches_torch_distribution_and_preserves_variance_semantics(df):
+    torch.manual_seed(1234)
+    prediction = torch.randn(2, 3, 4, dtype=torch.float32, requires_grad=True)
+    target = torch.randn_like(prediction)
+    variance = torch.logspace(-8, 2, prediction.numel()).reshape_as(prediction).requires_grad_()
+    loss = predicted_error_mse_loss(
+        variance, prediction, target, "student_t_nll", student_t_df=df,
+    )
+    safe_u = variance.float().clamp_min(GAUSSIAN_NLL_VARIANCE_FLOOR)
+    scale_squared = safe_u * ((df - 2.0) / df)
+    expected = -torch.distributions.StudentT(
+        df=df, loc=prediction.detach().float(), scale=scale_squared.sqrt(),
+    ).log_prob(target.float()).mean()
+    torch.testing.assert_close(loss, expected, rtol=2e-6, atol=2e-6)
+    torch.testing.assert_close(scale_squared * df / (df - 2.0), safe_u)
+    assert loss.dtype == torch.float32
+    loss.backward()
+    assert prediction.grad is None
+    assert torch.isfinite(variance.grad).all()
+
+
+def test_student_t_nll_robust_residuals_floor_and_invalid_df(monkeypatch):
+    target = torch.tensor([0.0, 1e-4, 100.0, float("nan")])
+    prediction = torch.zeros_like(target)
+    variance = torch.tensor([1e-12, 0.2, 1.0, 2.0], requires_grad=True)
+    student = predicted_error_mse_loss(
+        variance, prediction, target, "student_t_nll", student_t_df=3.0,
+    )
+    gaussian = predicted_error_mse_loss(variance, prediction, target, "gaussian_nll")
+    assert torch.isfinite(student) and student < gaussian
+    student.backward()
+    assert variance.grad[-1] == 0  # NaN-padded target was filtered before arithmetic.
+    assert torch.isfinite(variance.grad).all()
+    for invalid in (2.0, 1.5, float("nan")):
+        with pytest.raises(ValueError, match="degrees of freedom"):
+            predicted_error_mse_loss(
+                variance, prediction, target, "student_t_nll", student_t_df=invalid,
+            )
+        monkeypatch.setattr(sys, "argv", [
+            "train", "--uncertainty-aware", "--uncertainty-loss", "student_t_nll",
+            "--student-t-df", str(invalid),
+        ])
+        with pytest.raises(SystemExit):
+            parse_args()
+
+
+def test_phase_c_k2_student_t_uses_three_detached_reuses():
+    from train_masked_unet3d import curriculum_forward_loss
+
+    model = UNet3D(
+        base_channels=2, channel_mults=(1, 2, 4), uncertainty_aware=True,
+        architecture=DIRECT_MODEL_VERSION,
+    )
+    target = torch.randn(1, 4, 4, 4, 4)
+    masks = [torch.randint(2, target.shape).float() for _ in range(3)]
+    model_input = torch.cat([
+        make_uncertain_input(target, 1 - masks[0]), 1 - masks[0],
+    ], dim=1)
+    phase_b_loss, _, _, phase_b_parts = curriculum_forward_loss(
+        model, model_input, target, masks[0], 1.0, 0.0, None,
+        "student_t_nll", 3.0,
+    )
+    assert phase_b_parts["forwards"] == 1 and torch.isfinite(phase_b_loss)
+    model.zero_grad(set_to_none=True)
+    loss, _, _, parts = curriculum_forward_loss(
+        model, model_input, target, masks[0], 1.0, 1.0, tuple(masks[1:]),
+        "student_t_nll", 3.0,
+    )
+    assert parts["forwards"] == 3
+    assert all(torch.isfinite(parts[f"L_var_{index}"]) for index in range(3))
+    loss.backward()
+    assert all(parameter.grad is None or torch.isfinite(parameter.grad).all()
+               for parameter in model.parameters())
 
 
 @pytest.mark.parametrize("fault", ["mask", "variance", "gradient", "reconstruction"])

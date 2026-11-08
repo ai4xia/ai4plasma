@@ -148,8 +148,13 @@ def parse_args():
         help="Use input variance and predict per-element squared reconstruction error.",
     )
     p.add_argument(
-        "--uncertainty-loss", choices=("smooth_l1", "gaussian_nll"), default="smooth_l1",
-        help="Variance objective; gaussian_nll enables controlled binary-input Stage-1 checks.",
+        "--uncertainty-loss", choices=("smooth_l1", "gaussian_nll", "student_t_nll"),
+        default="smooth_l1",
+        help="Variance objective; NLL objectives use controlled binary-input checks.",
+    )
+    p.add_argument(
+        "--student-t-df", type=float, default=3.0,
+        help="Fixed Student-t degrees of freedom; must be > 2 (default: 3).",
     )
     p.add_argument(
         "--uncertainty-loss-weight", type=float, default=1.0,
@@ -433,13 +438,18 @@ def parse_args():
             p.error("--post-final-continuation does not permit ramp arming")
     if (args.arm_variance_ramp or args.arm_rollout_ramp) and (not args.curriculum_training or not args.auto_resume):
         p.error("Ramp arming requires --curriculum-training and --auto-resume")
-    if args.uncertainty_loss == "gaussian_nll" and not args.uncertainty_aware:
-        p.error("--uncertainty-loss gaussian_nll requires --uncertainty-aware")
-    if args.uncertainty_loss == "gaussian_nll":
+    if not math.isfinite(args.student_t_df) or args.student_t_df <= 2.0:
+        p.error("--student-t-df must be finite and greater than 2")
+    if args.uncertainty_loss in ("gaussian_nll", "student_t_nll") and not args.uncertainty_aware:
+        p.error(f"--uncertainty-loss {args.uncertainty_loss} requires --uncertainty-aware")
+    if args.uncertainty_loss in ("gaussian_nll", "student_t_nll"):
         args.variance_floor = GAUSSIAN_NLL_VARIANCE_FLOOR
     if args.curriculum_training:
-        if not args.uncertainty_aware or args.uncertainty_loss != "gaussian_nll":
-            p.error("--curriculum-training requires --uncertainty-aware --uncertainty-loss gaussian_nll")
+        if (not args.uncertainty_aware
+                or args.uncertainty_loss not in ("gaussian_nll", "student_t_nll")):
+            p.error(
+                "--curriculum-training requires --uncertainty-aware and an NLL uncertainty loss"
+            )
         if args.uncertainty_loss_weight != 1.0:
             p.error("Curriculum variance weighting is controlled by lambda_v; --uncertainty-loss-weight must be 1")
         for name in ("variance_ramp_start_epoch", "rollout_ramp_start_epoch",
@@ -740,6 +750,8 @@ def default_run_name(args) -> str:
     }
     if getattr(args, "uncertainty_loss", "smooth_l1") != "smooth_l1":
         signature_data["uncertainty_loss"] = args.uncertainty_loss
+    if getattr(args, "uncertainty_loss", "smooth_l1") == "student_t_nll":
+        signature_data["student_t_df"] = args.student_t_df
     if getattr(args, "curriculum_training", False):
         signature_data.update({key: getattr(args, key) for key in (
             "curriculum_training", "variance_ramp_start_epoch", "variance_ramp_epochs",
@@ -883,6 +895,12 @@ def validate_resume_parameters(args, checkpoint_args: Dict[str, Any]) -> None:
         new_value = getattr(args, key, default)
         if old_value != new_value:
             mismatches.append(f"{key}: checkpoint={old_value!r}, current={new_value!r}")
+    if getattr(args, "uncertainty_loss", "smooth_l1") == "student_t_nll":
+        old_df = checkpoint_args.get("student_t_df", 3.0)
+        if old_df != args.student_t_df:
+            mismatches.append(
+                f"student_t_df: checkpoint={old_df!r}, current={args.student_t_df!r}"
+            )
     if getattr(args, "curriculum_training", False):
         for key in ("variance_ramp_start_epoch", "variance_ramp_epochs",
                     "rollout_ramp_start_epoch", "rollout_ramp_epochs",
@@ -1419,7 +1437,12 @@ def phase_b_convergence(history, args, curriculum_state):
     cutoff = segment_start if segment_start is not None else history[-1]["epoch"] + 1
     mse_rows = positive_metric_convergence(history, half_life=half_life, window=window,
                                           threshold=threshold, patience=patience, segment_start_epoch=cutoff)
-    nll_rows = nll_metric_convergence(history, half_life=half_life, window=window, segment_start_epoch=cutoff)
+    objective = getattr(args, "uncertainty_loss", "gaussian_nll")
+    nll_metric = f"val_{objective if objective in ('gaussian_nll', 'student_t_nll') else 'gaussian_nll'}"
+    nll_rows = nll_metric_convergence(
+        history, half_life=half_life, window=window,
+        segment_start_epoch=cutoff, metric=nll_metric,
+    )
     stable_count, previous_epoch = 0, None
     for mse, nll in zip(mse_rows, nll_rows):
         if previous_epoch is not None and mse["epoch"] != previous_epoch + 1:
@@ -1457,11 +1480,17 @@ def phase_c_convergence(history, args, curriculum_state):
         and completed and state.get("phase_d_start_epoch") is None
     )
     segment_start = None
+    objective = getattr(args, "uncertainty_loss", "gaussian_nll")
+    rollout_nll_metric = (
+        f"val_rollout_{objective}"
+        if objective in ("gaussian_nll", "student_t_nll")
+        else "val_rollout_gaussian_nll"
+    )
     if candidate:
         for row in history:
             count = row.get("curriculum", {}).get("successful_optimizer_steps", -1)
             valid = (row.get("val_rollout_mse") is not None
-                     and row.get("val_rollout_gaussian_nll") is not None)
+                     and row.get(rollout_nll_metric) is not None)
             if count < start + duration or not valid:
                 segment_start = None
             elif segment_start is None:
@@ -1476,7 +1505,7 @@ def phase_c_convergence(history, args, curriculum_state):
         threshold=threshold, patience=patience, segment_start_epoch=cutoff,
     )
     nll_rows = nll_metric_convergence(
-        history, metric="val_rollout_gaussian_nll", half_life=half_life,
+        history, metric=rollout_nll_metric, half_life=half_life,
         window=window, segment_start_epoch=cutoff,
     )
     stable_count, previous_epoch = 0, None
@@ -1903,12 +1932,15 @@ def make_phase_c_reuse_input(
 
 def curriculum_forward_loss(
     model, model_input, target, mask, lambda_v, lambda_r, reuse_masks=None,
+    uncertainty_loss="gaussian_nll", student_t_df=3.0,
 ):
     """Phase A/B pass or Phase-C K=2 detached reuse with geometric weighting."""
     weights = phase_c_geometric_weights(lambda_r)
     pred, variance = model(model_input, detach_variance_features=True)
     mu_loss = full_mse_loss(pred, target, mask)
-    var_loss = (predicted_error_mse_loss(variance, pred, target, "gaussian_nll")
+    var_loss = (predicted_error_mse_loss(
+                    variance, pred, target, uncertainty_loss, student_t_df,
+                )
                 if lambda_v > 0 else mu_loss.new_zeros(()))
     check_stage1(torch.isfinite(pred).all() & torch.isfinite(variance).all() & (variance > 0).all()
                  & torch.isfinite(mu_loss) & (mu_loss <= 100) & torch.isfinite(var_loss),
@@ -1937,7 +1969,7 @@ def curriculum_forward_loss(
             )
             next_mu_loss = full_mse_loss(next_mean, target, exact_mask)
             next_var_loss = predicted_error_mse_loss(
-                next_variance, next_mean, target, "gaussian_nll",
+                next_variance, next_mean, target, uncertainty_loss, student_t_df,
             )
             check_stage1(
                 torch.isfinite(next_mean).all()
@@ -1999,13 +2031,14 @@ def train_one_epoch(
     scaler: Optional[Any] = None,
     amp_dtype: torch.dtype = torch.float16,
     uncertainty_loss: str = "smooth_l1",
+    student_t_df: float = 3.0,
     curriculum_state: Optional[Dict[str, Any]] = None,
     curriculum_log_every: int = 50,
     phase_d_stream: Optional[PhaseDStreamingBatch] = None,
 ) -> Dict[str, Any]:
     model.train()
-    stage1 = uncertainty_aware and uncertainty_loss == "gaussian_nll"
-    uncertainty_key = "gaussian_nll" if stage1 else "uncertainty_mse"
+    stage1 = uncertainty_aware and uncertainty_loss in ("gaussian_nll", "student_t_nll")
+    uncertainty_key = uncertainty_loss if stage1 else "uncertainty_mse"
 
     n_patterns = len(MASK_PATTERNS)
 
@@ -2138,7 +2171,7 @@ def train_one_epoch(
                 pred, output_variance = model(model_input, detach_variance_features=True)
                 reconstruction_loss = full_mse_loss(pred, y, mask)
                 variance_loss = predicted_error_mse_loss(
-                    output_variance, pred, y, "gaussian_nll"
+                    output_variance, pred, y, uncertainty_loss, student_t_df,
                 )
                 loss = reconstruction_loss + variance_loss
                 components = {
@@ -2149,7 +2182,9 @@ def train_one_epoch(
                 }
             elif curriculum_state is not None:
                 loss, pred, output_variance, components = curriculum_forward_loss(
-                    model, model_input, y, mask, lambda_v, lambda_r, reuse_masks)
+                    model, model_input, y, mask, lambda_v, lambda_r, reuse_masks,
+                    uncertainty_loss, student_t_df,
+                )
                 reconstruction_loss = components["L_mu_0"]
                 variance_loss = components["L_var_0"]
             else:
@@ -2160,7 +2195,8 @@ def train_one_epoch(
                 loss = reconstruction_loss
                 if uncertainty_aware:
                     variance_loss = predicted_error_mse_loss(
-                        output_variance, pred, y, objective=uncertainty_loss
+                        output_variance, pred, y, objective=uncertainty_loss,
+                        student_t_df=student_t_df,
                     ) if stage1 else predicted_error_mse_loss(output_variance, pred, y)
                     loss = loss + uncertainty_loss_weight * variance_loss
 
@@ -2492,6 +2528,7 @@ def validate(
     uncertainty_aware: bool = False,
     amp_dtype: torch.dtype = torch.float16,
     uncertainty_loss: str = "smooth_l1",
+    student_t_df: float = 3.0,
     rollout_validation: bool = False,
 ) -> Dict[str, Dict[str, float]]:
     """
@@ -2503,10 +2540,11 @@ def validate(
     patterns.
     """
     model.eval()
-    stage1 = uncertainty_aware and uncertainty_loss == "gaussian_nll"
+    stage1 = uncertainty_aware and uncertainty_loss in ("gaussian_nll", "student_t_nll")
     if rollout_validation and not stage1:
-        raise ValueError("Rollout validation requires uncertainty-aware Gaussian-NLL mode")
-    uncertainty_key = "gaussian_nll" if stage1 else "uncertainty_mse"
+        raise ValueError("Rollout validation requires an uncertainty-aware NLL mode")
+    uncertainty_key = uncertainty_loss if stage1 else "uncertainty_mse"
+    rollout_uncertainty_key = f"rollout_{uncertainty_key}"
     beta_details = {}
     _ = (mask_seed, density_probe_min, density_probe_max)
 
@@ -2550,7 +2588,11 @@ def validate(
                     pred, output_variance = pred
                 loss_mse = full_mse_loss(pred, y, mask)
                 if uncertainty_aware:
-                    variance_loss = (predicted_error_mse_loss(output_variance, pred, y, objective=uncertainty_loss)
+                    variance_loss = (predicted_error_mse_loss(
+                                         output_variance, pred, y,
+                                         objective=uncertainty_loss,
+                                         student_t_df=student_t_df,
+                                     )
                                      if stage1 else predicted_error_mse_loss(output_variance, pred, y))
                 if rollout_validation:
                     reuse_mask_1, _ = make_fixed_validation_mask(
@@ -2573,7 +2615,8 @@ def validate(
                     pred3, variance3 = model(third_input, detach_variance_features=True)
                     rollout_mse = full_mse_loss(pred3, y, exact_mask_2)
                     rollout_nll = predicted_error_mse_loss(
-                        variance3, pred3, y, objective="gaussian_nll",
+                        variance3, pred3, y, objective=uncertainty_loss,
+                        student_t_df=student_t_df,
                     )
 
             if stage1:
@@ -2658,14 +2701,14 @@ def validate(
         rollout_nll_sums = rollout_nll_sums.cpu()
         for i, pattern in enumerate(patterns):
             metrics[pattern]["rollout_mse"] = float(rollout_mse_sums[i] / counts[i])
-            metrics[pattern]["rollout_gaussian_nll"] = float(
+            metrics[pattern][rollout_uncertainty_key] = float(
                 rollout_nll_sums[i] / counts[i]
             )
         metrics["mean"]["rollout_mse"] = sum(
             metrics[p]["rollout_mse"] for p in patterns
         ) / len(patterns)
-        metrics["mean"]["rollout_gaussian_nll"] = sum(
-            metrics[p]["rollout_gaussian_nll"] for p in patterns
+        metrics["mean"][rollout_uncertainty_key] = sum(
+            metrics[p][rollout_uncertainty_key] for p in patterns
         ) / len(patterns)
 
     if stage1:
@@ -2748,15 +2791,24 @@ def build_epoch_wandb_log(
         log_data[f"val/{pattern}/mse"] = val_metrics[pattern]["mse"]
         if "rollout_mse" in val_metrics[pattern]:
             log_data[f"val/{pattern}/rollout_mse"] = val_metrics[pattern]["rollout_mse"]
-            log_data[f"val/{pattern}/rollout_gaussian_nll"] = val_metrics[pattern][
-                "rollout_gaussian_nll"
-            ]
+            rollout_key = next(
+                key for key in ("rollout_gaussian_nll", "rollout_student_t_nll")
+                if key in val_metrics[pattern]
+            )
+            log_data[f"val/{pattern}/{rollout_key}"] = val_metrics[pattern][rollout_key]
     if "val_rollout_mse" in row:
         log_data["val/rollout_mse"] = row["val_rollout_mse"]
-        log_data["val/rollout_gaussian_nll"] = row["val_rollout_gaussian_nll"]
+        rollout_key = next(
+            key for key in ("val_rollout_gaussian_nll", "val_rollout_student_t_nll")
+            if key in row
+        )
+        log_data[f"val/{rollout_key.removeprefix('val_')}"] = row[rollout_key]
     if "train_gaussian_nll" in row:
         log_data["train/gaussian_nll"] = row["train_gaussian_nll"]
         log_data["val/gaussian_nll"] = row["val_gaussian_nll"]
+    elif "train_student_t_nll" in row:
+        log_data["train/student_t_nll"] = row["train_student_t_nll"]
+        log_data["val/student_t_nll"] = row["val_student_t_nll"]
     elif "train_uncertainty_mse" in row:
         log_data["train/uncertainty_smooth_l1"] = row["train_uncertainty_mse"]
         log_data["val/uncertainty_smooth_l1"] = row["val_uncertainty_mse"]
@@ -2849,7 +2901,42 @@ def save_checkpoint(
         ckpt["lr_schedule"] = dict(horizon_epochs=args.epochs, warmup_epochs=args.warmup_epochs,
                                    base_lr=args.lr, min_lr=args.min_lr,
                                    current_lr=[group["lr"] for group in optimizer.param_groups])
-    torch.save(ckpt, path)
+    path = Path(path)
+    if path.name == "latest.pt":
+        temporary_path = path.with_name(path.name + ".tmp")
+        temporary_path.unlink(missing_ok=True)
+        try:
+            torch.save(ckpt, temporary_path)
+            os.replace(temporary_path, path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+    else:
+        torch.save(ckpt, path)
+
+
+def save_history_atomic(path: Path, history: List[Dict[str, Any]]) -> None:
+    path = Path(path)
+    temporary_path = path.with_name(path.name + ".tmp")
+    temporary_path.unlink(missing_ok=True)
+    try:
+        with open(temporary_path, "w") as f:
+            json.dump(history, f, indent=2)
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def history_through_checkpoint(
+    history: List[Dict[str, Any]], checkpoint_epoch: int, first_epoch: int = 1,
+) -> List[Dict[str, Any]]:
+    """Return the contiguous history committed through the authoritative checkpoint."""
+    epochs = [row.get("epoch") for row in history]
+    if any(not isinstance(epoch, int) or isinstance(epoch, bool) for epoch in epochs):
+        raise ValueError("Cannot resume: history contains an invalid epoch.")
+    trimmed = [row for row, epoch in zip(history, epochs) if epoch <= checkpoint_epoch]
+    if [row["epoch"] for row in trimmed] != list(range(first_epoch, checkpoint_epoch + 1)):
+        raise ValueError("Cannot resume: history is behind or inconsistent with the completed checkpoint epoch.")
+    return trimmed
 
 
 def main():
@@ -2911,7 +2998,9 @@ def main():
     rank_print("Validation mask patterns:", args.val_patterns)
     if args.uncertainty_aware:
         rank_print("Uncertainty objective:", args.uncertainty_loss)
-        if args.uncertainty_loss == "gaussian_nll":
+        if args.uncertainty_loss == "student_t_nll":
+            rank_print("Student-t df:", args.student_t_df)
+        if args.uncertainty_loss in ("gaussian_nll", "student_t_nll"):
             input_label = "Curriculum first pass" if args.curriculum_training else "Stage-1"
             rank_print(f"{input_label}: binary input variance checked every batch; FP32 NLL floor={GAUSSIAN_NLL_VARIANCE_FLOOR:g}; no upper cap")
     if args.curriculum_training:
@@ -3261,7 +3350,10 @@ def main():
     if is_main_process() and resume_checkpoint is not None and history_path.exists():
         with open(history_path) as f:
             history = json.load(f)
-        history = [row for row in history if row.get("epoch", 0) < start_epoch]
+        first_history_epoch = args.epochs + 1 if args.post_final_continuation else 1
+        history = history_through_checkpoint(
+            history, start_epoch - 1, first_epoch=first_history_epoch,
+        )
 
     epoch_progress = None
     if is_main_process():
@@ -3332,6 +3424,7 @@ def main():
             scaler=scaler,
             amp_dtype=getattr(torch, args.amp_dtype),
             uncertainty_loss=args.uncertainty_loss,
+            student_t_df=args.student_t_df,
             curriculum_state=curriculum_state,
             curriculum_log_every=args.curriculum_log_every,
             phase_d_stream=active_phase_d_stream,
@@ -3362,6 +3455,7 @@ def main():
             uncertainty_aware=args.uncertainty_aware,
             amp_dtype=getattr(torch, args.amp_dtype),
             uncertainty_loss=args.uncertainty_loss,
+            student_t_df=args.student_t_df,
             rollout_validation=rollout_validation,
         )
         validation_seconds = time.perf_counter() - validation_started
@@ -3436,10 +3530,11 @@ def main():
             epoch_log("  Phase-D streaming diagnostics: " + json.dumps(row["phase_d"]))
         if args.uncertainty_aware:
             row["uncertainty_objective"] = args.uncertainty_loss
-            key = "gaussian_nll" if args.uncertainty_loss == "gaussian_nll" else "uncertainty_mse"
+            nll_active = args.uncertainty_loss in ("gaussian_nll", "student_t_nll")
+            key = args.uncertainty_loss if nll_active else "uncertainty_mse"
             row[f"train_{key}"] = train_metrics[key]
             row[f"val_{key}"] = val_metrics["mean"][key]
-            if args.uncertainty_loss == "gaussian_nll":
+            if nll_active:
                 row.update({key: train_metrics[key] for key in (
                     "gradient_norm_mean", "gradient_norm_max", "binary_input_variance_verified",
                     "finite_model_input_verified", "nonfinite_events", "optimizer_updates")})
@@ -3447,8 +3542,8 @@ def main():
                 row["val_per_beta"] = val_metrics["per_beta"]
                 if rollout_validation:
                     row["val_rollout_mse"] = val_metrics["mean"]["rollout_mse"]
-                    row["val_rollout_gaussian_nll"] = val_metrics["mean"][
-                        "rollout_gaussian_nll"
+                    row[f"val_rollout_{key}"] = val_metrics["mean"][
+                        f"rollout_{key}"
                     ]
         transition_diagnostic = None
         if is_main_process():
@@ -3589,7 +3684,35 @@ def main():
             )
         )
 
+        performance = torch.tensor([
+            time.perf_counter() - epoch_started, train_metrics["train_seconds"],
+            train_metrics["data_wait_seconds"], validation_seconds,
+            torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else 0,
+            torch.cuda.max_memory_reserved(device) / 2**30 if device.type == "cuda" else 0,
+        ], dtype=torch.float64, device=device)
+        if distributed_is_initialized():
+            dist.all_reduce(performance, op=dist.ReduceOp.MAX)
+        row.update(zip(("epoch_seconds", "train_seconds", "data_wait_seconds",
+                        "validation_seconds", "peak_allocated_gib", "peak_reserved_gib"),
+                       performance.cpu().tolist()))
+        if args.uncertainty_aware:
+            label = {
+                "gaussian_nll": "Gaussian NLL",
+                "student_t_nll": "Student-t NLL",
+            }.get(args.uncertainty_loss, "uncertainty Smooth L1")
+            epoch_log(f"  {label}: train={row[f'train_{key}']:.6f} val={row[f'val_{key}']:.6f}")
+            if args.uncertainty_loss in ("gaussian_nll", "student_t_nll"):
+                input_check = ("binary v_in verified" if row["binary_input_variance_verified"]
+                               else "finite stateful Phase-D input verified")
+                epoch_log(f"  synchronized preclip gradient norm: mean={row['gradient_norm_mean']:.6g} "
+                          f"max={row['gradient_norm_max']:.6g}; {input_check}; nonfinite_events=0")
+                epoch_log("  validation variance statistics: " + json.dumps(row["val_variance_statistics"]))
+                epoch_log("  validation per beta: " + json.dumps(row["val_per_beta"]))
+        epoch_log(f"  epoch_seconds={row['epoch_seconds']:.2f} "
+                  f"AMP skipped rank-steps={row['amp_skipped_steps']:.0f} "
+                  f"scale={row['amp_scale_start']:g}->{row['amp_scale_end']:g}")
         if is_main_process():
+            save_history_atomic(history_path, history)
             save_checkpoint(
                 latest_path,
                 model=model,
@@ -3603,34 +3726,6 @@ def main():
             )
         if distributed_is_initialized():
             dist.barrier()
-
-        performance = torch.tensor([
-            time.perf_counter() - epoch_started, train_metrics["train_seconds"],
-            train_metrics["data_wait_seconds"], validation_seconds,
-            torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else 0,
-            torch.cuda.max_memory_reserved(device) / 2**30 if device.type == "cuda" else 0,
-        ], dtype=torch.float64, device=device)
-        if distributed_is_initialized():
-            dist.all_reduce(performance, op=dist.ReduceOp.MAX)
-        row.update(zip(("epoch_seconds", "train_seconds", "data_wait_seconds",
-                        "validation_seconds", "peak_allocated_gib", "peak_reserved_gib"),
-                       performance.cpu().tolist()))
-        if args.uncertainty_aware:
-            label = "Gaussian NLL" if args.uncertainty_loss == "gaussian_nll" else "uncertainty Smooth L1"
-            epoch_log(f"  {label}: train={row[f'train_{key}']:.6f} val={row[f'val_{key}']:.6f}")
-            if args.uncertainty_loss == "gaussian_nll":
-                input_check = ("binary v_in verified" if row["binary_input_variance_verified"]
-                               else "finite stateful Phase-D input verified")
-                epoch_log(f"  synchronized preclip gradient norm: mean={row['gradient_norm_mean']:.6g} "
-                          f"max={row['gradient_norm_max']:.6g}; {input_check}; nonfinite_events=0")
-                epoch_log("  validation variance statistics: " + json.dumps(row["val_variance_statistics"]))
-                epoch_log("  validation per beta: " + json.dumps(row["val_per_beta"]))
-        epoch_log(f"  epoch_seconds={row['epoch_seconds']:.2f} "
-                  f"AMP skipped rank-steps={row['amp_skipped_steps']:.0f} "
-                  f"scale={row['amp_scale_start']:g}->{row['amp_scale_end']:g}")
-        if is_main_process():
-            with open(out_dir / "history.json", "w") as f:
-                json.dump(history, f, indent=2)
         if epoch == args.final_epoch:
             if distributed_is_initialized():
                 dist.barrier()

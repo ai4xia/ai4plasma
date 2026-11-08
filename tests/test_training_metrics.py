@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import sys
+import json
 import math
+import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,7 +24,10 @@ from train_masked_unet3d import (  # noqa: E402
     curriculum_phase,
     curriculum_weights,
     global_cosine_learning_rate,
+    history_through_checkpoint,
+    make_curriculum_state,
     save_checkpoint,
+    save_history_atomic,
     start_phase_d_if_ready,
     train_one_epoch,
     validate,
@@ -275,16 +281,242 @@ def test_fromscratch_launcher_uses_run_local_safe_slurm_handoff():
     launcher = Path(train.__file__).with_name("train_masked_unet3d_4n16g.sbatch").read_text()
     assert "multi_beta_curriculum_direct_v3_fromscratch_globalcosine_2e4_1e5_1000ep_48h_20261027" in launcher
     assert "ACTIVE_JOB_REGISTRY=${OUT_DIR}/active_slurm_job_id" in launcher
-    assert 'scancel "${REGISTERED_JOB_ID}"' in launcher
+    assert '"${HANDOFF_SCANCEL_COMMAND}" "${REGISTERED_JOB_ID}"' in launcher
     assert '"${REGISTERED_JOB_ID}" == "${SLURM_JOB_ID}"' in launcher
     assert "BatchFlag=0" in launcher
     assert "HANDOFF_DEADLINE=$((SECONDS + 120))" in launcher
     assert "scancel --user" not in launcher and "scancel -u" not in launcher
-    assert launcher.index('if [[ "${HANDOFF_ACTIVE_SALLOC}" == 1 ]]') < launcher.index(
-        'echo "Loaded PyTorch environment:"'
-    ) < launcher.index(
-        "# Check the same compatibility rules as the trainer"
-    ) < launcher.index("# One torchrun controller per node")
+    main = launcher[launcher.index("COMPLETED_EPOCH=0"):]
+    first_preflight = main.index("COMPLETED_EPOCH=$(resume_checkpoint_preflight)")
+    registry_validation = main.index("validate_registered_active_salloc")
+    cancellation = main.index("cancel_registered_active_salloc")
+    second_preflight = main.index(
+        "COMPLETED_EPOCH=$(resume_checkpoint_preflight)", first_preflight + 1
+    )
+    resume = main.index("# One torchrun controller per node")
+    assert first_preflight < registry_validation < cancellation < second_preflight < resume
+    assert "refusing concurrent resume. Set HANDOFF_ACTIVE_SALLOC=1" in main
+    preflight = launcher.split("resume_checkpoint_preflight() {", 1)[1].split("\n}\n", 1)[0]
+    assert "history_through_checkpoint(history, epoch, first_epoch=first_epoch)" in preflight
+
+
+def _launcher_function(launcher: str, name: str) -> str:
+    start = launcher.index(f"{name}() {{")
+    end = launcher.index("\n}\n", start) + 3
+    return launcher[start:end]
+
+
+def _run_handoff_functions(tmp_path, handoff_enabled=True, self_job=False):
+    import train_masked_unet3d as train
+
+    launcher = Path(train.__file__).with_name("train_masked_unet3d_4n16g.sbatch").read_text()
+    functions = "\n".join(_launcher_function(launcher, name) for name in (
+        "validate_registered_active_salloc", "cancel_registered_active_salloc",
+    ))
+    registry = tmp_path / "active_slurm_job_id"
+    registry.write_text("12345\n" if not self_job else "99999\n")
+    events = tmp_path / "events"
+    script = f"""
+set -uo pipefail
+NNODES=4
+GPUS_PER_NODE=4
+SLURM_JOB_ID=99999
+ACTIVE_JOB_REGISTRY={str(registry)!r}
+HANDOFF_ACTIVE_SALLOC={int(handoff_enabled)}
+HANDOFF_SCANCEL_COMMAND=fake_scancel
+ACTIVE=1
+EVENTS={str(events)!r}
+slurm_job_is_active() {{
+    if (( ACTIVE )); then return 0; fi
+    printf 'wait\n' >> "$EVENTS"
+    return 1
+}}
+scontrol() {{
+    printf '%s\n' 'JobId=12345 UserId=tester(1) Account=m5240_g BatchFlag=0 NumNodes=4 AllocTRES=gres/gpu=16 '
+}}
+id() {{ printf '%s\n' tester; }}
+fake_scancel() {{ printf 'cancel\n' >> "$EVENTS"; ACTIVE=0; }}
+preflight() {{ printf 'preflight\n' >> "$EVENTS"; }}
+{functions}
+preflight
+REGISTRY_STATUS=0
+validate_registered_active_salloc || REGISTRY_STATUS=$?
+if (( REGISTRY_STATUS == 2 )); then exit 2; fi
+if (( REGISTRY_STATUS == 0 )); then
+    if [[ "$HANDOFF_ACTIVE_SALLOC" != 1 ]]; then
+        printf 'refuse\n' >> "$EVENTS"
+        exit 2
+    fi
+    cancel_registered_active_salloc
+    preflight
+fi
+printf 'resume\n' >> "$EVENTS"
+"""
+    result = subprocess.run(["bash", "-c", script], text=True, capture_output=True)
+    return result, events.read_text().splitlines() if events.exists() else []
+
+
+def test_handoff_disabled_refuses_active_registry_without_cancellation(tmp_path):
+    result, events = _run_handoff_functions(tmp_path, handoff_enabled=False)
+    assert result.returncode == 2
+    assert events == ["preflight", "refuse"]
+
+
+def test_handoff_enabled_preflights_cancels_waits_revalidates_then_resumes(tmp_path):
+    result, events = _run_handoff_functions(tmp_path, handoff_enabled=True)
+    assert result.returncode == 0, result.stderr
+    assert events == ["preflight", "cancel", "wait", "preflight", "resume"]
+
+
+def test_handoff_registry_cannot_cancel_current_batch_job(tmp_path):
+    result, events = _run_handoff_functions(tmp_path, handoff_enabled=True, self_job=True)
+    assert result.returncode == 2
+    assert events == ["preflight"]
+
+
+def test_latest_checkpoint_is_atomically_replaced(tmp_path, monkeypatch):
+    import train_masked_unet3d as train
+
+    model = ScaleModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=.1)
+    latest = tmp_path / "latest.pt"
+    temporary = tmp_path / "latest.pt.tmp"
+    latest.write_bytes(b"previous-valid-checkpoint")
+    temporary.write_bytes(b"stale-incomplete-temporary")
+    replacements = []
+    real_replace = os.replace
+
+    def checked_replace(source, destination):
+        source, destination = Path(source), Path(destination)
+        checkpoint = torch.load(source, map_location="cpu", weights_only=False)
+        assert checkpoint["epoch"] == 3
+        assert destination == latest
+        replacements.append((source, destination))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(train.os, "replace", checked_replace)
+    save_checkpoint(latest, model, optimizer, 3, SimpleNamespace(), {"loss": [1.]})
+    assert replacements == [(temporary, latest)]
+    assert not temporary.exists()
+    assert torch.load(latest, map_location="cpu", weights_only=False)["epoch"] == 3
+
+
+def test_history_is_atomically_replaced_and_stale_temporary_is_removed(tmp_path, monkeypatch):
+    history_path = tmp_path / "history.json"
+    temporary = tmp_path / "history.json.tmp"
+    history_path.write_text('[{"epoch": 1}]')
+    temporary.write_text("stale incomplete JSON")
+    replacements = []
+    real_replace = os.replace
+
+    def checked_replace(source, destination):
+        source, destination = Path(source), Path(destination)
+        assert json.loads(source.read_text()) == [{"epoch": 1}, {"epoch": 2}]
+        replacements.append((source, destination))
+        real_replace(source, destination)
+
+    import train_masked_unet3d as train
+    monkeypatch.setattr(train.os, "replace", checked_replace)
+    save_history_atomic(history_path, [{"epoch": 1}, {"epoch": 2}])
+    assert replacements == [(temporary, history_path)]
+    assert json.loads(history_path.read_text()) == [{"epoch": 1}, {"epoch": 2}]
+    assert not temporary.exists()
+
+
+def test_failed_history_temporary_write_preserves_old_valid_history(tmp_path, monkeypatch):
+    import train_masked_unet3d as train
+
+    history_path = tmp_path / "history.json"
+    temporary = tmp_path / "history.json.tmp"
+    original = [{"epoch": 1, "val_mse": 1.0}]
+    history_path.write_text(json.dumps(original))
+
+    def fail_during_dump(_history, stream, **_kwargs):
+        stream.write('[{"epoch": 2}')
+        raise OSError("injected history write failure")
+
+    monkeypatch.setattr(train.json, "dump", fail_during_dump)
+    with pytest.raises(OSError, match="injected history write failure"):
+        save_history_atomic(history_path, [{"epoch": 1}, {"epoch": 2}])
+    assert json.loads(history_path.read_text()) == original
+    assert not temporary.exists()
+
+
+def test_epoch_commit_orders_atomic_history_before_atomic_latest():
+    import train_masked_unet3d as train
+
+    source = Path(train.__file__).read_text()
+    epoch_loop = source[source.index("for epoch in range(start_epoch, final_epoch + 1):"):]
+    history_commit = epoch_loop.index("save_history_atomic(history_path, history)")
+    latest_commit = epoch_loop.index("save_checkpoint(\n                latest_path")
+    assert history_commit < latest_commit
+
+
+def test_checkpoint_authoritative_history_accepts_equal_or_ahead_and_trims():
+    history = [{"epoch": epoch, "val_mse": 1.0 / epoch} for epoch in range(1, 22)]
+    equal = history_through_checkpoint(history[:20], 20)
+    ahead = history_through_checkpoint(history, 20)
+    assert [row["epoch"] for row in equal] == list(range(1, 21))
+    assert ahead == equal
+
+
+def test_checkpoint_authoritative_history_rejects_history_behind():
+    history = [{"epoch": epoch} for epoch in range(1, 20)]
+    with pytest.raises(ValueError, match="behind or inconsistent"):
+        history_through_checkpoint(history, 20)
+
+
+@pytest.mark.parametrize("history_end,accepted", [(6, True), (7, True), (5, False)])
+def test_launcher_preflight_uses_checkpoint_authoritative_history(
+    tmp_path, monkeypatch, history_end, accepted,
+):
+    import train_masked_unet3d as train
+
+    monkeypatch.setattr(sys, "argv", [
+        "train", "--out-dir", str(tmp_path), "--amp", "--amp-dtype", "bfloat16",
+        "--uncertainty-aware", "--uncertainty-loss", "gaussian_nll",
+        "--curriculum-training", "--stop-after-epochs", "7",
+    ])
+    args = train.parse_args()
+    state = train.make_curriculum_state(args, 1)
+    state["successful_optimizer_steps"] = 6
+    checkpoint = dict(
+        model={"weight": torch.ones(1)}, optimizer={"state": {1: {}}},
+        stats={"mean": [0.] * 4, "std": [1.] * 4}, epoch=6,
+        args=vars(args), curriculum_state=state, split_sha256=args.split_sha256,
+    )
+    torch.save(checkpoint, tmp_path / "latest.pt")
+    (tmp_path / "history.json").write_text(json.dumps([
+        {"epoch": epoch} for epoch in range(1, history_end + 1)
+    ]))
+    launcher = Path(train.__file__).with_name("train_masked_unet3d_4n16g.sbatch").read_text()
+    preflight = launcher.split("resume_checkpoint_preflight() {", 1)[1].split(
+        "<<'PY'\n", 1
+    )[1].split("\nPY\n}", 1)[0]
+    if accepted:
+        exec(compile(preflight, "launcher_preflight", "exec"), {})
+    else:
+        with pytest.raises(ValueError, match="behind or inconsistent"):
+            exec(compile(preflight, "launcher_preflight", "exec"), {})
+
+
+def test_convergence_reconstruction_ignores_history_after_checkpoint():
+    args = SimpleNamespace(
+        curriculum_training=True, curriculum_config="global_cosine",
+        warmup_epochs=5, min_lr=1e-5, transition_ema_half_life=5.0,
+        transition_rate_window=5, transition_rate_threshold=.005,
+        transition_patience=4,
+    )
+    state = SimpleNamespace(variance_ramp_epochs=40., rollout_ramp_epochs=40.)
+    state = make_curriculum_state(state, updates_per_epoch=10)
+    committed = [
+        {"epoch": epoch, "val_mse": 1.0, "learning_rate": 2e-4}
+        for epoch in range(1, 21)
+    ]
+    ahead = committed + [{"epoch": 21, "val_mse": 1e6, "learning_rate": 2e-4}]
+    expected = phase_a_convergence(committed, args, state)
+    actual = phase_a_convergence(history_through_checkpoint(ahead, 20), args, state)
+    assert actual == expected
 
 
 @pytest.mark.parametrize("slope,sign", [(-.02, -1), (0., 0), (.02, 1)])
@@ -702,6 +934,21 @@ def test_abcd_existing_successful_step_ramps_and_phase_c_rollout_gate():
     assert not phase_c_convergence(changed, args, state)["ready_for_phase_d"]
 
 
+def test_phase_b_and_c_convergence_use_student_t_nll_keys_without_formula_changes():
+    args_b, state_b, history_b = _phase_b_example()
+    args_b.uncertainty_loss = "student_t_nll"
+    for row in history_b:
+        row["val_student_t_nll"] = row.pop("val_gaussian_nll")
+    assert phase_b_convergence(history_b, args_b, state_b)["ready_for_rollout_ramp"]
+
+    args_c, state_c, history_c = _phase_c_example()
+    args_c.uncertainty_loss = "student_t_nll"
+    for row in history_c:
+        row["val_student_t_nll"] = row.pop("val_gaussian_nll")
+        row["val_rollout_student_t_nll"] = row.pop("val_rollout_gaussian_nll")
+    assert phase_c_convergence(history_c, args_c, state_c)["ready_for_phase_d"]
+
+
 def test_abcd_phase_d_requires_phase_c_readiness_and_resume_is_exact(tmp_path):
     import json
     from train_masked_unet3d import make_curriculum_state
@@ -874,7 +1121,9 @@ def test_launcher_resume_scaler_preflight(tmp_path, monkeypatch, dtype, scaler_s
     (tmp_path / "history.json").write_text(json.dumps([{"epoch": e} for e in range(1, 7)]))
     # Execute only the launcher's existing Python preflight, never its srun command.
     launcher = Path(train.__file__).with_name("train_masked_unet3d_4n16g.sbatch").read_text()
-    preflight = launcher.split('COMPLETED_EPOCH=$(', 1)[1].split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+    preflight = launcher.split("resume_checkpoint_preflight() {", 1)[1].split(
+        "<<'PY'\n", 1
+    )[1].split("\nPY\n}", 1)[0]
     if accepted:
         exec(compile(preflight, "launcher_preflight", "exec"), {})
     else:
@@ -1054,6 +1303,25 @@ def test_wandb_epoch_log_has_no_mae_and_keeps_mse_and_sampling_stats():
         "mask/magnetic_probe_patterns/full_sample_share",
     ):
         assert key in log_data
+
+    student_row = dict(
+        row, uncertainty_objective="student_t_nll",
+        train_student_t_nll=-0.2, val_student_t_nll=-0.1,
+        val_rollout_mse=0.2, val_rollout_student_t_nll=0.3,
+    )
+    student_val = {key: dict(value) for key, value in val_metrics.items()}
+    for pattern in MASK_PATTERNS:
+        student_val[pattern].update(
+            student_t_nll=-0.1, rollout_mse=0.2, rollout_student_t_nll=0.3,
+        )
+    student_log = build_epoch_wandb_log(
+        row=student_row, train_metrics=train_metrics,
+        val_metrics=student_val, val_patterns=list(MASK_PATTERNS),
+    )
+    assert student_log["train/student_t_nll"] == -0.2
+    assert student_log["val/student_t_nll"] == -0.1
+    assert student_log["val/rollout_student_t_nll"] == 0.3
+    assert not any("gaussian_nll" in key for key in student_log)
 
 
 def test_wandb_epoch_log_includes_curriculum_phase_and_convergence_state():

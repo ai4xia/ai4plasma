@@ -146,7 +146,7 @@ if ${PHASE_C_K2_PROBE}; then
     IFS=$'\t' read -r PROBE_SOURCE_EPOCH PROBE_EPOCHS PROBE_FINAL_EPOCH \
         PROBE_LR PROBE_WARMUP_EPOCHS PROBE_MIN_LR PROBE_CURRICULUM_CONFIG \
         PROBE_MODEL_VERSION PROBE_SOURCE_PHASE PROBE_LAMBDA_V PROBE_LAMBDA_R \
-        PROBE_OPTIMIZER_LR < <(
+        PROBE_OPTIMIZER_LR PROBE_UNCERTAINTY_LOSS PROBE_STUDENT_T_DF < <(
         "${PYTHON}" - "${PHASE_C_PROBE_CHECKPOINT}" <<'PY'
 from pathlib import Path
 import sys
@@ -188,6 +188,7 @@ print("\t".join(map(str, (
     epoch, args["epochs"], args["final_epoch"], args["lr"],
     args["warmup_epochs"], args["min_lr"], config, args["model_version"],
     phase_name, lambda_v, lambda_r, group_lrs.pop(),
+    args["uncertainty_loss"], args.get("student_t_df", 3.0),
 ))))
 PY
     )
@@ -221,7 +222,7 @@ RUN_NAME=multi_beta_smoothl1_6ep_horizon20_20261018
 if ${PHASE_C_K2_PROBE}; then
     RUN_NAME=${CURRICULUM_RUN_NAME}
 elif ${FROMSCRATCH_48H}; then
-    RUN_NAME=${FROMSCRATCH_RUN_NAME:-multi_beta_curriculum_direct_v3_fromscratch_globalcosine_2e4_1e5_1000ep_48h_20261027}
+    RUN_NAME=${CURRICULUM_RUN_NAME:-multi_beta_curriculum_direct_v3_fromscratch_globalcosine_2e4_1e5_1000ep_48h_20261027}
 elif ${PHASE_D_PROBE}; then
     RUN_NAME=${CURRICULUM_RUN_NAME:-phase_d_stateful_sliding_probe_from_1000ep_20261105}
 elif ${POST_FINAL_CONTINUATION}; then
@@ -311,28 +312,35 @@ slurm_job_is_active() {
     [[ -n "${listing}" ]]
 }
 
-if [[ "${HANDOFF_ACTIVE_SALLOC}" == 1 ]]; then
+HANDOFF_SCANCEL_COMMAND=${HANDOFF_SCANCEL_COMMAND:-scancel}
+
+validate_registered_active_salloc() {
+    REGISTERED_JOB_ID=
+    REGISTERED_JOB_INFO=
     if [[ ! -e "${ACTIVE_JOB_REGISTRY}" ]]; then
         echo "Handoff: no active-allocation registry exists; no salloc job to cancel."
+        return 1
     else
         REGISTERED_JOB_ID=$(<"${ACTIVE_JOB_REGISTRY}")
         if [[ -z "${REGISTERED_JOB_ID}" ]]; then
             echo "Handoff: active-allocation registry is empty; no salloc job to cancel."
+            return 1
         elif [[ ! "${REGISTERED_JOB_ID}" =~ ^[0-9]+$ ]]; then
             echo "ERROR: invalid Slurm job ID in ${ACTIVE_JOB_REGISTRY}: ${REGISTERED_JOB_ID@Q}" >&2
-            exit 2
+            return 2
         elif [[ "${REGISTERED_JOB_ID}" == "${SLURM_JOB_ID}" ]]; then
             echo "ERROR: handoff registry points to the current batch job ${SLURM_JOB_ID}; refusing self-cancellation." >&2
-            exit 2
+            return 2
         else
             REGISTERED_JOB_INFO=$(scontrol show job "${REGISTERED_JOB_ID}" -o 2>/dev/null || true)
             if [[ -z "${REGISTERED_JOB_INFO}" ]] || ! slurm_job_is_active "${REGISTERED_JOB_ID}"; then
                 echo "Handoff: registered job ${REGISTERED_JOB_ID} is stale or already gone; nothing to cancel."
+                return 1
             else
                 CURRENT_USER=$(id -un)
                 if [[ "${REGISTERED_JOB_INFO}" != *" UserId=${CURRENT_USER}("* ]]; then
                     echo "ERROR: registered job ${REGISTERED_JOB_ID} is not owned by ${CURRENT_USER}; refusing cancellation." >&2
-                    exit 2
+                    return 2
                 fi
                 if [[ "${REGISTERED_JOB_INFO}" != *" Account=m5240_g "* ]] ||
                    [[ "${REGISTERED_JOB_INFO}" != *" BatchFlag=0 "* ]] ||
@@ -341,23 +349,27 @@ if [[ "${HANDOFF_ACTIVE_SALLOC}" == 1 ]]; then
                    [[ ! "${REGISTERED_JOB_INFO}" =~ AllocTRES=[^[:space:]]*gres/gpu=([0-9]+) ]] ||
                    (( BASH_REMATCH[1] < NNODES * GPUS_PER_NODE )); then
                     echo "ERROR: registered job ${REGISTERED_JOB_ID} is not the expected 4-node/16-GPU salloc allocation; refusing cancellation." >&2
-                    exit 2
+                    return 2
                 fi
-                echo "Handoff: cancelling registered active salloc job ${REGISTERED_JOB_ID}."
-                scancel "${REGISTERED_JOB_ID}"
-                HANDOFF_DEADLINE=$((SECONDS + 120))
-                while slurm_job_is_active "${REGISTERED_JOB_ID}"; do
-                    if (( SECONDS >= HANDOFF_DEADLINE )); then
-                        echo "ERROR: registered job ${REGISTERED_JOB_ID} is still active after 120 seconds; aborting before checkpoint access/DDP." >&2
-                        exit 2
-                    fi
-                    sleep 2
-                done
-                echo "Handoff: registered salloc job ${REGISTERED_JOB_ID} has terminated; checkpoint resume may proceed."
+                return 0
             fi
         fi
     fi
-fi
+}
+
+cancel_registered_active_salloc() {
+    echo "Handoff: cancelling registered active salloc job ${REGISTERED_JOB_ID}."
+    "${HANDOFF_SCANCEL_COMMAND}" "${REGISTERED_JOB_ID}"
+    HANDOFF_DEADLINE=$((SECONDS + 120))
+    while slurm_job_is_active "${REGISTERED_JOB_ID}"; do
+        if (( SECONDS >= HANDOFF_DEADLINE )); then
+            echo "ERROR: registered job ${REGISTERED_JOB_ID} is still active after 120 seconds; aborting before checkpoint revalidation/DDP." >&2
+            return 2
+        fi
+        sleep 2
+    done
+    echo "Handoff: registered salloc job ${REGISTERED_JOB_ID} has terminated; revalidating checkpoint."
+}
 
 echo "Loaded PyTorch environment:"
 echo "  Python: ${PYTHON}"
@@ -428,8 +440,15 @@ TRAIN_ARGS=(
     --wandb-name "${RUN_NAME}"
 )
 if ${STAGE1_NLL} || ${CURRICULUM}; then
-    TRAIN_ARGS+=(--uncertainty-loss gaussian_nll --stop-after-epochs "${STOP_EPOCH}"
-    )
+    if ${FROMSCRATCH_48H}; then
+        TRAIN_ARGS+=(--uncertainty-loss student_t_nll --student-t-df 3.0)
+    elif ${PHASE_C_K2_PROBE}; then
+        TRAIN_ARGS+=(--uncertainty-loss "${PROBE_UNCERTAINTY_LOSS}"
+                     --student-t-df "${PROBE_STUDENT_T_DF}")
+    else
+        TRAIN_ARGS+=(--uncertainty-loss gaussian_nll)
+    fi
+    TRAIN_ARGS+=(--stop-after-epochs "${STOP_EPOCH}")
     if ${CURRICULUM}; then
         TRAIN_ARGS+=(--curriculum-training "${ARM_ARGS[@]}")
         if ${ABCD_SYMMETRIC}; then
@@ -524,6 +543,74 @@ fi
 
 # Check the same compatibility rules as the trainer before starting workers.
 # Resume uses the LR horizon recorded by the selected curriculum configuration.
+resume_checkpoint_preflight() {
+"${PYTHON}" - "${TRAIN_ARGS[@]}" <<'PY'
+from pathlib import Path
+import json
+import math
+import sys
+import torch
+from data.vpic_hdf5_dataset import validate_checkpoint_split
+from train_masked_unet3d import (
+    curriculum_weights, history_through_checkpoint, make_curriculum_state, parse_args,
+    validate_post_final_continuation, validate_resume_parameters,
+)
+
+args = parse_args()
+latest = Path(args.out_dir) / "latest.pt"
+initial_continuation = bool(args.post_final_continuation and not latest.is_file())
+checkpoint_path = Path(args.post_final_continuation) if initial_continuation else latest
+checkpoint = torch.load(checkpoint_path, map_location="cpu")
+for key in ("model", "optimizer", "stats", "epoch", "args"):
+    if key not in checkpoint or not checkpoint[key]:
+        raise ValueError(f"Cannot resume: missing or empty checkpoint {key!r}")
+if args.amp and args.amp_dtype == "float16" and not checkpoint.get("scaler"):
+    raise ValueError("Cannot resume: missing or empty checkpoint 'scaler'")
+validate_checkpoint_split(checkpoint)
+if initial_continuation:
+    validate_post_final_continuation(args, checkpoint, checkpoint_path, Path(args.out_dir))
+else:
+    validate_resume_parameters(args, checkpoint["args"])
+epoch = int(checkpoint["epoch"])
+limit = (args.stop_after_epochs or args.epochs) if args.curriculum_training else args.epochs
+minimum_epoch = args.epochs if args.post_final_continuation else (1 if args.curriculum_training else 6)
+if not minimum_epoch <= epoch <= limit:
+    raise ValueError(f"Unexpected completed epoch {epoch} for final epoch {limit}")
+if args.curriculum_training:
+    state = make_curriculum_state(args, checkpoint["curriculum_state"]["updates_per_epoch"], checkpoint)
+    if args.post_final_continuation and curriculum_weights(state) != (1.0, 1.0):
+        raise ValueError("Continuation did not restore lambda_v=lambda_r=1")
+    if (args.arm_variance_ramp or args.arm_rollout_ramp) and epoch >= limit:
+        raise ValueError("Arming requires --stop-after-epochs beyond the completed epoch")
+if args.uncertainty_loss in ("gaussian_nll", "student_t_nll"):
+    history_path = Path(args.out_dir) / "history.json"
+    if initial_continuation:
+        if history_path.exists():
+            raise ValueError("Fresh continuation output unexpectedly contains history.json")
+    else:
+        history = json.loads(history_path.read_text())
+        if args.post_final_continuation:
+            source = torch.load(args.post_final_continuation, map_location="cpu", weights_only=False, mmap=True)
+            first_epoch = int(source["epoch"]) + 1
+        else:
+            first_epoch = 1
+        history_through_checkpoint(history, epoch, first_epoch=first_epoch)
+if args.post_final_continuation:
+    group_lrs = [float(group["lr"]) for group in checkpoint["optimizer"]["param_groups"]]
+    if not group_lrs or any(not math.isclose(lr, args.min_lr, rel_tol=0., abs_tol=1e-15) for lr in group_lrs):
+        raise ValueError(f"Continuation optimizer LR is not fixed at {args.min_lr:g}: {group_lrs}")
+    print(
+        f"Continuation preflight confirmed: source/completed epoch={epoch}, "
+        f"next epoch={epoch + 1}, final epoch={limit}, lambda_v=lambda_r=1, "
+        f"optimizer restored ({len(checkpoint['optimizer']['state'])} parameter states), "
+        f"LR={args.min_lr:g}, split_sha256={checkpoint['split_sha256']}, "
+        f"output={args.out_dir}",
+        file=sys.stderr,
+    )
+print(epoch)
+PY
+}
+
 COMPLETED_EPOCH=0
 if ${FROMSCRATCH_48H} && ! ${RESUMING}; then
 FROMSCRATCH_PREFLIGHT_RESULT=$("${PYTHON}" - "${TRAIN_ARGS[@]}" <<'PY'
@@ -604,77 +691,31 @@ COMPLETED_EPOCH=${FROMSCRATCH_PREFLIGHT_RESULT}
 elif ${PHASE_C_K2_PROBE}; then
     COMPLETED_EPOCH=${PROBE_SOURCE_EPOCH}
 elif ${RESUMING} || ${POST_FINAL_CONTINUATION}; then
-COMPLETED_EPOCH=$("${PYTHON}" - "${TRAIN_ARGS[@]}" <<'PY'
-from pathlib import Path
-import json
-import math
-import sys
-import torch
-from data.vpic_hdf5_dataset import validate_checkpoint_split
-from train_masked_unet3d import (
-    curriculum_weights, make_curriculum_state, parse_args,
-    validate_post_final_continuation, validate_resume_parameters,
-)
-
-args = parse_args()
-latest = Path(args.out_dir) / "latest.pt"
-initial_continuation = bool(args.post_final_continuation and not latest.is_file())
-checkpoint_path = Path(args.post_final_continuation) if initial_continuation else latest
-checkpoint = torch.load(checkpoint_path, map_location="cpu")
-for key in ("model", "optimizer", "stats", "epoch", "args"):
-    if key not in checkpoint or not checkpoint[key]:
-        raise ValueError(f"Cannot resume: missing or empty checkpoint {key!r}")
-if args.amp and args.amp_dtype == "float16" and not checkpoint.get("scaler"):
-    raise ValueError("Cannot resume: missing or empty checkpoint 'scaler'")
-validate_checkpoint_split(checkpoint)
-if initial_continuation:
-    validate_post_final_continuation(args, checkpoint, checkpoint_path, Path(args.out_dir))
-else:
-    validate_resume_parameters(args, checkpoint["args"])
-epoch = int(checkpoint["epoch"])
-limit = (args.stop_after_epochs or args.epochs) if args.curriculum_training else args.epochs
-minimum_epoch = args.epochs if args.post_final_continuation else (1 if args.curriculum_training else 6)
-if not minimum_epoch <= epoch <= limit:
-    raise ValueError(f"Unexpected completed epoch {epoch} for final epoch {limit}")
-if args.curriculum_training:
-    state = make_curriculum_state(args, checkpoint["curriculum_state"]["updates_per_epoch"], checkpoint)
-    if args.post_final_continuation and curriculum_weights(state) != (1.0, 1.0):
-        raise ValueError("Continuation did not restore lambda_v=lambda_r=1")
-    if (args.arm_variance_ramp or args.arm_rollout_ramp) and epoch >= limit:
-        raise ValueError("Arming requires --stop-after-epochs beyond the completed epoch")
-if args.uncertainty_loss == "gaussian_nll":
-    history_path = Path(args.out_dir) / "history.json"
-    if initial_continuation:
-        if history_path.exists():
-            raise ValueError("Fresh continuation output unexpectedly contains history.json")
-    else:
-        history = json.loads(history_path.read_text())
-        if args.post_final_continuation:
-            source = torch.load(args.post_final_continuation, map_location="cpu", weights_only=False, mmap=True)
-            first_epoch = int(source["epoch"]) + 1
-        else:
-            first_epoch = 1
-        if [row["epoch"] for row in history] != list(range(first_epoch, epoch + 1)):
-            raise ValueError("Cannot resume: history does not match completed checkpoint epochs.")
-if args.post_final_continuation:
-    group_lrs = [float(group["lr"]) for group in checkpoint["optimizer"]["param_groups"]]
-    if not group_lrs or any(not math.isclose(lr, args.min_lr, rel_tol=0., abs_tol=1e-15) for lr in group_lrs):
-        raise ValueError(f"Continuation optimizer LR is not fixed at {args.min_lr:g}: {group_lrs}")
-    print(
-        f"Continuation preflight confirmed: source/completed epoch={epoch}, "
-        f"next epoch={epoch + 1}, final epoch={limit}, lambda_v=lambda_r=1, "
-        f"optimizer restored ({len(checkpoint['optimizer']['state'])} parameter states), "
-        f"LR={args.min_lr:g}, split_sha256={checkpoint['split_sha256']}, "
-        f"output={args.out_dir}",
-        file=sys.stderr,
-    )
-print(epoch)
-PY
-)
+COMPLETED_EPOCH=$(resume_checkpoint_preflight)
 if (( COMPLETED_EPOCH >= STOP_EPOCH )); then
     echo "Training is already complete through epoch ${STOP_EPOCH}; no workers launched."
     exit 0
 fi
+fi
+
+if ${FROMSCRATCH_48H} && ${RESUMING} && [[ "${JOB_INFO}" == *" BatchFlag=1 "* ]]; then
+    REGISTRY_STATUS=0
+    validate_registered_active_salloc || REGISTRY_STATUS=$?
+    if (( REGISTRY_STATUS == 2 )); then
+        exit 2
+    elif (( REGISTRY_STATUS == 0 )); then
+        if [[ "${HANDOFF_ACTIVE_SALLOC}" != 1 ]]; then
+            echo "ERROR: active interactive allocation ${REGISTERED_JOB_ID} is registered for ${OUT_DIR}; refusing concurrent resume. Set HANDOFF_ACTIVE_SALLOC=1 for an explicit safe handoff." >&2
+            exit 2
+        fi
+        cancel_registered_active_salloc
+        COMPLETED_EPOCH=$(resume_checkpoint_preflight)
+        echo "Handoff: checkpoint revalidated successfully at epoch ${COMPLETED_EPOCH}; DDP resume may proceed."
+        if (( COMPLETED_EPOCH >= STOP_EPOCH )); then
+            echo "Training is already complete through epoch ${STOP_EPOCH}; no workers launched."
+            exit 0
+        fi
+    fi
 fi
 
 if ${FROMSCRATCH_48H} && [[ "${JOB_INFO}" == *" BatchFlag=0 "* ]]; then
@@ -718,6 +759,8 @@ if ${CURRICULUM}; then
         echo "Phase-C K=2 probe guard: rollout ramp cannot complete; Phase D remains inactive"
     elif ${FROMSCRATCH_48H}; then
         echo "Curriculum state: fresh adaptive Phase A from random model initialization"
+        echo "Uncertainty objective: student_t_nll"
+        echo "Student-t df: 3.0"
     elif ${POST_FINAL_CONTINUATION}; then
         echo "Curriculum state: fixed full objective; adaptive transitions disabled"
     else

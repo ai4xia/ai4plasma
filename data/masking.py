@@ -1070,6 +1070,7 @@ def predicted_error_mse_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
     objective: str = "smooth_l1",
+    student_t_df: float = 3.0,
 ) -> torch.Tensor:
     """Variance objective in FP32; retain the legacy name and Smooth L1 default."""
     valid = torch.isfinite(target)
@@ -1084,6 +1085,22 @@ def predicted_error_mse_loss(
     if objective == "gaussian_nll":
         variance = variance_valid.clamp_min(GAUSSIAN_NLL_VARIANCE_FLOOR)
         return 0.5 * (variance.log() + squared_error / variance).mean()
+    if objective == "student_t_nll":
+        if not math.isfinite(student_t_df) or student_t_df <= 2.0:
+            raise ValueError(f"Student-t degrees of freedom must be finite and > 2, got {student_t_df}")
+        variance = variance_valid.clamp_min(GAUSSIAN_NLL_VARIANCE_FLOOR)
+        scale_squared = variance * ((student_t_df - 2.0) / student_t_df)
+        constant = (
+            math.lgamma(student_t_df / 2.0)
+            - math.lgamma((student_t_df + 1.0) / 2.0)
+            + 0.5 * math.log(student_t_df * math.pi)
+        )
+        return (
+            constant
+            + 0.5 * scale_squared.log()
+            + 0.5 * (student_t_df + 1.0)
+            * torch.log1p(squared_error / (student_t_df * scale_squared))
+        ).mean()
     raise ValueError(f"Unknown uncertainty objective: {objective!r}")
 
 
