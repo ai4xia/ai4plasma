@@ -37,6 +37,66 @@ def test_continuous_corruption_and_endpoints():
     )
 
 
+def test_diagnostic_training_replaces_only_fifth_mask_family(monkeypatch):
+    import train_masked_unet3d as train
+
+    patterns = list(MASK_PATTERNS)
+    monkeypatch.setattr(
+        train, "sample_patterns",
+        lambda _weights, n: (patterns * ((n + 4) // 5))[:n],
+    )
+    target = torch.zeros(5, 4, 24, 3, 2)
+    result = train.sample_training_mask(
+        target, {name: 1.0 for name in MASK_PATTERNS},
+        .05, .05, .05, .05, temporal_extrapolation=True,
+    )
+    mask, infos, magnetic, density = result[:4]
+    expected = [*MASK_PATTERNS[:-1], "temporal_extrapolation"]
+    assert magnetic == density == expected
+    assert torch.equal(mask[4, 0], mask[4, 1])
+    assert torch.equal(mask[4, 1], mask[4, 2])
+    for modality, channels in (("magnetic", slice(0, 3)), ("density", slice(3, 4))):
+        horizon = infos[4][f"{modality}_horizon"]
+        assert 1 <= horizon <= 23
+        values = mask[4, channels]
+        assert torch.all(values[:, :24 - horizon] == 1)
+        assert torch.all(values[:, 24 - horizon:] == 0)
+
+    # Without the opt-in flag, the exact same category remains temporal_block.
+    historical = train.sample_training_mask(
+        target, {name: 1.0 for name in MASK_PATTERNS}, .05, .05, .05, .05,
+    )
+    assert historical[2] == historical[3] == list(MASK_PATTERNS)
+
+
+def test_diagnostic_training_forces_all_masks_to_temporal_extrapolation(monkeypatch):
+    import train_masked_unet3d as train
+
+    def unexpected_sampler(*args, **kwargs):
+        pytest.fail("100% extrapolation must not sample historical mask families")
+
+    monkeypatch.setattr(train, "sample_patterns", unexpected_sampler)
+    monkeypatch.setattr(train, "sample_independent_batch_masks", unexpected_sampler)
+    monkeypatch.setattr(train, "sample_training_severity_counts", unexpected_sampler)
+    target = torch.zeros(10, 4, 24, 3, 2)
+    result = train.sample_training_mask(
+        target, {name: 1.0 for name in MASK_PATTERNS},
+        .05, .05, .05, .05, temporal_extrapolation_only=True,
+    )
+    mask, infos, magnetic, density = result[:4]
+    expected = ["temporal_extrapolation"] * 10
+    assert magnetic == density == expected
+    for b in range(10):
+        assert torch.equal(mask[b, 0], mask[b, 1])
+        assert torch.equal(mask[b, 1], mask[b, 2])
+        for modality, channels in (("magnetic", slice(0, 3)), ("density", slice(3, 4))):
+            horizon = infos[b][f"{modality}_horizon"]
+            assert 1 <= horizon <= 23
+            values = mask[b, channels]
+            assert torch.all(values[:, :24 - horizon] == 1)
+            assert torch.all(values[:, 24 - horizon:] == 0)
+
+
 def test_error_regression_detaches_prediction_and_does_not_clip_target():
     prediction = torch.tensor([3.0, 2.0, 1.0, 1.0], requires_grad=True)
     variance = torch.tensor([1.0, 0.5, 0.75, 1.5], requires_grad=True)
@@ -1036,6 +1096,262 @@ def test_curriculum_phases_formula_and_gradient_routing(lambda_v, lambda_r, forw
     assert GAUSSIAN_NLL_VARIANCE_FLOOR == 1e-6
 
 
+@pytest.mark.parametrize("lambda_v", [0.0, 0.4, 1.0])
+def test_three_phase_normalized_phase_ab_objective(lambda_v):
+    from train_masked_unet3d import curriculum_forward_loss
+
+    model = UNet3D(
+        base_channels=2, channel_mults=(1, 2, 4), uncertainty_aware=True,
+        architecture=DIRECT_MODEL_VERSION,
+    )
+    target = torch.randn(1, 4, 4, 4, 4)
+    mask = torch.randint(2, target.shape).float()
+    model_input = torch.cat(
+        [make_uncertain_input(target, 1 - mask), 1 - mask], dim=1,
+    )
+    loss, _, _, parts = curriculum_forward_loss(
+        model, model_input, target, mask, lambda_v, 0.0,
+        uncertainty_loss="student_t_nll", student_t_df=3.0,
+        curriculum_config="three_phase_global_cosine",
+    )
+    expected = (
+        parts["L_mu_0"] + lambda_v * parts["L_var_0"]
+    ) / (1.0 + lambda_v)
+    torch.testing.assert_close(loss, expected)
+    assert parts["forwards"] == 1
+    assert parts["reuse_weight_0"] == 1
+    assert parts["reuse_weight_1"] == 0
+    assert parts["reuse_weight_2"] == 0
+    if lambda_v == 0:
+        torch.testing.assert_close(loss, parts["L_mu_0"])
+
+
+@pytest.mark.parametrize("detach_features", [True, False])
+def test_uncertainty_feature_gradient_switch_preserves_detached_mean(detach_features):
+    from train_masked_unet3d import curriculum_forward_loss
+
+    torch.manual_seed(47)
+    model = UNet3D(
+        base_channels=2, channel_mults=(1, 2, 4), uncertainty_aware=True,
+        architecture=DIRECT_MODEL_VERSION, use_attention=True, spatial_only_pooling=True,
+    )
+    original_state = {name: value.clone() for name, value in model.state_dict().items()}
+    target = torch.randn(1, 4, 4, 4, 4)
+    mask = torch.randint(2, target.shape).float()
+    inputs = torch.cat([make_uncertain_input(target, 1-mask), 1-mask], dim=1)
+    # Omitting the switch tests the historical default, as well as the opt-in.
+    kwargs = {} if detach_features else {"detach_variance_features": False}
+    _, pred, variance, parts = curriculum_forward_loss(
+        model, inputs, target, mask, 1.0, 0.0,
+        uncertainty_loss="student_t_nll", student_t_df=3.0,
+        curriculum_config="three_phase_global_cosine", **kwargs,
+    )
+    pred.retain_grad()
+    parts["L_var_0"].backward()
+    assert model.variance_out.weight.grad.abs().sum() > 0
+    assert pred.grad is None
+    assert model.out.weight.grad is None and model.out.bias.grad is None
+    if detach_features:
+        assert all(p.grad is None for name, p in model.named_parameters()
+                   if not name.startswith("variance_out."))
+    else:
+        for parameter in (model.enc0.conv1.weight, model.up0.conv.conv1.weight,
+                          model.attention_mid.out_proj.weight):
+            assert parameter.grad is not None and parameter.grad.abs().sum() > 0
+    assert all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters())
+    assert pred.shape == variance.shape == target.shape
+    model.load_state_dict(original_state, strict=True)
+    with torch.no_grad():
+        historical_mu, historical_u = model(inputs, detach_variance_features=True)
+    torch.testing.assert_close(pred, historical_mu, rtol=0, atol=0)
+    torch.testing.assert_close(variance, historical_u, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("mode", ["historical", "b_only", "a_plus_b", "a_only"])
+def test_nll_gradient_paths_isolation(mode):
+    """Isolate Student-t NLL from reconstruction MSE and verify gradient routing.
+
+    - historical (A OFF, B OFF): NLL reaches variance head only; mean head and
+      shared features receive NO NLL gradients; pred.grad is None.
+    - b_only (A OFF, B ON): NLL reaches variance head and shared features through
+      the variance branch; mean head receives NO NLL gradient; pred.grad is None.
+    - a_plus_b (A ON, B ON): NLL reaches variance head, shared features through
+      the variance branch, and mean head/shared features through the non-detached
+      residual; pred.grad is nonzero; mean-head parameters receive NLL gradients.
+    - a_only (A ON, B OFF): NLL reaches variance head and mean head / shared features
+      through residual only; variance branch features remain detached.
+    """
+    from train_masked_unet3d import curriculum_forward_loss
+
+    torch.manual_seed(47)
+    model = UNet3D(
+        base_channels=2, channel_mults=(1, 2, 4), uncertainty_aware=True,
+        architecture=DIRECT_MODEL_VERSION, use_attention=True, spatial_only_pooling=True,
+    )
+    # Give model.out non-zero weights so that backpropagation through Path A
+    # can flow into the shared trunk (out.weight defaults to zeros in direct UNet3D).
+    with torch.no_grad():
+        torch.nn.init.normal_(model.out.weight, std=0.02)
+    target = torch.randn(1, 4, 4, 4, 4)
+    mask = torch.randint(2, target.shape).float()
+    inputs = torch.cat([make_uncertain_input(target, 1 - mask), 1 - mask], dim=1)
+
+    detach_variance_features = mode in ("historical", "a_only")
+    detach_mean = mode in ("historical", "b_only")
+
+    loss, pred, variance, parts = curriculum_forward_loss(
+        model, inputs, target, mask, 1.0, 0.0,
+        uncertainty_loss="student_t_nll", student_t_df=3.0,
+        curriculum_config="three_phase_global_cosine",
+        detach_variance_features=detach_variance_features,
+        detach_mean=detach_mean,
+    )
+    pred.retain_grad()
+    variance.retain_grad()
+
+    # Backpropagate ONLY the Student-t uncertainty NLL (L_var_0).
+    # This strictly isolates NLL gradients from reconstruction MSE (L_mu_0).
+    parts["L_var_0"].backward()
+
+    # 1. dL_NLL/du: always nonzero in all modes
+    assert variance.grad is not None
+    assert (variance.grad.abs() > 0).any()
+
+    # 2. Variance-head parameters: always receive NLL gradients in all modes
+    assert model.variance_out.weight.grad is not None
+    assert (model.variance_out.weight.grad.abs() > 0).any()
+    assert model.variance_out.bias.grad is not None
+    assert (model.variance_out.bias.grad.abs() > 0).any()
+
+    # 3. dL_NLL/dmu (Path A gradient on predictions)
+    if detach_mean:  # historical and b_only
+        assert pred.grad is None
+        assert model.out.weight.grad is None
+        assert model.out.bias.grad is None
+    else:  # a_plus_b and a_only
+        assert pred.grad is not None
+        assert (pred.grad.abs() > 0).any()
+        assert model.out.weight.grad is not None
+        assert (model.out.weight.grad.abs() > 0).any()
+        assert model.out.bias.grad is not None
+        assert (model.out.bias.grad.abs() > 0).any()
+
+    # 4. Representative shared parameters (encoder, decoder, attention)
+    shared_params = (
+        model.enc0.conv1.weight,
+        model.up0.conv.conv1.weight,
+        model.attention_mid.out_proj.weight,
+    )
+    if mode == "historical":
+        # A OFF, B OFF: trunk receives NO NLL gradient whatsoever
+        assert all(p.grad is None for name, p in model.named_parameters()
+                   if not name.startswith("variance_out."))
+    elif mode == "b_only":
+        # A OFF, B ON: trunk receives NLL gradients through variance head only
+        for p in shared_params:
+            assert p.grad is not None and (p.grad.abs() > 0).any()
+        # Mean head still receives NO gradient
+        assert model.out.weight.grad is None
+    elif mode == "a_plus_b":
+        # A ON, B ON: trunk receives NLL gradients through both heads; mean head receives gradients
+        for p in shared_params:
+            assert p.grad is not None and (p.grad.abs() > 0).any()
+        assert model.out.weight.grad is not None and (model.out.weight.grad.abs() > 0).any()
+    elif mode == "a_only":
+        # A ON, B OFF: trunk receives NLL gradients through mean head only
+        for p in shared_params:
+            assert p.grad is not None and (p.grad.abs() > 0).any()
+        assert model.out.weight.grad is not None and (model.out.weight.grad.abs() > 0).any()
+
+    assert all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters())
+
+
+@pytest.mark.parametrize("lambda_r", [0.4, 1.0])
+@pytest.mark.parametrize("uncertainty_loss", ["student_t_nll", "gaussian_nll"])
+def test_three_phase_k1_reuse_is_detached_raw_and_normalized(
+    monkeypatch, lambda_r, uncertainty_loss,
+):
+    from train_masked_unet3d import curriculum_forward_loss
+
+    model = UNet3D(
+        base_channels=2, channel_mults=(1, 2, 4), uncertainty_aware=True,
+        architecture=DIRECT_MODEL_VERSION,
+    )
+    with torch.no_grad():
+        model.variance_out.weight.zero_()
+        model.variance_out.bias.fill_(
+            torch.log(torch.expm1(torch.tensor(1.5))).item()
+        )
+    target = torch.randn(1, 4, 4, 4, 4)
+    initial_mask = torch.zeros_like(target)
+    initial_mask[..., ::2] = 1
+    reuse_mask = torch.zeros_like(target)
+    reuse_mask[..., :2] = 1
+    noises, inputs, outputs = [], [], []
+    original_noise = torch.randn_like
+
+    def record_noise(values):
+        noise = original_noise(values)
+        noises.append(noise)
+        return noise
+
+    monkeypatch.setattr("data.masking.torch.randn_like", record_noise)
+    pre = model.register_forward_pre_hook(
+        lambda _model, args: inputs.append(
+            (args[0].detach().clone(), args[0].requires_grad)
+        )
+    )
+    def record_output(_model, _args, output):
+        for tensor in output:
+            tensor.retain_grad()
+        outputs.append(output)
+
+    post = model.register_forward_hook(record_output)
+    model_input = torch.cat([
+        make_uncertain_input(target, 1 - initial_mask), 1 - initial_mask,
+    ], dim=1)
+    loss, pred, variance, parts = curriculum_forward_loss(
+        model, model_input, target, initial_mask, 1.0, lambda_r, (reuse_mask,),
+        uncertainty_loss=uncertainty_loss, student_t_df=3.0,
+        curriculum_config="three_phase_global_cosine",
+    )
+    pre.remove()
+    post.remove()
+
+    assert len(inputs) == len(outputs) == parts["forwards"] == 2
+    assert len(noises) == 1
+    assert not inputs[1][1]
+    second = inputs[1][0]
+    observed = reuse_mask.bool()
+    assert torch.equal(second[:, :4][observed], target[observed])
+    assert (second[:, 4:][observed] == 0).all()
+    torch.testing.assert_close(
+        second[:, :4][~observed], pred.detach()[~observed], rtol=0, atol=0,
+    )
+    torch.testing.assert_close(
+        second[:, 4:][~observed], variance.detach()[~observed], rtol=0, atol=0,
+    )
+    assert (second[:, 4:][~observed] > 1).all()
+    assert parts["L_mu_2"] == 0 and parts["L_var_2"] == 0
+    assert parts["reuse_weight_2"] == 0
+    pass_0 = (parts["L_mu_0"] + parts["L_var_0"]) / 2
+    pass_1 = (parts["L_mu_1"] + parts["L_var_1"]) / 2
+    torch.testing.assert_close(
+        loss, (pass_0 + lambda_r * pass_1) / (1.0 + lambda_r),
+    )
+    assert parts["reuse_weight_0"] == pytest.approx(1.0 / (1.0 + lambda_r))
+    assert parts["reuse_weight_1"] == pytest.approx(lambda_r / (1.0 + lambda_r))
+
+    (parts["L_mu_1"] + parts["L_var_1"]).backward(retain_graph=True)
+    assert pred.grad is None and variance.grad is None
+    model.zero_grad(set_to_none=True)
+    loss.backward()
+    assert all(
+        parameter.grad is None or torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters()
+    )
+
+
 @pytest.mark.parametrize("bf16", [False, True])
 def test_direct_three_pass_optimization_preserves_reuse_and_raw_variance(monkeypatch, bf16):
     from train_masked_unet3d import curriculum_forward_loss
@@ -1149,6 +1465,122 @@ def test_phase_c_resamples_two_masks_and_uses_one_optimizer_update(monkeypatch):
         "phase_c_forwards",
     }
     assert expected_keys <= metrics["curriculum"].keys()
+
+
+@pytest.mark.parametrize("feature_grad", [False, True])
+def test_three_phase_resamples_one_mask_and_uses_one_optimizer_update(monkeypatch, feature_grad):
+    from types import SimpleNamespace
+    import train_masked_unet3d as train
+
+    original_sampler = train.sample_training_mask
+    original_forward_loss = train.curriculum_forward_loss
+    sampled_masks = []
+    detach_settings = []
+
+    def record_forward_loss(*args, **kwargs):
+        detach_settings.append(kwargs["detach_variance_features"])
+        return original_forward_loss(*args, **kwargs)
+
+    def record_sampler(*args, **kwargs):
+        result = original_sampler(*args, **kwargs)
+        sampled_masks.append(result[0].detach().clone())
+        return result
+
+    monkeypatch.setattr(train, "sample_training_mask", record_sampler)
+    monkeypatch.setattr(train, "curriculum_forward_loss", record_forward_loss)
+    model = UNet3D(
+        base_channels=2, channel_mults=(1, 2, 4),
+        uncertainty_aware=True, architecture=DIRECT_MODEL_VERSION,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5)
+    args = SimpleNamespace(
+        variance_ramp_start_epoch=0.0, variance_ramp_epochs=1.0,
+        rollout_ramp_start_epoch=1.0, rollout_ramp_epochs=1.0,
+        arm_variance_ramp=False, arm_rollout_ramp=False,
+    )
+    state = make_curriculum_state(args, updates_per_epoch=1)
+    state["successful_optimizer_steps"] = 2
+    metrics = train_one_epoch(
+        model, [{"block": torch.randn(1, 4, 4, 4, 4)}], optimizer,
+        torch.device("cpu"), torch.zeros(1, 4, 1, 1, 1),
+        torch.ones(1, 4, 1, 1, 1), {name: 1.0 for name in MASK_PATTERNS},
+        .05, .05, .05, .05, False, 1.0,
+        uncertainty_aware=True, uncertainty_loss="student_t_nll",
+        student_t_df=3.0, curriculum_state=state,
+        curriculum_config="three_phase_global_cosine",
+        uncertainty_feature_grad_continuation=feature_grad,
+    )
+    assert detach_settings == [not feature_grad]
+    assert len(sampled_masks) == 2  # pass 0 plus one independently sampled reuse mask
+    assert len({mask.data_ptr() for mask in sampled_masks}) == 2
+    assert metrics["optimizer_updates"] == 1
+    assert metrics["curriculum"]["phase_c_forwards"] == 2
+    assert metrics["curriculum"]["two_forward_fraction"] == 1
+    assert metrics["curriculum"]["three_forward_fraction"] == 0
+    assert metrics["curriculum"]["L_mu_2"] == 0
+    assert metrics["curriculum"]["L_var_2"] == 0
+    assert metrics["curriculum"]["reuse_weight_2"] == 0
+
+
+def test_three_phase_joint_nll_grad_continuation_training_epoch(monkeypatch):
+    from types import SimpleNamespace
+    import train_masked_unet3d as train
+
+    original_sampler = train.sample_training_mask
+    original_forward_loss = train.curriculum_forward_loss
+    sampled_masks = []
+    forward_kwargs_seen = []
+
+    def record_forward_loss(*args, **kwargs):
+        forward_kwargs_seen.append({
+            "detach_variance_features": kwargs["detach_variance_features"],
+            "detach_mean": kwargs["detach_mean"],
+        })
+        return original_forward_loss(*args, **kwargs)
+
+    def record_sampler(*args, **kwargs):
+        result = original_sampler(*args, **kwargs)
+        sampled_masks.append(result[0].detach().clone())
+        return result
+
+    monkeypatch.setattr(train, "sample_training_mask", record_sampler)
+    monkeypatch.setattr(train, "curriculum_forward_loss", record_forward_loss)
+    model = UNet3D(
+        base_channels=2, channel_mults=(1, 2, 4),
+        uncertainty_aware=True, architecture=DIRECT_MODEL_VERSION,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5)
+    args = SimpleNamespace(
+        variance_ramp_start_epoch=0.0, variance_ramp_epochs=1.0,
+        rollout_ramp_start_epoch=1.0, rollout_ramp_epochs=1.0,
+        arm_variance_ramp=False, arm_rollout_ramp=False,
+    )
+    state = make_curriculum_state(args, updates_per_epoch=1)
+    state["successful_optimizer_steps"] = 2
+    metrics = train_one_epoch(
+        model, [{"block": torch.randn(1, 4, 4, 4, 4)}], optimizer,
+        torch.device("cpu"), torch.zeros(1, 4, 1, 1, 1),
+        torch.ones(1, 4, 1, 1, 1), {name: 1.0 for name in MASK_PATTERNS},
+        .05, .05, .05, .05, False, 1.0,
+        uncertainty_aware=True, uncertainty_loss="student_t_nll",
+        student_t_df=3.0, curriculum_state=state,
+        curriculum_config="three_phase_global_cosine",
+        temporal_extrapolation_continuation=True,
+        joint_nll_grad_continuation=True,
+    )
+    assert forward_kwargs_seen == [{
+        "detach_variance_features": False,
+        "detach_mean": False,
+    }]
+    assert len(sampled_masks) == 2  # pass 0 plus one independently sampled reuse mask
+    assert len({mask.data_ptr() for mask in sampled_masks}) == 2
+    assert metrics["optimizer_updates"] == 1
+    assert metrics["curriculum"]["phase_c_forwards"] == 2
+    assert metrics["curriculum"]["two_forward_fraction"] == 1
+    assert metrics["curriculum"]["three_forward_fraction"] == 0
+    assert metrics["curriculum"]["L_mu_2"] == 0
+    assert metrics["curriculum"]["L_var_2"] == 0
+    assert metrics["curriculum"]["reuse_weight_2"] == 0
 
 
 def test_curriculum_skipped_updates_do_not_advance_ramps():
@@ -1345,3 +1777,189 @@ def test_curriculum_compressed_main_save_resume_smoke(monkeypatch, tmp_path, cap
     assert [r["learning_rate"] for r in history[6:]] == pytest.approx([3.6e-6, 5.2e-6])
     print(complete_log)
     print("Save/resume at steps 4 and 10 exactly reproduced all 16 lambda pairs; checkpoints:", resumed)
+
+
+def test_three_phase_joint_nll_grad_phase_a_b_c_routing():
+    """Verify gradient routing across Phase A, Phase B, and Phase C for joint_nll_grad.
+
+    Phase A (lambda_v=0, lambda_r=0):
+      - Reconstruction MSE updates shared U-Net and mean head.
+      - NLL contributes zero gradients; variance_out has no gradients.
+      - No reuse.
+
+    Phase B (lambda_v in [0.25, 0.5, 1.0], lambda_r=0):
+      - Path A: NLL residual backpropagates through mean head into shared trunk.
+      - Path B: NLL backpropagates through variance head into shared trunk.
+      - Objective is (L_mu + lambda_v * L_NLL) / (1 + lambda_v).
+      - Effective NLL gradient coefficient is lambda_v / (1 + lambda_v).
+
+    Phase C (lambda_v=1.0, lambda_r in [0.4, 1.0]):
+      - Both Path A and Path B open for both forwards.
+      - Two forwards (K=1 reuse), weights (1/(1+lambda_r), lambda_r/(1+lambda_r), 0).
+      - Reused state between passes is strictly detached: no BPTT through reuse.
+    """
+    import math
+    from train_masked_unet3d import curriculum_forward_loss, make_phase_c_reuse_input
+
+    torch.manual_seed(101)
+
+    def make_model():
+        m = UNet3D(
+            base_channels=2, channel_mults=(1, 2, 4), uncertainty_aware=True,
+            architecture=DIRECT_MODEL_VERSION, use_attention=True, spatial_only_pooling=True,
+        )
+        with torch.no_grad():
+            torch.nn.init.normal_(m.out.weight, std=0.02)
+        return m
+
+    target = torch.randn(1, 4, 4, 4, 4)
+    mask = torch.randint(2, target.shape).float()
+    inputs = torch.cat([make_uncertain_input(target, 1 - mask), 1 - mask], dim=1)
+
+    # 1. Phase A: lambda_v = 0, lambda_r = 0
+    model_a = make_model()
+    loss_a, pred_a, var_a, parts_a = curriculum_forward_loss(
+        model_a, inputs, target, mask, 0.0, 0.0,
+        uncertainty_loss="student_t_nll", student_t_df=3.0,
+        curriculum_config="three_phase_global_cosine",
+        detach_variance_features=False, detach_mean=False,
+    )
+    assert parts_a["L_var_0"].item() == 0.0
+    loss_a.backward()
+    # Reconstruction gradients flow into mean head and shared trunk
+    assert model_a.out.weight.grad is not None and (model_a.out.weight.grad.abs() > 0).any()
+    assert model_a.enc0.conv1.weight.grad is not None and (model_a.enc0.conv1.weight.grad.abs() > 0).any()
+    # ZERO gradient reaches variance head in Phase A
+    assert model_a.variance_out.weight.grad is None
+    assert model_a.variance_out.bias.grad is None
+
+    # 2. Phase B: smooth lambda_v scaling and both paths open
+    for lv in (0.25, 0.5, 1.0):
+        model_b = make_model()
+        loss_b, pred_b, var_b, parts_b = curriculum_forward_loss(
+            model_b, inputs, target, mask, lv, 0.0,
+            uncertainty_loss="student_t_nll", student_t_df=3.0,
+            curriculum_config="three_phase_global_cosine",
+            detach_variance_features=False, detach_mean=False,
+        )
+        expected_loss = (parts_b["L_mu_0"] + lv * parts_b["L_var_0"]) / (1.0 + lv)
+        assert torch.allclose(loss_b, expected_loss, rtol=1e-5, atol=1e-6)
+
+        # Backpropagate L_var_0 alone to isolate NLL gradient paths
+        model_iso = make_model()
+        loss_iso, pred_iso, var_iso, parts_iso = curriculum_forward_loss(
+            model_iso, inputs, target, mask, lv, 0.0,
+            uncertainty_loss="student_t_nll", student_t_df=3.0,
+            curriculum_config="three_phase_global_cosine",
+            detach_variance_features=False, detach_mean=False,
+        )
+        pred_iso.retain_grad()
+        parts_iso["L_var_0"].backward()
+        # Path A: dL_NLL/dmu is non-zero and mean head has grad
+        assert pred_iso.grad is not None and (pred_iso.grad.abs() > 0).any()
+        assert model_iso.out.weight.grad is not None and (model_iso.out.weight.grad.abs() > 0).any()
+        # Path B: variance head has grad
+        assert model_iso.variance_out.weight.grad is not None and (model_iso.variance_out.weight.grad.abs() > 0).any()
+        # Shared trunk has grad from both paths
+        assert model_iso.enc0.conv1.weight.grad is not None and (model_iso.enc0.conv1.weight.grad.abs() > 0).any()
+
+        # Effective coefficient: gradient of normalized loss vs weighted parts
+        effective_coeff = lv / (1.0 + lv)
+        assert math.isclose(effective_coeff, 0.20 if lv == 0.25 else (1.0 / 3.0 if lv == 0.5 else 0.5))
+
+    # 3. Phase C: K=1 reuse, normalized weights, detached reuse (no BPTT)
+    for lr in (0.4, 1.0):
+        model_c = make_model()
+        reuse_mask = torch.randint(2, target.shape).float()
+        loss_c, pred_c, var_c, parts_c = curriculum_forward_loss(
+            model_c, inputs, target, mask, 1.0, lr,
+            reuse_masks=(reuse_mask,),
+            uncertainty_loss="student_t_nll", student_t_df=3.0,
+            curriculum_config="three_phase_global_cosine",
+            detach_variance_features=False, detach_mean=False,
+        )
+        assert parts_c["forwards"] == 2
+        normalizer = 1.0 + lr
+        w0 = 1.0 / normalizer
+        w1 = lr / normalizer
+        assert math.isclose(parts_c["reuse_weight_0"].item(), w0, rel_tol=1e-5)
+        assert math.isclose(parts_c["reuse_weight_1"].item(), w1, rel_tol=1e-5)
+        assert parts_c["reuse_weight_2"].item() == 0.0
+
+        # Verify detached reuse between pass 0 and pass 1 (no BPTT)
+        pass0_mean = pred_c
+        pass0_var = var_c
+        pass0_mean.retain_grad()
+        pass0_var.retain_grad()
+        reuse_input, exact_mask = make_phase_c_reuse_input(
+            target, pass0_mean, pass0_var, reuse_mask,
+        )
+        assert reuse_input.grad_fn is None
+        next_mean, next_var = model_c(reuse_input, detach_variance_features=False)
+        pass1_loss = full_mse_loss(next_mean, target, exact_mask)
+        pass1_loss.backward()
+        assert pass0_mean.grad is None
+        assert pass0_var.grad is None
+
+
+def test_three_phase_joint_nll_grad_fromscratch_training_epoch(monkeypatch):
+    from types import SimpleNamespace
+    import train_masked_unet3d as train
+
+    original_forward_loss = train.curriculum_forward_loss
+    forward_kwargs_seen = []
+
+    def record_forward_loss(*args, **kwargs):
+        forward_kwargs_seen.append({
+            "detach_variance_features": kwargs["detach_variance_features"],
+            "detach_mean": kwargs["detach_mean"],
+        })
+        return original_forward_loss(*args, **kwargs)
+
+    monkeypatch.setattr(train, "curriculum_forward_loss", record_forward_loss)
+    model = UNet3D(
+        base_channels=2, channel_mults=(1, 2, 4),
+        uncertainty_aware=True, architecture=DIRECT_MODEL_VERSION,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4)
+    args = SimpleNamespace(
+        variance_ramp_start_epoch=0.0, variance_ramp_epochs=1.0,
+        rollout_ramp_start_epoch=1.0, rollout_ramp_epochs=1.0,
+        arm_variance_ramp=False, arm_rollout_ramp=False,
+    )
+    state = make_curriculum_state(args, updates_per_epoch=1)
+    state["successful_optimizer_steps"] = 2  # Phase C (lambda_v=1, lambda_r=1)
+
+    # 1. With joint_nll_grad=True: both flags are False (enabled gradients)
+    forward_kwargs_seen.clear()
+    train_one_epoch(
+        model, [{"block": torch.randn(1, 4, 4, 4, 4)}], optimizer,
+        torch.device("cpu"), torch.zeros(1, 4, 1, 1, 1),
+        torch.ones(1, 4, 1, 1, 1), {name: 1.0 for name in MASK_PATTERNS},
+        .05, .05, .05, .05, False, 1.0,
+        uncertainty_aware=True, uncertainty_loss="student_t_nll",
+        student_t_df=3.0, curriculum_state=state,
+        curriculum_config="three_phase_global_cosine",
+        joint_nll_grad=True,
+    )
+    assert forward_kwargs_seen == [{
+        "detach_variance_features": False,
+        "detach_mean": False,
+    }]
+
+    # 2. With joint_nll_grad=False (historical default): both flags are True (detached)
+    forward_kwargs_seen.clear()
+    train_one_epoch(
+        model, [{"block": torch.randn(1, 4, 4, 4, 4)}], optimizer,
+        torch.device("cpu"), torch.zeros(1, 4, 1, 1, 1),
+        torch.ones(1, 4, 1, 1, 1), {name: 1.0 for name in MASK_PATTERNS},
+        .05, .05, .05, .05, False, 1.0,
+        uncertainty_aware=True, uncertainty_loss="student_t_nll",
+        student_t_df=3.0, curriculum_state=state,
+        curriculum_config="three_phase_global_cosine",
+        joint_nll_grad=False,
+    )
+    assert forward_kwargs_seen == [{
+        "detach_variance_features": True,
+        "detach_mean": True,
+    }]

@@ -275,6 +275,46 @@ def test_global_cosine_fromscratch_48h_lr_configuration(monkeypatch):
     assert all(left >= right for left, right in zip(lrs[4:], lrs[5:]))
 
 
+def test_three_phase_global_cosine_cli_lr_and_resume_isolation(monkeypatch):
+    from train_masked_unet3d import parse_args, validate_resume_parameters
+
+    argv = [
+        "train", "--curriculum-training", "--curriculum-config",
+        "three_phase_global_cosine", "--uncertainty-aware",
+        "--uncertainty-loss", "student_t_nll", "--student-t-df", "3.0",
+        "--epochs", "256", "--warmup-epochs", "5", "--lr", "2e-4",
+        "--min-lr", "1e-5", "--variance-ramp-epochs", "40",
+        "--rollout-ramp-epochs", "40", "--final-epoch", "256",
+        "--stop-after-epochs", "256", "--no-auto-resume",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    args = parse_args()
+    assert args.curriculum_config == "three_phase_global_cosine"
+    assert (args.epochs, args.final_epoch, args.stop_after_epochs) == (256, 256, 256)
+    state = make_curriculum_state(args, updates_per_epoch=10)
+    actual = [curriculum_learning_rate_for_epoch(epoch, args, state)
+              for epoch in range(1, 257)]
+    expected = [global_cosine_learning_rate(epoch, 256, 5, 1e-5, 2e-4)
+                for epoch in range(1, 257)]
+    assert actual == expected
+    assert actual[-1] == 1e-5
+    assert state["variance_ramp_steps"] == state["rollout_ramp_steps"] == 400
+
+    saved = vars(args).copy()
+    validate_resume_parameters(args, saved)
+    saved["curriculum_config"] = "global_cosine"
+    with pytest.raises(ValueError, match="curriculum_config"):
+        validate_resume_parameters(args, saved)
+    historical_args = SimpleNamespace(**vars(args))
+    historical_args.curriculum_config = "global_cosine"
+    with pytest.raises(ValueError, match="curriculum_config"):
+        validate_resume_parameters(historical_args, vars(args))
+    old_three_phase = vars(args).copy()
+    old_three_phase.update(epochs=1000, final_epoch=1000)
+    with pytest.raises(ValueError, match="epochs"):
+        validate_resume_parameters(args, old_three_phase)
+
+
 def test_fromscratch_launcher_uses_run_local_safe_slurm_handoff():
     import train_masked_unet3d as train
 
@@ -464,6 +504,39 @@ def test_checkpoint_authoritative_history_rejects_history_behind():
     history = [{"epoch": epoch} for epoch in range(1, 20)]
     with pytest.raises(ValueError, match="behind or inconsistent"):
         history_through_checkpoint(history, 20)
+
+
+@pytest.mark.parametrize("diagnostic", ["temporal_extrapolation_only_continuation",
+                                      "uncertainty_feature_grad_continuation",
+                                      "joint_nll_grad_continuation"])
+def test_temporal_extrapolation_only_resume_accepts_history_starting_at_277(tmp_path, diagnostic):
+    import ast
+    import train_masked_unet3d as train
+
+    history = [{"epoch": epoch} for epoch in range(277, 281)]
+    history_path = tmp_path / "history.json"
+    history_path.write_text(json.dumps(history))
+    # Exercise the trainer's history restoration without constructing a dataset
+    # or starting training. The original cosine horizon remains 256 epochs.
+    main = next(node for node in ast.parse(Path(train.__file__).read_text()).body
+                if isinstance(node, ast.FunctionDef) and node.name == "main")
+    restore = next(node for node in main.body if isinstance(node, ast.If)
+                   and "history_path.exists()" in ast.unparse(node.test))
+    namespace = dict(
+        args=SimpleNamespace(epochs=256, post_final_continuation="source/final.pt",
+                             temporal_extrapolation_only_continuation=(
+                                 diagnostic == "temporal_extrapolation_only_continuation"),
+                             uncertainty_feature_grad_continuation=(
+                                 diagnostic == "uncertainty_feature_grad_continuation"),
+                             joint_nll_grad_continuation=(
+                                 diagnostic == "joint_nll_grad_continuation")),
+        is_main_process=lambda: True, resume_checkpoint={"epoch": 279},
+        history_path=history_path, start_epoch=280, json=json,
+        history_through_checkpoint=history_through_checkpoint,
+    )
+    exec(compile(ast.Module(body=[restore], type_ignores=[]), str(train.__file__), "exec"),
+         namespace)
+    assert namespace["history"] == history[:3]
 
 
 @pytest.mark.parametrize("history_end,accepted", [(6, True), (7, True), (5, False)])
@@ -787,6 +860,324 @@ def test_post_final_continuation_holds_global_cosine_floor():
     ] == [1e-6] * 80
 
 
+def test_gaussian_u_continuation_isolated_validation_and_fixed_floor(monkeypatch):
+    from train_masked_unet3d import (
+        parse_args, resolve_checkpoint_plan, validate_post_final_continuation,
+        validate_resume_parameters,
+    )
+
+    common = [
+        "train", "--curriculum-training", "--curriculum-config",
+        "three_phase_global_cosine", "--uncertainty-aware", "--epochs", "256",
+        "--warmup-epochs", "5", "--lr", "2e-4", "--min-lr", "1e-5",
+        "--variance-ramp-epochs", "40", "--rollout-ramp-epochs", "40",
+    ]
+    monkeypatch.setattr(sys, "argv", [
+        *common, "--uncertainty-loss", "student_t_nll", "--student-t-df", "3",
+        "--final-epoch", "256", "--stop-after-epochs", "256",
+    ])
+    source_args = parse_args()
+    state = make_curriculum_state(source_args, updates_per_epoch=10)
+    state.update(
+        variance_ramp_armed=True, variance_ramp_start_step=0,
+        rollout_ramp_armed=True, rollout_ramp_start_step=400,
+        successful_optimizer_steps=800, lambda_v=1.0, lambda_r=1.0,
+    )
+    source_path = Path("/tmp/three_phase_source/final.pt")
+    checkpoint = {
+        "model": {"weight": torch.ones(1)},
+        "optimizer": {"state": {0: {"step": 1}},
+                      "param_groups": [{"lr": 1e-5}]},
+        "stats": {"mean": [0.] * 4, "std": [1.] * 4},
+        "epoch": 256, "args": vars(source_args), "curriculum_state": state,
+    }
+
+    monkeypatch.setattr(sys, "argv", [
+        *common, "--uncertainty-loss", "gaussian_nll", "--final-epoch", "276",
+        "--stop-after-epochs", "276", "--post-final-continuation",
+        str(source_path), "--gaussian-u-continuation",
+    ])
+    args = parse_args()
+    validate_post_final_continuation(
+        args, checkpoint, source_path, Path("/tmp/gaussian_u_continuation"),
+    )
+    assert resolve_checkpoint_plan(
+        "/tmp/gaussian_u_continuation", auto_resume=False,
+        post_final_continuation=str(source_path),
+    ).mode == "continuation"
+    assert args.uncertainty_loss == "gaussian_nll"
+    assert curriculum_weights(state) == (1.0, 1.0)
+    assert curriculum_phase(
+        257, state, 1.0, 1.0, args.curriculum_config,
+    ) == (2, "rollout_settled")
+    assert [
+        curriculum_learning_rate_for_epoch(epoch, args, state)
+        for epoch in range(257, 277)
+    ] == [1e-5] * 20
+
+    # Only this explicit source transition may cross likelihoods. A normal
+    # resume retains strict objective checking, while the continuation's own
+    # checkpoint metadata resumes cleanly.
+    with pytest.raises(ValueError, match="uncertainty_loss"):
+        validate_resume_parameters(args, vars(source_args))
+    validate_resume_parameters(args, vars(args))
+
+
+def test_gaussian_u_continuation_launcher_is_fresh_resumable_and_isolated():
+    launcher = Path(__file__).resolve().parents[1].joinpath(
+        "train_masked_unet3d_4n16g.sbatch"
+    ).read_text()
+    assert "--gaussian-u-continuation-20ep)" in launcher
+    assert "--resume-gaussian-u-continuation-20ep)" in launcher
+    assert launcher.count("CURRICULUM_STOP=276; FINAL_EPOCH=276") >= 2
+    assert "RUN_NAME=${CURRICULUM_RUN_NAME:-multi_beta_three_phase_gaussian_u_continuation_20ep_20261116}" in launcher
+    assert "multi_beta_curriculum_direct_v3_three_phase_globalcosine_2e4_1e5_256ep_20261115/final.pt" in launcher
+    assert "TRAIN_ARGS+=(--gaussian-u-continuation" in launcher
+    assert "if ${GAUSSIAN_U_CONTINUATION}; then MIN_LR=1e-5; fi" in launcher
+
+
+def test_temporal_extrapolation_continuation_validation_and_launcher(monkeypatch):
+    from train_masked_unet3d import (
+        parse_args, validate_post_final_continuation,
+        validate_resume_parameters,
+    )
+
+    common = [
+        "train", "--curriculum-training", "--curriculum-config",
+        "three_phase_global_cosine", "--uncertainty-aware",
+        "--uncertainty-loss", "student_t_nll", "--student-t-df", "3",
+        "--epochs", "256", "--warmup-epochs", "5", "--lr", "2e-4",
+        "--min-lr", "1e-5", "--variance-ramp-epochs", "40",
+        "--rollout-ramp-epochs", "40",
+    ]
+    monkeypatch.setattr(sys, "argv", [
+        *common, "--final-epoch", "256", "--stop-after-epochs", "256",
+    ])
+    source_args = parse_args()
+    state = make_curriculum_state(source_args, updates_per_epoch=10)
+    state.update(
+        variance_ramp_armed=True, variance_ramp_start_step=0,
+        rollout_ramp_armed=True, rollout_ramp_start_step=400,
+        successful_optimizer_steps=800, lambda_v=1.0, lambda_r=1.0,
+    )
+    source_path = Path("/tmp/three_phase_student_t/final.pt")
+    checkpoint = {
+        "model": {"weight": torch.ones(1)},
+        "optimizer": {"state": {0: {"step": 1}},
+                      "param_groups": [{"lr": 1e-5}]},
+        "stats": {"mean": [0.] * 4, "std": [1.] * 4},
+        "epoch": 256, "args": vars(source_args), "curriculum_state": state,
+    }
+    monkeypatch.setattr(sys, "argv", [
+        *common, "--final-epoch", "276", "--stop-after-epochs", "276",
+        "--post-final-continuation", str(source_path),
+        "--temporal-extrapolation-continuation",
+    ])
+    args = parse_args()
+    validate_post_final_continuation(
+        args, checkpoint, source_path,
+        Path("/tmp/temporal_extrapolation_continuation"),
+    )
+    assert args.uncertainty_loss == "student_t_nll" and args.student_t_df == 3
+    assert set(args.mask_pattern_weights.values()) == {1.0}
+    assert [value / sum(args.mask_pattern_weights.values())
+            for value in args.mask_pattern_weights.values()] == [0.2] * 5
+    assert curriculum_weights(state) == (1.0, 1.0)
+    assert curriculum_phase(
+        257, state, 1.0, 1.0, args.curriculum_config,
+    ) == (2, "rollout_settled")
+    assert [curriculum_learning_rate_for_epoch(epoch, args, state)
+            for epoch in range(257, 277)] == [1e-5] * 20
+    with pytest.raises(ValueError, match="temporal_extrapolation_continuation"):
+        validate_resume_parameters(args, vars(source_args))
+    validate_resume_parameters(args, vars(args))
+
+    launcher = Path(__file__).resolve().parents[1].joinpath(
+        "train_masked_unet3d_4n16g.sbatch"
+    ).read_text()
+    assert "--temporal-extrapolation-continuation-20ep)" in launcher
+    assert "--resume-temporal-extrapolation-continuation-20ep)" in launcher
+    assert launcher.count("CURRICULUM_STOP=276; FINAL_EPOCH=276") >= 4
+    assert "RUN_NAME=${CURRICULUM_RUN_NAME:-multi_beta_three_phase_temporal_extrapolation_continuation_20ep_20261116}" in launcher
+    assert "TRAIN_ARGS+=(--temporal-extrapolation-continuation" in launcher
+
+
+def test_temporal_extrapolation_only_continuation_validation_and_launcher(monkeypatch):
+    from train_masked_unet3d import (
+        parse_args, validate_post_final_continuation,
+        validate_resume_parameters,
+    )
+
+    common = [
+        "train", "--curriculum-training", "--curriculum-config",
+        "three_phase_global_cosine", "--uncertainty-aware",
+        "--uncertainty-loss", "student_t_nll", "--student-t-df", "3",
+        "--epochs", "256", "--warmup-epochs", "5", "--lr", "2e-4",
+        "--min-lr", "1e-5", "--variance-ramp-epochs", "40",
+        "--rollout-ramp-epochs", "40",
+    ]
+    monkeypatch.setattr(sys, "argv", [
+        *common, "--final-epoch", "276", "--stop-after-epochs", "276",
+        "--post-final-continuation", "/tmp/three_phase_student_t/final.pt",
+        "--temporal-extrapolation-continuation",
+    ])
+    source_args = parse_args()
+    state = make_curriculum_state(source_args, updates_per_epoch=10)
+    state.update(
+        variance_ramp_armed=True, variance_ramp_start_step=0,
+        rollout_ramp_armed=True, rollout_ramp_start_step=400,
+        successful_optimizer_steps=800, lambda_v=1.0, lambda_r=1.0,
+    )
+    source_path = Path("/tmp/temporal_extrapolation_continuation_20ep/final.pt")
+    checkpoint = {
+        "model": {"weight": torch.ones(1)},
+        "optimizer": {"state": {0: {"step": 1}},
+                      "param_groups": [{"lr": 1e-5}]},
+        "stats": {"mean": [0.] * 4, "std": [1.] * 4},
+        "epoch": 276, "args": vars(source_args), "curriculum_state": state,
+    }
+    monkeypatch.setattr(sys, "argv", [
+        *common, "--final-epoch", "286", "--stop-after-epochs", "286",
+        "--post-final-continuation", str(source_path),
+        "--temporal-extrapolation-only-continuation",
+    ])
+    args = parse_args()
+    validate_post_final_continuation(
+        args, checkpoint, source_path,
+        Path("/tmp/temporal_extrapolation_only_continuation"),
+    )
+    assert args.uncertainty_loss == "student_t_nll" and args.student_t_df == 3
+    assert args.temporal_extrapolation_only_continuation is True
+    assert set(args.mask_pattern_weights.values()) == {1.0}
+    assert [value / sum(args.mask_pattern_weights.values())
+            for value in args.mask_pattern_weights.values()] == [0.2] * 5
+    assert curriculum_weights(state) == (1.0, 1.0)
+    assert curriculum_phase(
+        277, state, 1.0, 1.0, args.curriculum_config,
+    ) == (2, "rollout_settled")
+    assert [curriculum_learning_rate_for_epoch(epoch, args, state)
+            for epoch in range(277, 287)] == [1e-5] * 10
+    with pytest.raises(ValueError, match="temporal_extrapolation_only_continuation"):
+        validate_resume_parameters(args, vars(source_args))
+    validate_resume_parameters(args, vars(args))
+
+    launcher = Path(__file__).resolve().parents[1].joinpath(
+        "train_masked_unet3d_4n16g.sbatch"
+    ).read_text()
+    assert "--temporal-extrapolation-only-continuation-10ep)" in launcher
+    assert "--resume-temporal-extrapolation-only-continuation-10ep)" in launcher
+    assert "CURRICULUM_STOP=286; FINAL_EPOCH=286" in launcher
+    assert "RUN_NAME=${CURRICULUM_RUN_NAME:-multi_beta_three_phase_temporal_extrapolation_only_continuation_10ep_20261117}" in launcher
+    assert "TRAIN_ARGS+=(--temporal-extrapolation-only-continuation" in launcher
+    assert "if ${TEMPORAL_EXTRAPOLATION_ONLY_CONTINUATION}; then MIN_LR=1e-5; fi" in launcher
+    assert "CONTINUATION_SOURCE_CHECKPOINT=${CONTINUATION_SOURCE_CHECKPOINT:-runs/multi_beta_three_phase_temporal_extrapolation_continuation_20ep_20261116/final.pt}" in launcher
+
+
+def test_uncertainty_feature_grad_continuation_validation_and_isolation(monkeypatch):
+    from train_masked_unet3d import parse_args, validate_post_final_continuation, validate_resume_parameters
+
+    common = [
+        "train", "--curriculum-training", "--curriculum-config", "three_phase_global_cosine",
+        "--uncertainty-aware", "--uncertainty-loss", "student_t_nll", "--student-t-df", "3",
+        "--epochs", "256", "--warmup-epochs", "5", "--lr", "2e-4", "--min-lr", "1e-5",
+        "--variance-ramp-epochs", "40", "--rollout-ramp-epochs", "40",
+        "--temporal-extrapolation-continuation",
+    ]
+    monkeypatch.setattr(sys, "argv", [*common, "--final-epoch", "276", "--stop-after-epochs", "276",
+        "--post-final-continuation", "/tmp/original_student_t/final.pt"])
+    source_args = parse_args()
+    assert not source_args.uncertainty_feature_grad_continuation
+    state = make_curriculum_state(source_args, updates_per_epoch=10)
+    state.update(variance_ramp_armed=True, variance_ramp_start_step=0,
+        rollout_ramp_armed=True, rollout_ramp_start_step=400,
+        successful_optimizer_steps=800, lambda_v=1.0, lambda_r=1.0)
+    source = Path("/tmp/temporal_20pct/final.pt")
+    checkpoint = dict(model={"weight": torch.ones(1)}, epoch=276, args=vars(source_args),
+        optimizer={"state": {0: {"step": 1}}, "param_groups": [{"lr": 1e-5}]},
+        stats={"mean": [0.]*4, "std": [1.]*4}, curriculum_state=state)
+    monkeypatch.setattr(sys, "argv", [*common, "--final-epoch", "286", "--stop-after-epochs", "286",
+        "--post-final-continuation", str(source), "--uncertainty-feature-grad-continuation"])
+    args = parse_args()
+    validate_post_final_continuation(args, checkpoint, source, Path("/tmp/feature_grad"))
+    assert args.temporal_extrapolation_continuation
+    assert args.mask_pattern_weights == source_args.mask_pattern_weights
+    assert args.uncertainty_loss == "student_t_nll" and args.student_t_df == 3
+    assert [curriculum_learning_rate_for_epoch(e,args,state) for e in range(277,287)] == [1e-5]*10
+    assert curriculum_phase(277,state,1.,1.,args.curriculum_config) == (2,"rollout_settled")
+    validate_resume_parameters(args, vars(args))
+    with pytest.raises(ValueError, match="uncertainty_feature_grad_continuation"):
+        validate_resume_parameters(args, vars(source_args))
+    historical = vars(args).copy()
+    historical["uncertainty_feature_grad_continuation"] = False
+    with pytest.raises(ValueError, match="uncertainty_feature_grad_continuation"):
+        validate_resume_parameters(SimpleNamespace(**historical), vars(args))
+    with pytest.raises(ValueError, match="different run directory"):
+        validate_post_final_continuation(args, checkpoint, source, source.parent)
+    args.final_epoch = args.stop_after_epochs = 287
+    with pytest.raises(ValueError, match="exactly 10"):
+        validate_post_final_continuation(args, checkpoint, source, Path("/tmp/feature_grad"))
+    monkeypatch.setattr(sys, "argv", ["train", "--uncertainty-feature-grad-continuation"])
+    with pytest.raises(SystemExit):
+        parse_args()
+    launcher = Path(__file__).resolve().parents[1].joinpath("train_masked_unet3d_4n16g.sbatch").read_text()
+    assert "--uncertainty-feature-grad-continuation-10ep)" in launcher
+    assert "--resume-uncertainty-feature-grad-continuation-10ep)" in launcher
+    assert "RUN_NAME=${CURRICULUM_RUN_NAME:-multi_beta_three_phase_uncertainty_feature_grad_continuation_10ep_20261117}" in launcher
+
+
+def test_joint_nll_grad_continuation_validation_and_isolation(monkeypatch):
+    from train_masked_unet3d import parse_args, validate_post_final_continuation, validate_resume_parameters
+
+    common = [
+        "train", "--curriculum-training", "--curriculum-config", "three_phase_global_cosine",
+        "--uncertainty-aware", "--uncertainty-loss", "student_t_nll", "--student-t-df", "3",
+        "--epochs", "256", "--warmup-epochs", "5", "--lr", "2e-4", "--min-lr", "1e-5",
+        "--variance-ramp-epochs", "40", "--rollout-ramp-epochs", "40",
+        "--temporal-extrapolation-continuation",
+    ]
+    monkeypatch.setattr(sys, "argv", [*common, "--final-epoch", "276", "--stop-after-epochs", "276",
+        "--post-final-continuation", "/tmp/original_student_t/final.pt"])
+    source_args = parse_args()
+    assert not source_args.joint_nll_grad_continuation
+    state = make_curriculum_state(source_args, updates_per_epoch=10)
+    state.update(variance_ramp_armed=True, variance_ramp_start_step=0,
+        rollout_ramp_armed=True, rollout_ramp_start_step=400,
+        successful_optimizer_steps=800, lambda_v=1.0, lambda_r=1.0)
+    source = Path("/tmp/temporal_20pct/final.pt")
+    checkpoint = dict(model={"weight": torch.ones(1)}, epoch=276, args=vars(source_args),
+        optimizer={"state": {0: {"step": 1}}, "param_groups": [{"lr": 1e-5}]},
+        stats={"mean": [0.]*4, "std": [1.]*4}, curriculum_state=state)
+    monkeypatch.setattr(sys, "argv", [*common, "--final-epoch", "286", "--stop-after-epochs", "286",
+        "--post-final-continuation", str(source), "--joint-nll-grad-continuation"])
+    args = parse_args()
+    validate_post_final_continuation(args, checkpoint, source, Path("/tmp/joint_grad"))
+    assert args.temporal_extrapolation_continuation
+    assert args.joint_nll_grad_continuation
+    assert args.mask_pattern_weights == source_args.mask_pattern_weights
+    assert args.uncertainty_loss == "student_t_nll" and args.student_t_df == 3
+    assert [curriculum_learning_rate_for_epoch(e,args,state) for e in range(277,287)] == [1e-5]*10
+    assert curriculum_phase(277,state,1.,1.,args.curriculum_config) == (2,"rollout_settled")
+    validate_resume_parameters(args, vars(args))
+    with pytest.raises(ValueError, match="joint_nll_grad_continuation"):
+        validate_resume_parameters(args, vars(source_args))
+    historical = vars(args).copy()
+    historical["joint_nll_grad_continuation"] = False
+    with pytest.raises(ValueError, match="joint_nll_grad_continuation"):
+        validate_resume_parameters(SimpleNamespace(**historical), vars(args))
+    with pytest.raises(ValueError, match="different run directory"):
+        validate_post_final_continuation(args, checkpoint, source, source.parent)
+    args.final_epoch = args.stop_after_epochs = 287
+    with pytest.raises(ValueError, match="exactly 10"):
+        validate_post_final_continuation(args, checkpoint, source, Path("/tmp/joint_grad"))
+    monkeypatch.setattr(sys, "argv", ["train", "--joint-nll-grad-continuation"])
+    with pytest.raises(SystemExit):
+        parse_args()
+    launcher = Path(__file__).resolve().parents[1].joinpath("train_masked_unet3d_4n16g.sbatch").read_text()
+    assert "--joint-nll-grad-continuation-10ep)" in launcher
+    assert "--resume-joint-nll-grad-continuation-10ep)" in launcher
+    assert "RUN_NAME=${CURRICULUM_RUN_NAME:-multi_beta_three_phase_joint_nll_grad_continuation_10ep_20261117}" in launcher
+
+
 def test_global_cosine_phase_a_monitors_after_warmup_while_lr_decays():
     from train_masked_unet3d import make_curriculum_state
 
@@ -843,6 +1234,73 @@ def test_global_cosine_phase_b_controls_existing_rollout_ramp_and_resume():
     assert curriculum_phase(100, state, 1., .5, "global_cosine") == (2, "rollout_ramp")
     assert curriculum_phase(140, state, 1., 1., "global_cosine") == (3, "sliding_rollout")
 
+
+def test_three_phase_reuses_ab_convergence_and_settles_without_phase_d():
+    global_args = _global_cosine_args()
+    three_phase_args = SimpleNamespace(**vars(global_args))
+    three_phase_args.curriculum_config = "three_phase_global_cosine"
+    three_phase_args.epochs = three_phase_args.final_epoch = 256
+    three_phase_args.min_lr = 1e-5
+    global_state = make_curriculum_state(global_args, updates_per_epoch=10)
+    three_phase_state = make_curriculum_state(three_phase_args, updates_per_epoch=10)
+
+    phase_a_history = [
+        {"epoch": epoch, "val_mse": 1.,
+         "learning_rate": curriculum_learning_rate_for_epoch(
+             epoch, global_args, global_state,
+         )}
+        for epoch in range(1, 16)
+    ]
+    assert phase_a_convergence(
+        phase_a_history, global_args, global_state,
+    ) == phase_a_convergence(
+        phase_a_history, three_phase_args, three_phase_state,
+    )
+
+    for state in (global_state, three_phase_state):
+        state.update(
+            variance_ramp_armed=True, variance_ramp_start_step=100,
+            successful_optimizer_steps=500,
+        )
+    phase_b_history = [
+        {"epoch": epoch, "val_mse": .2, "val_gaussian_nll": -.5,
+         "curriculum": {"successful_optimizer_steps": 500}}
+        for epoch in range(60, 74)
+    ]
+    assert phase_b_convergence(
+        phase_b_history, global_args, global_state,
+    ) == phase_b_convergence(
+        phase_b_history, three_phase_args, three_phase_state,
+    )
+
+    complete = dict(
+        three_phase_state,
+        rollout_ramp_armed=True,
+        rollout_ramp_start_step=500,
+        successful_optimizer_steps=900,
+    )
+    assert curriculum_is_complete(complete)
+    assert curriculum_phase(
+        140, complete, 1., 1., "three_phase_global_cosine",
+    ) == (2, "rollout_settled")
+    require_complete_curriculum(complete, 256)
+    source = Path(__file__).resolve().parents[1].joinpath(
+        "train_masked_unet3d.py"
+    ).read_text()
+    assert ('args.curriculum_config != "three_phase_global_cosine"' in source)
+
+
+def test_three_phase_launcher_fresh_resume_share_run_selection():
+    launcher = Path(__file__).resolve().parents[1].joinpath(
+        "train_masked_unet3d_4n16g.sbatch"
+    ).read_text()
+    assert "--three-phase-global-cosine-48h)" in launcher
+    assert "--resume-three-phase-global-cosine-48h)" in launcher
+    assert "THREE_PHASE_GLOBAL_COSINE=true" in launcher
+    assert launcher.count("CURRICULUM_STOP=256; FINAL_EPOCH=256") >= 2
+    assert "RUN_NAME=${CURRICULUM_RUN_NAME:-multi_beta_curriculum_direct_v3_three_phase_globalcosine_2e4_1e5_256ep_20261115}" in launcher
+    assert "if ${THREE_PHASE_GLOBAL_COSINE}; then EPOCHS=256; fi" in launcher
+    assert "TRAIN_ARGS+=(--curriculum-config three_phase_global_cosine)" in launcher
 
 def test_abcd_phase_a_and_phase_d_use_identical_fixed_lr_cycles():
     from train_masked_unet3d import make_curriculum_state
@@ -1393,3 +1851,80 @@ def test_validation_metrics_do_not_select_a_checkpoint():
     source = Path(__file__).resolve().parents[1].joinpath("train_masked_unet3d.py").read_text()
     assert 'out_dir / "best.pt"' not in source
     assert 'out_dir / "final.pt"' in source
+
+
+def test_fromscratch_three_phase_joint_nll_grad_cli_and_schedule(monkeypatch):
+    from types import SimpleNamespace
+    from train_masked_unet3d import (
+        curriculum_learning_rate_for_epoch, global_cosine_learning_rate,
+        make_curriculum_state, parse_args, validate_resume_parameters,
+    )
+
+    argv = [
+        "train", "--curriculum-training", "--curriculum-config",
+        "three_phase_global_cosine", "--uncertainty-aware",
+        "--uncertainty-loss", "student_t_nll", "--student-t-df", "3.0",
+        "--epochs", "256", "--warmup-epochs", "5", "--lr", "2e-4",
+        "--min-lr", "1e-5", "--variance-ramp-epochs", "40",
+        "--rollout-ramp-epochs", "40", "--final-epoch", "256",
+        "--stop-after-epochs", "256", "--no-auto-resume",
+        "--joint-nll-grad",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    args = parse_args()
+    assert args.joint_nll_grad is True
+    assert args.curriculum_config == "three_phase_global_cosine"
+    assert (args.epochs, args.final_epoch, args.stop_after_epochs) == (256, 256, 256)
+    assert args.post_final_continuation is None
+    assert args.init_checkpoint is None
+
+    # Verify global cosine LR schedule over 256 epochs
+    state = make_curriculum_state(args, updates_per_epoch=10)
+    actual_lrs = [curriculum_learning_rate_for_epoch(epoch, args, state) for epoch in range(1, 257)]
+    expected_lrs = [global_cosine_learning_rate(epoch, 256, 5, 1e-5, 2e-4) for epoch in range(1, 257)]
+    assert actual_lrs == expected_lrs
+    assert actual_lrs[0] == 1e-5
+    assert actual_lrs[4] == 2e-4
+    assert actual_lrs[-1] == 1e-5
+    assert all(left >= right for left, right in zip(actual_lrs[4:], actual_lrs[5:]))
+
+    # Verify resume parameter validation
+    saved = vars(args).copy()
+    validate_resume_parameters(args, saved)
+    # Checkpoint without joint_nll_grad must be rejected
+    saved_no_grad = vars(args).copy()
+    saved_no_grad["joint_nll_grad"] = False
+    with pytest.raises(ValueError, match="joint_nll_grad"):
+        validate_resume_parameters(args, saved_no_grad)
+    # Baseline args without joint_nll_grad must reject resuming with joint_nll_grad checkpoint
+    historical_args = SimpleNamespace(**vars(args))
+    historical_args.joint_nll_grad = False
+    with pytest.raises(ValueError, match="joint_nll_grad"):
+        validate_resume_parameters(historical_args, vars(args))
+
+    # Verify mutual exclusivity guards
+    with pytest.raises(SystemExit):
+        monkeypatch.setattr(sys, "argv", argv + ["--post-final-continuation", "runs/dummy/final.pt"])
+        parse_args()
+    with pytest.raises(SystemExit):
+        monkeypatch.setattr(sys, "argv", argv + ["--init-checkpoint", "runs/dummy/final.pt"])
+        parse_args()
+    with pytest.raises(SystemExit):
+        bad_config = list(argv)
+        bad_config[bad_config.index("three_phase_global_cosine")] = "global_cosine"
+        monkeypatch.setattr(sys, "argv", bad_config)
+        parse_args()
+
+
+def test_three_phase_joint_nll_grad_launcher_mode_and_run_name():
+    launcher = Path(__file__).resolve().parents[1].joinpath(
+        "train_masked_unet3d_4n16g.sbatch"
+    ).read_text()
+
+    assert "--three-phase-joint-nll-grad-globalcosine-256ep)" in launcher
+    assert "--resume-three-phase-joint-nll-grad-globalcosine-256ep)" in launcher
+    assert "THREE_PHASE_JOINT_NLL_GRAD=true" in launcher
+    assert "multi_beta_three_phase_joint_nll_grad_globalcosine_256ep_20261117" in launcher
+    assert "TRAIN_ARGS+=(--joint-nll-grad)" in launcher
+    assert "TRAIN_ARGS+=(three-phase k1-reuse joint-nll-gradient)" in launcher
+    assert "TRAIN_ARGS+=(--curriculum-config three_phase_global_cosine)" in launcher

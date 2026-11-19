@@ -19,6 +19,7 @@ MASK_PATTERNS: Tuple[str, ...] = (
     "temporal_random",
     "temporal_block",
 )
+TEMPORAL_EXTRAPOLATION_PATTERN = "temporal_extrapolation"
 
 # Increment this whenever the training-time meaning of a mask changes. It is
 # stored in checkpoints so auto-resume cannot silently mix incompatible mask
@@ -513,6 +514,21 @@ def _temporal_block_frames(T, generator):
         int(boundaries[0]),
         int(boundaries[1]),
     )
+
+
+def temporal_extrapolation_frames(T, generator=None):
+    """Uniform h in [1, T-1], with only the future suffix hidden."""
+    if T < 2:
+        raise ValueError(f"Temporal extrapolation requires T >= 2, got {T}.")
+    horizon = int(torch.randint(1, T, (1,), generator=generator).item())
+    tmask, info = _temporal_block_from_boundaries(T, T - horizon, T)
+    info.update(
+        temporal_mode=TEMPORAL_EXTRAPOLATION_PATTERN,
+        temporal_direction="future",
+        horizon=horizon,
+        num_visible_frames=T - horizon,
+    )
+    return tmask, info
 
 
 def _temporal_block_from_visible_count(T, n_visible, generator):
@@ -1071,12 +1087,13 @@ def predicted_error_mse_loss(
     target: torch.Tensor,
     objective: str = "smooth_l1",
     student_t_df: float = 3.0,
+    detach_mean: bool = True,
 ) -> torch.Tensor:
     """Variance objective in FP32; retain the legacy name and Smooth L1 default."""
     valid = torch.isfinite(target)
     if not valid.any():
         raise ValueError("The uncertainty objective requires at least one finite target")
-    pred_valid = pred.detach().float()[valid]
+    pred_valid = (pred.detach() if detach_mean else pred).float()[valid]
     target_valid = target.float()[valid]
     variance_valid = output_variance.float()[valid]
     squared_error = (pred_valid - target_valid).square()
@@ -1101,6 +1118,12 @@ def predicted_error_mse_loss(
             + 0.5 * (student_t_df + 1.0)
             * torch.log1p(squared_error / (student_t_df * scale_squared))
         ).mean()
+    if objective in ("generalized_kl", "gkl"):
+        q = squared_error
+        u = variance_valid
+        q_safe = torch.where(q > 0, q, torch.ones_like(q))
+        loss_voxel = torch.where(q > 0, q * torch.log(q_safe), torch.zeros_like(q)) - q * torch.log(u) + u - q
+        return loss_voxel.mean()
     raise ValueError(f"Unknown uncertainty objective: {objective!r}")
 
 

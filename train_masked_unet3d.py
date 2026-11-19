@@ -37,6 +37,7 @@ from data.masking import (
     MASK_PATTERNS,
     PATTERN_TO_ID,
     PROBE_COUNT_PATTERNS,
+    TEMPORAL_EXTRAPOLATION_PATTERN,
     full_mse_loss,
     make_visible_input,
     make_uncertain_input,
@@ -46,6 +47,7 @@ from data.masking import (
     sample_independent_batch_masks,
     sample_patterns,
     sample_training_severity_counts,
+    temporal_extrapolation_frames,
     make_fixed_validation_mask,
 )
 from models.unet3d import DIRECT_MODEL_VERSION, MODEL_VERSION, UNet3D
@@ -102,7 +104,7 @@ class DistributedEvalSampler(Sampler[int]):
         return 0 if remaining <= 0 else (remaining + self.world_size - 1) // self.world_size
 
 
-def parse_args():
+def parse_args(argv=None):
     p = argparse.ArgumentParser()
 
     p.add_argument(
@@ -148,9 +150,11 @@ def parse_args():
         help="Use input variance and predict per-element squared reconstruction error.",
     )
     p.add_argument(
-        "--uncertainty-loss", choices=("smooth_l1", "gaussian_nll", "student_t_nll"),
+        "--uncertainty-loss", choices=(
+            "smooth_l1", "gaussian_nll", "student_t_nll", "generalized_kl", "gkl",
+        ),
         default="smooth_l1",
-        help="Variance objective; NLL objectives use controlled binary-input checks.",
+        help="Variance objective; NLL and GKL objectives use controlled binary-input checks.",
     )
     p.add_argument(
         "--student-t-df", type=float, default=3.0,
@@ -164,7 +168,10 @@ def parse_args():
                    help="Opt-in reconstruction / detached variance / two-pass curriculum.")
     p.add_argument(
         "--curriculum-config",
-        choices=("adaptive", "abcd_symmetric_lr", "global_cosine"),
+        choices=(
+            "adaptive", "abcd_symmetric_lr", "global_cosine",
+            "three_phase_global_cosine",
+        ),
         default="adaptive",
         help="Curriculum control flow; the default preserves the existing adaptive run.",
     )
@@ -387,8 +394,90 @@ def parse_args():
             "latest.pt still takes precedence for crash recovery."
         ),
     )
+    p.add_argument(
+        "--gaussian-u-continuation",
+        action="store_true",
+        help=(
+            "Isolated diagnostic: continue a completed three-phase Student-t "
+            "checkpoint for 20 epochs with the existing Gaussian NLL. Requires "
+            "--post-final-continuation; all other continuation state is restored."
+        ),
+    )
+    p.add_argument(
+        "--temporal-extrapolation-continuation",
+        action="store_true",
+        help=(
+            "Isolated diagnostic: replace the temporal_block training draw "
+            "with a uniformly sampled visible-prefix/hidden-future-suffix task "
+            "during a 20-epoch Student-t post-final continuation."
+        ),
+    )
+    p.add_argument(
+        "--temporal-extrapolation-only-continuation",
+        action="store_true",
+        help=(
+            "Isolated diagnostic: replace all training masks with pure "
+            "temporal extrapolation (100% exposure) during a 10-epoch "
+            "Student-t post-final continuation from the epoch-276 checkpoint."
+        ),
+    )
+    p.add_argument(
+        "--uncertainty-feature-grad-continuation",
+        action="store_true",
+        help=(
+            "Isolated 10-epoch continuation from the epoch-276 20% extrapolation "
+            "checkpoint: allow uncertainty gradients into shared features, "
+            "while retaining detached mean predictions in the NLL."
+        ),
+    )
+    p.add_argument(
+        "--joint-nll-grad-continuation",
+        action="store_true",
+        help=(
+            "Isolated 10-epoch continuation from the epoch-276 20% extrapolation "
+            "checkpoint: allow Student-t uncertainty gradients into both the mean head "
+            "(Path A) and variance head/shared features (Path B)."
+        ),
+    )
+    p.add_argument(
+        "--joint-nll-grad",
+        action="store_true",
+        help=(
+            "Enable joint Path A and Path B Student-t uncertainty gradients "
+            "during curriculum training (Phase B and Phase C)."
+        ),
+    )
+    p.add_argument(
+        "--gkl-continuation-20ep",
+        action="store_true",
+        help=(
+            "Isolated diagnostic: continue the completed three-phase joint A+B "
+            "Student-t checkpoint for 20 epochs with Generalized KL divergence direct uncertainty "
+            "supervision after a 2-epoch cosine transition from Student-t A+B. "
+            "Requires --post-final-continuation; all other continuation state is restored."
+        ),
+    )
+    p.add_argument(
+        "--gkl-joint-grad-continuation-20ep",
+        action="store_true",
+        help=(
+            "Isolated diagnostic: continue the completed three-phase joint A+B "
+            "Student-t checkpoint for 20 epochs with Generalized KL divergence direct uncertainty "
+            "supervision with both Path A and Path B enabled after a 2-epoch cosine transition. "
+            "Requires --post-final-continuation; all other continuation state is restored."
+        ),
+    )
+    p.add_argument(
+        "--student-t-unnormalized-control-20ep",
+        action="store_true",
+        help=(
+            "Isolated matched control: continue the completed three-phase joint A+B "
+            "Student-t checkpoint for 20 epochs with unnormalized Student-t NLL. "
+            "Requires --post-final-continuation; all other continuation state is restored."
+        ),
+    )
 
-    args = p.parse_args()
+    args = p.parse_args(argv)
 
     # Normalized weights are what training actually consumes, and what resume
     # compatibility is checked against. The raw token list is kept for the record.
@@ -426,8 +515,13 @@ def parse_args():
         if args.init_checkpoint is not None:
             p.error("--post-final-continuation and --init-checkpoint are mutually exclusive")
         if (not args.curriculum_training
-                or args.curriculum_config != "global_cosine"):
-            p.error("--post-final-continuation requires the global_cosine curriculum")
+                or args.curriculum_config not in (
+                    "global_cosine", "three_phase_global_cosine",
+                )):
+            p.error(
+                "--post-final-continuation requires the global_cosine or "
+                "three_phase_global_cosine curriculum"
+            )
         if (args.stop_after_epochs != args.final_epoch
                 or args.final_epoch <= args.epochs):
             p.error(
@@ -436,19 +530,168 @@ def parse_args():
             )
         if args.arm_variance_ramp or args.arm_rollout_ramp:
             p.error("--post-final-continuation does not permit ramp arming")
+    if args.gaussian_u_continuation:
+        if args.post_final_continuation is None:
+            p.error("--gaussian-u-continuation requires --post-final-continuation")
+        if args.curriculum_config != "three_phase_global_cosine":
+            p.error(
+                "--gaussian-u-continuation requires three_phase_global_cosine"
+            )
+        if args.uncertainty_loss != "gaussian_nll":
+            p.error("--gaussian-u-continuation requires --uncertainty-loss gaussian_nll")
+    if args.uncertainty_feature_grad_continuation:
+        if (not args.temporal_extrapolation_continuation
+                or args.temporal_extrapolation_only_continuation
+                or args.gaussian_u_continuation
+                or args.joint_nll_grad_continuation
+                or args.joint_nll_grad):
+            p.error(
+                "--uncertainty-feature-grad-continuation requires the existing "
+                "--temporal-extrapolation-continuation 20% mask policy only"
+            )
+    if args.joint_nll_grad_continuation:
+        if (not args.temporal_extrapolation_continuation
+                or args.temporal_extrapolation_only_continuation
+                or args.gaussian_u_continuation
+                or args.uncertainty_feature_grad_continuation
+                or args.joint_nll_grad):
+            p.error(
+                "--joint-nll-grad-continuation requires the existing "
+                "--temporal-extrapolation-continuation 20% mask policy only"
+            )
+    if args.joint_nll_grad:
+        if (not args.curriculum_training
+                or args.curriculum_config != "three_phase_global_cosine"):
+            p.error(
+                "--joint-nll-grad requires --curriculum-training and "
+                "--curriculum-config three_phase_global_cosine"
+            )
+        if (args.uncertainty_loss != "student_t_nll"
+                or args.student_t_df != 3.0):
+            p.error(
+                "--joint-nll-grad requires --uncertainty-loss student_t_nll "
+                "--student-t-df 3"
+            )
+        if args.post_final_continuation is not None:
+            p.error(
+                "--joint-nll-grad is for from-scratch training and cannot be "
+                "used with --post-final-continuation"
+            )
+        if args.init_checkpoint is not None:
+            p.error(
+                "--joint-nll-grad is for from-scratch training and cannot be "
+                "used with --init-checkpoint"
+            )
+        if (args.gaussian_u_continuation
+                or args.temporal_extrapolation_continuation
+                or args.temporal_extrapolation_only_continuation
+                or args.uncertainty_feature_grad_continuation
+                or args.joint_nll_grad_continuation
+                or args.gkl_continuation_20ep
+                or args.gkl_joint_grad_continuation_20ep
+                or args.student_t_unnormalized_control_20ep):
+            p.error(
+                "--joint-nll-grad cannot be combined with continuation diagnostic flags"
+            )
+    if args.gkl_continuation_20ep:
+        if args.post_final_continuation is None:
+            p.error("--gkl-continuation-20ep requires --post-final-continuation")
+        if args.curriculum_config != "three_phase_global_cosine":
+            p.error("--gkl-continuation-20ep requires three_phase_global_cosine")
+        if args.uncertainty_loss not in ("generalized_kl", "gkl"):
+            p.error("--gkl-continuation-20ep requires --uncertainty-loss generalized_kl")
+        if (args.gaussian_u_continuation
+                or args.temporal_extrapolation_continuation
+                or args.temporal_extrapolation_only_continuation
+                or args.uncertainty_feature_grad_continuation
+                or args.joint_nll_grad_continuation
+                or args.gkl_joint_grad_continuation_20ep
+                or args.student_t_unnormalized_control_20ep):
+            p.error("--gkl-continuation-20ep cannot be combined with other continuation flags")
+    if args.gkl_joint_grad_continuation_20ep:
+        if args.post_final_continuation is None:
+            p.error("--gkl-joint-grad-continuation-20ep requires --post-final-continuation")
+        if args.curriculum_config != "three_phase_global_cosine":
+            p.error("--gkl-joint-grad-continuation-20ep requires three_phase_global_cosine")
+        if args.uncertainty_loss not in ("generalized_kl", "gkl"):
+            p.error("--gkl-joint-grad-continuation-20ep requires --uncertainty-loss generalized_kl")
+        if (args.gaussian_u_continuation
+                or args.temporal_extrapolation_continuation
+                or args.temporal_extrapolation_only_continuation
+                or args.uncertainty_feature_grad_continuation
+                or args.joint_nll_grad_continuation
+                or args.gkl_continuation_20ep
+                or args.student_t_unnormalized_control_20ep):
+            p.error("--gkl-joint-grad-continuation-20ep cannot be combined with other continuation flags")
+    if args.student_t_unnormalized_control_20ep:
+        if args.post_final_continuation is None:
+            p.error("--student-t-unnormalized-control-20ep requires --post-final-continuation")
+        if args.curriculum_config != "three_phase_global_cosine":
+            p.error("--student-t-unnormalized-control-20ep requires three_phase_global_cosine")
+        if args.uncertainty_loss != "student_t_nll" or args.student_t_df != 3.0:
+            p.error("--student-t-unnormalized-control-20ep requires --uncertainty-loss student_t_nll --student-t-df 3")
+        if (args.gaussian_u_continuation
+                or args.temporal_extrapolation_continuation
+                or args.temporal_extrapolation_only_continuation
+                or args.uncertainty_feature_grad_continuation
+                or args.joint_nll_grad_continuation
+                or args.gkl_continuation_20ep
+                or args.gkl_joint_grad_continuation_20ep):
+            p.error("--student-t-unnormalized-control-20ep cannot be combined with other continuation flags")
+    if args.temporal_extrapolation_continuation:
+        if args.post_final_continuation is None:
+            p.error(
+                "--temporal-extrapolation-continuation requires "
+                "--post-final-continuation"
+            )
+        if args.curriculum_config != "three_phase_global_cosine":
+            p.error(
+                "--temporal-extrapolation-continuation requires "
+                "three_phase_global_cosine"
+            )
+        if args.uncertainty_loss != "student_t_nll" or args.student_t_df != 3.0:
+            p.error(
+                "--temporal-extrapolation-continuation requires "
+                "--uncertainty-loss student_t_nll --student-t-df 3"
+            )
+        if args.delta_t != 24:
+            p.error("--temporal-extrapolation-continuation requires --delta-t 24")
+    if args.temporal_extrapolation_only_continuation:
+        if args.post_final_continuation is None:
+            p.error(
+                "--temporal-extrapolation-only-continuation requires "
+                "--post-final-continuation"
+            )
+        if args.curriculum_config != "three_phase_global_cosine":
+            p.error(
+                "--temporal-extrapolation-only-continuation requires "
+                "three_phase_global_cosine"
+            )
+        if args.uncertainty_loss != "student_t_nll" or args.student_t_df != 3.0:
+            p.error(
+                "--temporal-extrapolation-only-continuation requires "
+                "--uncertainty-loss student_t_nll --student-t-df 3"
+            )
+        if args.delta_t != 24:
+            p.error("--temporal-extrapolation-only-continuation requires --delta-t 24")
+        if args.temporal_extrapolation_continuation:
+            p.error(
+                "--temporal-extrapolation-only-continuation and "
+                "--temporal-extrapolation-continuation are mutually exclusive"
+            )
     if (args.arm_variance_ramp or args.arm_rollout_ramp) and (not args.curriculum_training or not args.auto_resume):
         p.error("Ramp arming requires --curriculum-training and --auto-resume")
     if not math.isfinite(args.student_t_df) or args.student_t_df <= 2.0:
         p.error("--student-t-df must be finite and greater than 2")
-    if args.uncertainty_loss in ("gaussian_nll", "student_t_nll") and not args.uncertainty_aware:
+    if args.uncertainty_loss in ("gaussian_nll", "student_t_nll", "generalized_kl", "gkl") and not args.uncertainty_aware:
         p.error(f"--uncertainty-loss {args.uncertainty_loss} requires --uncertainty-aware")
-    if args.uncertainty_loss in ("gaussian_nll", "student_t_nll"):
+    if args.uncertainty_loss in ("gaussian_nll", "student_t_nll", "generalized_kl", "gkl"):
         args.variance_floor = GAUSSIAN_NLL_VARIANCE_FLOOR
     if args.curriculum_training:
         if (not args.uncertainty_aware
-                or args.uncertainty_loss not in ("gaussian_nll", "student_t_nll")):
+                or args.uncertainty_loss not in ("gaussian_nll", "student_t_nll", "generalized_kl", "gkl")):
             p.error(
-                "--curriculum-training requires --uncertainty-aware and an NLL uncertainty loss"
+                "--curriculum-training requires --uncertainty-aware and an NLL or GKL uncertainty loss"
             )
         if args.uncertainty_loss_weight != 1.0:
             p.error("Curriculum variance weighting is controlled by lambda_v; --uncertainty-loss-weight must be 1")
@@ -507,6 +750,33 @@ def parse_args():
                 p.error(
                     f"global_cosine requires --final-epoch {args.epochs}"
                 )
+        elif args.curriculum_config == "three_phase_global_cosine":
+            if (args.epochs, args.warmup_epochs) != (256, 5):
+                p.error(
+                    "three_phase_global_cosine requires --epochs 256 "
+                    "--warmup-epochs 5"
+                )
+            if not (
+                math.isclose(args.lr, 2e-4)
+                and math.isclose(args.min_lr, 1e-5)
+            ):
+                p.error(
+                    "three_phase_global_cosine requires "
+                    "--lr 2e-4 --min-lr 1e-5"
+                )
+            if (args.variance_ramp_epochs, args.rollout_ramp_epochs) != (40.0, 40.0):
+                p.error(
+                    "three_phase_global_cosine requires 40-epoch variance "
+                    "and rollout ramps"
+                )
+            if (args.variance_ramp_start_epoch is not None
+                    or args.rollout_ramp_start_epoch is not None):
+                p.error(
+                    "three_phase_global_cosine uses convergence-triggered ramps; "
+                    "scheduled starts are not supported"
+                )
+            if args.post_final_continuation is None and args.final_epoch != 256:
+                p.error("three_phase_global_cosine requires --final-epoch 256")
     if not (0 <= args.warmup_epochs < args.epochs):
         p.error(
             "--warmup-epochs must lie in [0, epochs), got "
@@ -637,7 +907,9 @@ def curriculum_learning_rate_for_epoch(epoch: int, args, state: Dict[str, Any]) 
     if getattr(args, "post_final_continuation", None):
         return args.min_lr
     phase_d_start = state.get("phase_d_start_epoch")
-    if getattr(args, "curriculum_config", "adaptive") == "global_cosine":
+    if getattr(args, "curriculum_config", "adaptive") in (
+        "global_cosine", "three_phase_global_cosine",
+    ):
         return global_cosine_learning_rate(
             epoch, args.epochs, args.warmup_epochs, args.min_lr, args.lr,
         )
@@ -884,6 +1156,15 @@ def validate_resume_parameters(args, checkpoint_args: Dict[str, Any]) -> None:
         ("curriculum_training", False),
         ("curriculum_config", "adaptive"),
         ("post_final_continuation", None),
+        ("gaussian_u_continuation", False),
+        ("temporal_extrapolation_continuation", False),
+        ("temporal_extrapolation_only_continuation", False),
+        ("uncertainty_feature_grad_continuation", False),
+        ("joint_nll_grad_continuation", False),
+        ("joint_nll_grad", False),
+        ("gkl_continuation_20ep", False),
+        ("gkl_joint_grad_continuation_20ep", False),
+        ("student_t_unnormalized_control_20ep", False),
     ):
         if key == "amp_dtype" and not getattr(args, "amp", False):
             continue
@@ -919,6 +1200,12 @@ def validate_resume_parameters(args, checkpoint_args: Dict[str, Any]) -> None:
         if (key == "final_epoch" and getattr(args, "curriculum_training", False)
                 and old_value == 240 and new_value == 200):
             continue
+        if (key in {"channel_mults", "betas", "val_patterns"}
+                and isinstance(old_value, (list, tuple))
+                and isinstance(new_value, (list, tuple))):
+            if list(old_value) != list(new_value):
+                mismatches.append(f"{key}: checkpoint={old_value!r}, current={new_value!r}")
+            continue
         if old_value != new_value:
             mismatches.append(f"{key}: checkpoint={old_value!r}, current={new_value!r}")
 
@@ -946,7 +1233,14 @@ def validate_post_final_continuation(
             raise ValueError(f"Continuation source is missing checkpoint {key!r}")
     source_args = checkpoint["args"]
     source_epoch = int(checkpoint["epoch"])
-    if source_args.get("final_epoch") != source_epoch or args.epochs != source_epoch:
+    expected_source_epochs = (
+        source_args.get("epochs")
+        if (getattr(args, "temporal_extrapolation_only_continuation", False)
+            or getattr(args, "uncertainty_feature_grad_continuation", False)
+            or getattr(args, "joint_nll_grad_continuation", False))
+        else source_epoch
+    )
+    if source_args.get("final_epoch") != source_epoch or args.epochs != expected_source_epochs:
         raise ValueError(
             "Post-final continuation requires --epochs to match the completed "
             "source checkpoint's predetermined final epoch"
@@ -956,9 +1250,207 @@ def validate_post_final_continuation(
             "Post-final continuation requires a later matching stop/final epoch"
         )
 
+    if getattr(args, "gaussian_u_continuation", False):
+        if source_epoch != 256:
+            raise ValueError(
+                "Gaussian-u continuation requires the completed epoch-256 source"
+            )
+        if source_args.get("curriculum_config") != "three_phase_global_cosine":
+            raise ValueError(
+                "Gaussian-u continuation requires a three-phase source checkpoint"
+            )
+        if source_args.get("uncertainty_loss") != "student_t_nll":
+            raise ValueError(
+                "Gaussian-u continuation requires a Student-t source checkpoint"
+            )
+        if not math.isclose(
+            float(source_args.get("student_t_df", float("nan"))),
+            3.0,
+            rel_tol=0.0,
+            abs_tol=0.0,
+        ):
+            raise ValueError("Gaussian-u continuation requires Student-t df=3 source")
+        if args.uncertainty_loss != "gaussian_nll":
+            raise ValueError(
+                "Gaussian-u continuation must optimize the existing Gaussian NLL"
+            )
+        if args.final_epoch != source_epoch + 20:
+            raise ValueError(
+                "Gaussian-u continuation must run exactly 20 additional epochs"
+            )
+    if getattr(args, "temporal_extrapolation_continuation", False):
+        feature_grad = (
+            getattr(args, "uncertainty_feature_grad_continuation", False)
+            or getattr(args, "joint_nll_grad_continuation", False)
+        )
+        expected_epoch = 276 if feature_grad else 256
+        additional_epochs = 10 if feature_grad else 20
+        if source_epoch != expected_epoch:
+            raise ValueError(
+                "Temporal-extrapolation continuation requires the completed "
+                f"epoch-{expected_epoch} source"
+            )
+        if feature_grad and not source_args.get("temporal_extrapolation_continuation", False):
+            raise ValueError("Feature-gradient continuation requires the 20% extrapolation source")
+        if source_args.get("curriculum_config") != "three_phase_global_cosine":
+            raise ValueError(
+                "Temporal-extrapolation continuation requires a three-phase source"
+            )
+        if (source_args.get("uncertainty_loss") != "student_t_nll"
+                or float(source_args.get("student_t_df", float("nan"))) != 3.0):
+            raise ValueError(
+                "Temporal-extrapolation continuation requires a Student-t df=3 source"
+            )
+        if (args.uncertainty_loss != "student_t_nll" or args.student_t_df != 3.0
+                or args.mask_pattern_weights != DEFAULT_PATTERN_WEIGHTS):
+            raise ValueError(
+                "Temporal-extrapolation continuation requires Student-t df=3 "
+                "and the equal five-category mask weights"
+            )
+        if args.final_epoch != source_epoch + additional_epochs:
+            raise ValueError(
+                f"Temporal-extrapolation continuation must run exactly "
+                f"{additional_epochs} additional epochs"
+            )
+    if getattr(args, "temporal_extrapolation_only_continuation", False):
+        if source_epoch != 276:
+            raise ValueError(
+                "Temporal-extrapolation-only continuation requires the completed "
+                "epoch-276 source"
+            )
+        if source_args.get("curriculum_config") != "three_phase_global_cosine":
+            raise ValueError(
+                "Temporal-extrapolation-only continuation requires a three-phase source"
+            )
+        if (source_args.get("uncertainty_loss") != "student_t_nll"
+                or float(source_args.get("student_t_df", float("nan"))) != 3.0):
+            raise ValueError(
+                "Temporal-extrapolation-only continuation requires a Student-t df=3 source"
+            )
+        if (args.uncertainty_loss != "student_t_nll" or args.student_t_df != 3.0
+                or args.mask_pattern_weights != DEFAULT_PATTERN_WEIGHTS):
+            raise ValueError(
+                "Temporal-extrapolation-only continuation requires Student-t df=3 "
+                "and the equal five-category mask weights"
+            )
+        if args.final_epoch != source_epoch + 10:
+            raise ValueError(
+                "Temporal-extrapolation-only continuation must run exactly 10 "
+                "additional epochs"
+            )
+    if getattr(args, "gkl_continuation_20ep", False) or getattr(args, "gkl_joint_grad_continuation_20ep", False):
+        if source_epoch != 256:
+            raise ValueError(
+                "GKL continuation requires the completed epoch-256 source"
+            )
+        if source_args.get("curriculum_config") != "three_phase_global_cosine":
+            raise ValueError(
+                "GKL continuation requires a three-phase source checkpoint"
+            )
+        if (source_args.get("uncertainty_loss") != "student_t_nll"
+                or float(source_args.get("student_t_df", float("nan"))) != 3.0):
+            raise ValueError(
+                "GKL continuation requires a Student-t df=3 source checkpoint"
+            )
+        if not source_args.get("joint_nll_grad", False):
+            raise ValueError(
+                "GKL continuation requires a joint-NLL-gradient source checkpoint"
+            )
+        if args.uncertainty_loss not in ("generalized_kl", "gkl"):
+            raise ValueError("GKL continuation must optimize generalized_kl")
+        if args.mask_pattern_weights != DEFAULT_PATTERN_WEIGHTS:
+            raise ValueError(
+                "GKL continuation requires the equal five-category mask weights"
+            )
+        if args.final_epoch != source_epoch + 20:
+            raise ValueError(
+                "GKL continuation must run exactly 20 additional epochs"
+            )
+    if getattr(args, "student_t_unnormalized_control_20ep", False):
+        if source_epoch != 256:
+            raise ValueError(
+                "Student-t control continuation requires the completed epoch-256 source"
+            )
+        if source_args.get("curriculum_config") != "three_phase_global_cosine":
+            raise ValueError(
+                "Student-t control continuation requires a three-phase source checkpoint"
+            )
+        if (source_args.get("uncertainty_loss") != "student_t_nll"
+                or float(source_args.get("student_t_df", float("nan"))) != 3.0):
+            raise ValueError(
+                "Student-t control continuation requires a Student-t df=3 source checkpoint"
+            )
+        if not source_args.get("joint_nll_grad", False):
+            raise ValueError(
+                "Student-t control continuation requires a joint-NLL-gradient source checkpoint"
+            )
+        if args.uncertainty_loss != "student_t_nll" or args.student_t_df != 3.0:
+            raise ValueError(
+                "Student-t control continuation must optimize student_t_nll with df=3"
+            )
+        if args.mask_pattern_weights != DEFAULT_PATTERN_WEIGHTS:
+            raise ValueError(
+                "Student-t control continuation requires the equal five-category mask weights"
+            )
+        if args.final_epoch != source_epoch + 20:
+            raise ValueError(
+                "Student-t control continuation must run exactly 20 additional epochs"
+            )
+
     compatible_args = argparse.Namespace(**vars(args))
     compatible_args.final_epoch = source_args["final_epoch"]
     compatible_args.post_final_continuation = None
+    if getattr(args, "gkl_continuation_20ep", False) or getattr(args, "gkl_joint_grad_continuation_20ep", False):
+        compatible_args.gkl_continuation_20ep = source_args.get(
+            "gkl_continuation_20ep", False,
+        )
+        compatible_args.gkl_joint_grad_continuation_20ep = source_args.get(
+            "gkl_joint_grad_continuation_20ep", False,
+        )
+        compatible_args.uncertainty_loss = source_args["uncertainty_loss"]
+        compatible_args.student_t_df = source_args.get("student_t_df", 3.0)
+        compatible_args.joint_nll_grad = source_args.get("joint_nll_grad", False)
+    if getattr(args, "student_t_unnormalized_control_20ep", False):
+        compatible_args.student_t_unnormalized_control_20ep = source_args.get(
+            "student_t_unnormalized_control_20ep", False,
+        )
+        compatible_args.joint_nll_grad = source_args.get("joint_nll_grad", False)
+    if getattr(args, "uncertainty_feature_grad_continuation", False):
+        compatible_args.post_final_continuation = source_args.get("post_final_continuation")
+        compatible_args.uncertainty_feature_grad_continuation = source_args.get(
+            "uncertainty_feature_grad_continuation", False,
+        )
+    if getattr(args, "joint_nll_grad_continuation", False):
+        compatible_args.post_final_continuation = source_args.get("post_final_continuation")
+        compatible_args.joint_nll_grad_continuation = source_args.get(
+            "joint_nll_grad_continuation", False,
+        )
+    if getattr(args, "gaussian_u_continuation", False):
+        # This explicit diagnostic changes only the likelihood. Validate every
+        # other source parameter using its original value.
+        compatible_args.gaussian_u_continuation = source_args.get(
+            "gaussian_u_continuation", False,
+        )
+        compatible_args.uncertainty_loss = source_args["uncertainty_loss"]
+        compatible_args.student_t_df = source_args.get("student_t_df", 3.0)
+    if getattr(args, "temporal_extrapolation_continuation", False):
+        # The explicit diagnostic changes only how the existing fifth mask
+        # category is sampled. Every source training parameter remains strict.
+        compatible_args.temporal_extrapolation_continuation = source_args.get(
+            "temporal_extrapolation_continuation", False,
+        )
+    if getattr(args, "temporal_extrapolation_only_continuation", False):
+        # This diagnostic changes all training masks to pure temporal extrapolation.
+        # Preserve source continuation metadata for strict validation.
+        compatible_args.post_final_continuation = source_args.get(
+            "post_final_continuation"
+        )
+        compatible_args.temporal_extrapolation_only_continuation = source_args.get(
+            "temporal_extrapolation_only_continuation", False,
+        )
+        compatible_args.temporal_extrapolation_continuation = source_args.get(
+            "temporal_extrapolation_continuation", False,
+        )
     validate_resume_parameters(compatible_args, source_args)
 
     if not curriculum_is_complete(checkpoint["curriculum_state"]):
@@ -1256,6 +1748,14 @@ def curriculum_phase(
     epoch: int, state: Dict[str, Any], lambda_v: float, lambda_r: float,
     config: str = "adaptive",
 ) -> Tuple[int, str]:
+    if config == "three_phase_global_cosine":
+        if lambda_v == 0:
+            return 0, "mean_only"
+        if lambda_r == 0:
+            return 1, "variance_ramp_or_settle"
+        if lambda_r < 1:
+            return 2, "rollout_ramp"
+        return 2, "rollout_settled"
     if config == "global_cosine":
         if lambda_v == 0:
             return 0, "mean_only"
@@ -1336,7 +1836,9 @@ def positive_metric_convergence(
 
 def phase_a_convergence(history, args, curriculum_state):
     """Detect Phase-A readiness in the current contiguous fixed-LR regime."""
-    global_cosine = getattr(args, "curriculum_config", "adaptive") == "global_cosine"
+    global_cosine = getattr(args, "curriculum_config", "adaptive") in (
+        "global_cosine", "three_phase_global_cosine",
+    )
 
     def monitor_active(row):
         if global_cosine:
@@ -1536,31 +2038,75 @@ def phase_c_convergence(history, args, curriculum_state):
 
 
 def sample_training_mask(y, pattern_weights, density_p_zero, density_p_full,
-                         magnetic_p_zero, magnetic_p_full):
+                         magnetic_p_zero, magnetic_p_full,
+                         temporal_extrapolation=False,
+                         temporal_extrapolation_only=False):
     """Shared existing mask sampling for the ordinary pass and rollout pass."""
     batch_size, _, time_steps, nx, nz = y.shape
     spatial_sites = nx * nz
-    magnetic_patterns = sample_patterns(pattern_weights, batch_size)
-    density_patterns = sample_patterns(pattern_weights, batch_size)
-    magnetic_fractions = torch.rand(batch_size).tolist()
-    density_fractions = torch.rand(batch_size).tolist()
-    density_counts = sample_training_severity_counts(
-        density_patterns, spatial_sites=spatial_sites, time_steps=time_steps,
-        p_zero=density_p_zero, p_full=density_p_full)
-    magnetic_counts = sample_training_severity_counts(
-        magnetic_patterns, spatial_sites=spatial_sites, time_steps=time_steps,
-        p_zero=magnetic_p_zero, p_full=magnetic_p_full)
-    for patterns, counts, fractions, modality in (
-        (density_patterns, density_counts, density_fractions, "Density"),
-        (magnetic_patterns, magnetic_counts, magnetic_fractions, "magnetic"),
-    ):
-        _apply_training_visible_counts(patterns, counts, fractions,
-                                       spatial_sites=spatial_sites, time_steps=time_steps, modality=modality)
-    mask, infos = sample_independent_batch_masks(
-        y.shape, magnetic_patterns=magnetic_patterns, density_patterns=density_patterns,
-        magnetic_mask_fractions=magnetic_fractions, density_mask_fractions=density_fractions,
-        device=y.device, dtype=y.dtype, density_probe_counts=density_counts,
-        magnetic_visible_counts=magnetic_counts)
+    if temporal_extrapolation_only:
+        # Populate these directly below using only the existing suffix helper.
+        magnetic_patterns = [TEMPORAL_EXTRAPOLATION_PATTERN] * batch_size
+        density_patterns = [TEMPORAL_EXTRAPOLATION_PATTERN] * batch_size
+        magnetic_fractions, density_fractions = [0.0] * batch_size, [0.0] * batch_size
+        magnetic_counts, density_counts = [None] * batch_size, [None] * batch_size
+        mask = torch.empty_like(y)
+        infos = [{} for _ in range(batch_size)]
+    else:
+        magnetic_patterns = sample_patterns(pattern_weights, batch_size)
+        density_patterns = sample_patterns(pattern_weights, batch_size)
+        magnetic_fractions = torch.rand(batch_size).tolist()
+        density_fractions = torch.rand(batch_size).tolist()
+        density_counts = sample_training_severity_counts(
+            density_patterns, spatial_sites=spatial_sites, time_steps=time_steps,
+            p_zero=density_p_zero, p_full=density_p_full)
+        magnetic_counts = sample_training_severity_counts(
+            magnetic_patterns, spatial_sites=spatial_sites, time_steps=time_steps,
+            p_zero=magnetic_p_zero, p_full=magnetic_p_full)
+        for patterns, counts, fractions, modality in (
+            (density_patterns, density_counts, density_fractions, "Density"),
+            (magnetic_patterns, magnetic_counts, magnetic_fractions, "magnetic"),
+        ):
+            _apply_training_visible_counts(patterns, counts, fractions,
+                                           spatial_sites=spatial_sites, time_steps=time_steps, modality=modality)
+        mask, infos = sample_independent_batch_masks(
+            y.shape, magnetic_patterns=magnetic_patterns, density_patterns=density_patterns,
+            magnetic_mask_fractions=magnetic_fractions, density_mask_fractions=density_fractions,
+            device=y.device, dtype=y.dtype, density_probe_counts=density_counts,
+            magnetic_visible_counts=magnetic_counts)
+    if temporal_extrapolation or temporal_extrapolation_only:
+        for i in range(batch_size):
+            for modality, channels, patterns, fractions, counts in (
+                ("magnetic", slice(0, 3), magnetic_patterns,
+                 magnetic_fractions, magnetic_counts),
+                ("density", slice(3, 4), density_patterns,
+                 density_fractions, density_counts),
+            ):
+                if not temporal_extrapolation_only and patterns[i] != "temporal_block":
+                    continue
+                temporal_mask, temporal_info = temporal_extrapolation_frames(
+                    time_steps
+                )
+                mask[i, channels] = temporal_mask[0].expand(
+                    channels.stop - channels.start, time_steps, nx, nz,
+                ).to(device=y.device, dtype=y.dtype)
+                patterns[i] = TEMPORAL_EXTRAPOLATION_PATTERN
+                horizon = int(temporal_info["horizon"])
+                fractions[i] = horizon / time_steps
+                counts[i] = time_steps - horizon
+                infos[i][f"{modality}_pattern"] = TEMPORAL_EXTRAPOLATION_PATTERN
+                infos[i].update({
+                    f"{modality}_{key}": value
+                    for key, value in temporal_info.items()
+                })
+                infos[i][f"{modality}_actual_mask_fraction"] = horizon / time_steps
+                infos[i][f"{modality}_visible_fraction"] = 1.0 - horizon / time_steps
+                if temporal_extrapolation_only:
+                    infos[i][f"{modality}_target_mask_fraction"] = horizon / time_steps
+            infos[i]["actual_mask_fraction"] = (
+                3.0 * infos[i]["magnetic_actual_mask_fraction"]
+                + infos[i]["density_actual_mask_fraction"]
+            ) / 4.0
     return (mask, infos, magnetic_patterns, density_patterns, magnetic_fractions,
             density_fractions, magnetic_counts, density_counts)
 
@@ -1933,19 +2479,54 @@ def make_phase_c_reuse_input(
 def curriculum_forward_loss(
     model, model_input, target, mask, lambda_v, lambda_r, reuse_masks=None,
     uncertainty_loss="gaussian_nll", student_t_df=3.0,
+    curriculum_config="adaptive",
+    detach_variance_features=True,
+    detach_mean=True,
+    gkl_alpha=None,
 ):
-    """Phase A/B pass or Phase-C K=2 detached reuse with geometric weighting."""
-    weights = phase_c_geometric_weights(lambda_r)
-    pred, variance = model(model_input, detach_variance_features=True)
+    """Phase A/B pass or detached Phase-C reuse for the selected curriculum."""
+    three_phase = curriculum_config == "three_phase_global_cosine"
+    if three_phase:
+        normalizer = 1.0 + float(lambda_r)
+        weights = (1.0 / normalizer, float(lambda_r) / normalizer, 0.0)
+        reuse_steps = 1
+    else:
+        weights = phase_c_geometric_weights(lambda_r)
+        reuse_steps = 2
+
+    def base_loss(mu, var):
+        combined = mu + lambda_v * var
+        return combined / (1.0 + lambda_v) if three_phase else combined
+
+    pred, variance = model(model_input, detach_variance_features=detach_variance_features)
     mu_loss = full_mse_loss(pred, target, mask)
-    var_loss = (predicted_error_mse_loss(
-                    variance, pred, target, uncertainty_loss, student_t_df,
-                )
-                if lambda_v > 0 else mu_loss.new_zeros(()))
+    if gkl_alpha is not None and lambda_v > 0:
+        alpha = float(gkl_alpha)
+        l_st = (
+            predicted_error_mse_loss(
+                variance, pred, target, "student_t_nll", student_t_df,
+                detach_mean=False,
+            )
+            if alpha < 1.0 else mu_loss.new_zeros(())
+        )
+        l_gkl = (
+            predicted_error_mse_loss(
+                variance, pred, target, "generalized_kl", student_t_df,
+                detach_mean=detach_mean,
+            )
+            if alpha > 0.0 else mu_loss.new_zeros(())
+        )
+        var_loss = (1.0 - alpha) * l_st + alpha * l_gkl
+    else:
+        var_loss = (predicted_error_mse_loss(
+                        variance, pred, target, uncertainty_loss, student_t_df,
+                        detach_mean=detach_mean,
+                    )
+                    if lambda_v > 0 else mu_loss.new_zeros(()))
     check_stage1(torch.isfinite(pred).all() & torch.isfinite(variance).all() & (variance > 0).all()
                  & torch.isfinite(mu_loss) & (mu_loss <= 100) & torch.isfinite(var_loss),
                  "Invalid curriculum first-pass prediction/variance/loss or catastrophic reconstruction MSE (>100)")
-    pass_losses = [mu_loss + lambda_v * var_loss]
+    pass_losses = [base_loss(mu_loss, var_loss)]
     zero = mu_loss.new_zeros(())
     components = {
         "L_mu_0": mu_loss, "L_var_0": var_loss,
@@ -1956,21 +2537,49 @@ def curriculum_forward_loss(
         "reuse_weight_2": mu_loss.new_tensor(weights[2]),
         "forwards": 1,
     }
+    if gkl_alpha is not None:
+        components["gkl_alpha"] = mu_loss.new_tensor(alpha)
+        components["L_student_t_0"] = l_st.detach()
+        components["L_gkl_0"] = l_gkl.detach()
     if lambda_r > 0:
-        if reuse_masks is None or len(reuse_masks) != 2:
-            raise ValueError("Positive Phase-C rollout weight requires exactly two new masks")
+        if reuse_masks is None or len(reuse_masks) != reuse_steps:
+            raise ValueError(
+                "Positive Phase-C rollout weight requires exactly "
+                f"{reuse_steps} new mask{'s' if reuse_steps != 1 else ''}"
+            )
         previous_mean, previous_variance = pred, variance
         for pass_index, reuse_mask in enumerate(reuse_masks, 1):
             reuse_input, exact_mask = make_phase_c_reuse_input(
                 target, previous_mean, previous_variance, reuse_mask,
             )
             next_mean, next_variance = model(
-                reuse_input, detach_variance_features=True,
+                reuse_input, detach_variance_features=detach_variance_features,
             )
             next_mu_loss = full_mse_loss(next_mean, target, exact_mask)
-            next_var_loss = predicted_error_mse_loss(
-                next_variance, next_mean, target, uncertainty_loss, student_t_df,
-            )
+            if gkl_alpha is not None and lambda_v > 0:
+                alpha = float(gkl_alpha)
+                next_l_st = (
+                    predicted_error_mse_loss(
+                        next_variance, next_mean, target, "student_t_nll", student_t_df,
+                        detach_mean=False,
+                    )
+                    if alpha < 1.0 else next_mu_loss.new_zeros(())
+                )
+                next_l_gkl = (
+                    predicted_error_mse_loss(
+                        next_variance, next_mean, target, "generalized_kl", student_t_df,
+                        detach_mean=detach_mean,
+                    )
+                    if alpha > 0.0 else next_mu_loss.new_zeros(())
+                )
+                next_var_loss = (1.0 - alpha) * next_l_st + alpha * next_l_gkl
+                components[f"L_student_t_{pass_index}"] = next_l_st.detach()
+                components[f"L_gkl_{pass_index}"] = next_l_gkl.detach()
+            else:
+                next_var_loss = predicted_error_mse_loss(
+                    next_variance, next_mean, target, uncertainty_loss, student_t_df,
+                    detach_mean=detach_mean,
+                )
             check_stage1(
                 torch.isfinite(next_mean).all()
                 & torch.isfinite(next_variance).all()
@@ -1983,9 +2592,9 @@ def curriculum_forward_loss(
             )
             components[f"L_mu_{pass_index}"] = next_mu_loss
             components[f"L_var_{pass_index}"] = next_var_loss
-            pass_losses.append(next_mu_loss + lambda_v * next_var_loss)
+            pass_losses.append(base_loss(next_mu_loss, next_var_loss))
             previous_mean, previous_variance = next_mean, next_variance
-        components["forwards"] = 3
+        components["forwards"] = 1 + reuse_steps
     loss = sum(weight * pass_loss for weight, pass_loss in zip(weights, pass_losses))
     components["total_loss"] = loss
     return loss, pred, variance, components
@@ -2035,9 +2644,21 @@ def train_one_epoch(
     curriculum_state: Optional[Dict[str, Any]] = None,
     curriculum_log_every: int = 50,
     phase_d_stream: Optional[PhaseDStreamingBatch] = None,
+    curriculum_config: str = "adaptive",
+    temporal_extrapolation_continuation: bool = False,
+    temporal_extrapolation_only_continuation: bool = False,
+    uncertainty_feature_grad_continuation: bool = False,
+    joint_nll_grad_continuation: bool = False,
+    joint_nll_grad: bool = False,
+    gkl_continuation_20ep: bool = False,
+    gkl_joint_grad_continuation_20ep: bool = False,
+    student_t_unnormalized_control_20ep: bool = False,
 ) -> Dict[str, Any]:
     model.train()
-    stage1 = uncertainty_aware and uncertainty_loss in ("gaussian_nll", "student_t_nll")
+    is_gkl = gkl_continuation_20ep or gkl_joint_grad_continuation_20ep
+    stage1 = uncertainty_aware and uncertainty_loss in (
+        "gaussian_nll", "student_t_nll", "generalized_kl", "gkl",
+    )
     uncertainty_key = uncertainty_loss if stage1 else "uncertainty_mse"
 
     n_patterns = len(MASK_PATTERNS)
@@ -2046,6 +2667,7 @@ def train_one_epoch(
     # independent marginals, so no ambiguous 5x5 combination loss is logged.
     sum_mse = torch.zeros((), device=device)
     sum_uncertainty_mse = torch.zeros((), device=device)
+    gkl_totals = torch.zeros(5, dtype=torch.float64, device=device) if is_gkl else None
     magnetic_pattern_counts = torch.zeros(n_patterns, device=device)
     density_pattern_counts = torch.zeros(n_patterns, device=device)
     sum_actual_fraction = torch.zeros((), device=device)
@@ -2113,7 +2735,9 @@ def train_one_epoch(
         (mask, mask_infos, magnetic_patterns, density_patterns, magnetic_fractions,
          density_fractions, magnetic_visible_counts, density_visible_counts) = sample_training_mask(
             y, pattern_weights, density_visible_p_zero, density_visible_p_full,
-            magnetic_visible_p_zero, magnetic_visible_p_full)
+            magnetic_visible_p_zero, magnetic_visible_p_full,
+            temporal_extrapolation_continuation,
+            temporal_extrapolation_only_continuation)
         for pattern, count in zip(density_patterns, density_visible_counts):
             if pattern not in PROBE_COUNT_PATTERNS:
                 continue
@@ -2158,12 +2782,15 @@ def train_one_epoch(
             lambda_start = lambda_start or (lambda_v, lambda_r)
             lambda_end = (lambda_v, lambda_r)
             # Phase D is already a recursive state, so it performs one forward.
+            reuse_steps = (1 if curriculum_config == "three_phase_global_cosine" else 2)
             reuse_masks = (tuple(
                 sample_training_mask(
                     y, pattern_weights, density_visible_p_zero, density_visible_p_full,
                     magnetic_visible_p_zero, magnetic_visible_p_full,
+                    temporal_extrapolation_continuation,
+                    temporal_extrapolation_only_continuation,
                 )[0]
-                for _ in range(2)
+                for _ in range(reuse_steps)
             ) if lambda_r > 0 and not phase_d_active else None)
 
         with torch.cuda.amp.autocast(enabled=(amp and device.type == "cuda"), dtype=amp_dtype):
@@ -2181,9 +2808,33 @@ def train_one_epoch(
                     "total_loss": loss,
                 }
             elif curriculum_state is not None:
+                enable_variance_feature_grad = (
+                    uncertainty_feature_grad_continuation
+                    or joint_nll_grad_continuation
+                    or joint_nll_grad
+                    or gkl_continuation_20ep
+                    or gkl_joint_grad_continuation_20ep
+                    or student_t_unnormalized_control_20ep
+                )
+                enable_mean_nll_grad = (
+                    joint_nll_grad_continuation
+                    or joint_nll_grad
+                    or gkl_joint_grad_continuation_20ep
+                    or student_t_unnormalized_control_20ep
+                )
+                gkl_alpha = None
+                if is_gkl:
+                    gkl_start_step = 256 * curriculum_state.get("updates_per_epoch", len(loader))
+                    gkl_duration_steps = 2 * curriculum_state.get("updates_per_epoch", len(loader))
+                    current_step = curriculum_state["successful_optimizer_steps"]
+                    step_progress = min(max((current_step - gkl_start_step) / gkl_duration_steps, 0.0), 1.0)
+                    gkl_alpha = 0.5 * (1.0 - math.cos(math.pi * step_progress))
                 loss, pred, output_variance, components = curriculum_forward_loss(
                     model, model_input, y, mask, lambda_v, lambda_r, reuse_masks,
-                    uncertainty_loss, student_t_df,
+                    uncertainty_loss, student_t_df, curriculum_config,
+                    detach_variance_features=not enable_variance_feature_grad,
+                    detach_mean=not enable_mean_nll_grad,
+                    gkl_alpha=gkl_alpha,
                 )
                 reconstruction_loss = components["L_mu_0"]
                 variance_loss = components["L_var_0"]
@@ -2255,6 +2906,14 @@ def train_one_epoch(
                     loss.new_tensor(components["forwards"] == 2),
                     loss.new_tensor(components["forwards"] == 3),
                 ]).detach().double()
+                if is_gkl and gkl_totals is not None:
+                    gkl_totals += torch.stack([
+                        components.get("gkl_alpha", component_zero),
+                        components.get("L_student_t_0", component_zero),
+                        components.get("L_gkl_0", component_zero),
+                        components.get("L_student_t_1", component_zero),
+                        components.get("L_gkl_1", component_zero),
+                    ]).detach().double()
             if step % curriculum_log_every == 0 or step + 1 == len(loader):
                 region = ("D" if phase_d_active else
                           ("A" if lambda_v == 0 else ("B" if lambda_r == 0 else "C")))
@@ -2270,11 +2929,17 @@ def train_one_epoch(
 
         with torch.no_grad():
             magnetic_pattern_ids = torch.tensor(
-                [PATTERN_TO_ID[name] for name in magnetic_patterns],
+                [PATTERN_TO_ID[
+                    "temporal_block"
+                    if name == TEMPORAL_EXTRAPOLATION_PATTERN else name
+                ] for name in magnetic_patterns],
                 device=device,
             )
             density_pattern_ids = torch.tensor(
-                [PATTERN_TO_ID[name] for name in density_patterns],
+                [PATTERN_TO_ID[
+                    "temporal_block"
+                    if name == TEMPORAL_EXTRAPOLATION_PATTERN else name
+                ] for name in density_patterns],
                 device=device,
             )
             per_sample_actual = 1.0 - mask.flatten(1).mean(1)
@@ -2293,12 +2958,16 @@ def train_one_epoch(
         for i, info in enumerate(mask_infos):
             magnetic_target = (
                 info["magnetic_actual_mask_fraction"]
-                if magnetic_patterns[i] == "temporal_block"
+                if magnetic_patterns[i] in {
+                    "temporal_block", TEMPORAL_EXTRAPOLATION_PATTERN,
+                }
                 else magnetic_fractions[i]
             )
             density_target = (
                 info["density_actual_mask_fraction"]
-                if density_patterns[i] == "temporal_block"
+                if density_patterns[i] in {
+                    "temporal_block", TEMPORAL_EXTRAPOLATION_PATTERN,
+                }
                 else density_fractions[i]
             )
             sum_target_fraction += (
@@ -2375,6 +3044,13 @@ def train_one_epoch(
     magnetic_count = max(global_magnetic_sample_count, 1)
     mean_magnetic_visible = global_magnetic_visible_sum / magnetic_count
 
+    logged_pattern_names = tuple(
+        TEMPORAL_EXTRAPOLATION_PATTERN if (
+            (temporal_extrapolation_continuation or temporal_extrapolation_only_continuation)
+            and name == "temporal_block"
+        ) else name
+        for name in MASK_PATTERNS
+    )
     metrics = {
         "mse": global_mse / max(global_batches, 1),
         "target_mask_fraction": global_target / total_count,
@@ -2393,11 +3069,11 @@ def train_one_epoch(
         ),
         "magnetic_pattern_share": {
             name: float(magnetic_pattern_counts[i].cpu()) / total_count
-            for i, name in enumerate(MASK_PATTERNS)
+            for i, name in enumerate(logged_pattern_names)
         },
         "density_pattern_share": {
             name: float(density_pattern_counts[i].cpu()) / total_count
-            for i, name in enumerate(MASK_PATTERNS)
+            for i, name in enumerate(logged_pattern_names)
         },
         "optimizer_steps": global_applied_steps,
         "amp_skipped_steps": global_batches - global_applied_steps,
@@ -2422,6 +3098,15 @@ def train_one_epoch(
         metrics["curriculum"].update(lambda_v_start=lambda_start[0], lambda_r_start=lambda_start[1],
                                      lambda_v_end=lambda_end[0], lambda_r_end=lambda_end[1],
                                      successful_optimizer_steps=curriculum_state["successful_optimizer_steps"])
+        if is_gkl and gkl_totals is not None:
+            if distributed_is_initialized():
+                dist.all_reduce(gkl_totals, op=dist.ReduceOp.SUM)
+            gkl_names = (
+                "gkl_alpha", "L_student_t_0", "L_gkl_0", "L_student_t_1", "L_gkl_1",
+            )
+            metrics["curriculum"].update(
+                dict(zip(gkl_names, (gkl_totals / max(global_batches, 1)).cpu().tolist()))
+            )
     if phase_d_active:
         local = phase_d_stream.local_epoch_metrics()
         count = local["slot_steps"]
@@ -2540,7 +3225,9 @@ def validate(
     patterns.
     """
     model.eval()
-    stage1 = uncertainty_aware and uncertainty_loss in ("gaussian_nll", "student_t_nll")
+    stage1 = uncertainty_aware and uncertainty_loss in (
+        "gaussian_nll", "student_t_nll", "generalized_kl", "gkl",
+    )
     if rollout_validation and not stage1:
         raise ValueError("Rollout validation requires an uncertainty-aware NLL mode")
     uncertainty_key = uncertainty_loss if stage1 else "uncertainty_mse"
@@ -2779,31 +3466,39 @@ def build_epoch_wandb_log(
         "optimization/learning_rate": row["learning_rate"],
     }
 
-    for pattern in MASK_PATTERNS:
-        log_data[f"mask/magnetic_pattern_share/{pattern}"] = (
-            train_metrics["magnetic_pattern_share"][pattern]
-        )
-        log_data[f"mask/density_pattern_share/{pattern}"] = (
-            train_metrics["density_pattern_share"][pattern]
-        )
+    for modality in ("magnetic", "density"):
+        for pattern, share in train_metrics[f"{modality}_pattern_share"].items():
+            log_data[f"mask/{modality}_pattern_share/{pattern}"] = share
 
     for pattern in val_patterns:
         log_data[f"val/{pattern}/mse"] = val_metrics[pattern]["mse"]
         if "rollout_mse" in val_metrics[pattern]:
             log_data[f"val/{pattern}/rollout_mse"] = val_metrics[pattern]["rollout_mse"]
             rollout_key = next(
-                key for key in ("rollout_gaussian_nll", "rollout_student_t_nll")
+                key for key in (
+                    "rollout_gaussian_nll", "rollout_student_t_nll",
+                    "rollout_generalized_kl", "rollout_gkl",
+                )
                 if key in val_metrics[pattern]
             )
             log_data[f"val/{pattern}/{rollout_key}"] = val_metrics[pattern][rollout_key]
     if "val_rollout_mse" in row:
         log_data["val/rollout_mse"] = row["val_rollout_mse"]
         rollout_key = next(
-            key for key in ("val_rollout_gaussian_nll", "val_rollout_student_t_nll")
+            key for key in (
+                "val_rollout_gaussian_nll", "val_rollout_student_t_nll",
+                "val_rollout_generalized_kl", "val_rollout_gkl",
+            )
             if key in row
         )
         log_data[f"val/{rollout_key.removeprefix('val_')}"] = row[rollout_key]
-    if "train_gaussian_nll" in row:
+    if "train_generalized_kl" in row:
+        log_data["train/generalized_kl"] = row["train_generalized_kl"]
+        log_data["val/generalized_kl"] = row["val_generalized_kl"]
+    elif "train_gkl" in row:
+        log_data["train/gkl"] = row["train_gkl"]
+        log_data["val/gkl"] = row["val_gkl"]
+    elif "train_gaussian_nll" in row:
         log_data["train/gaussian_nll"] = row["train_gaussian_nll"]
         log_data["val/gaussian_nll"] = row["val_gaussian_nll"]
     elif "train_student_t_nll" in row:
@@ -2989,18 +3684,92 @@ def main():
         f"total_epochs={args.epochs}"
     )
     if args.post_final_continuation:
+        continuation_start = (
+            277 if (args.temporal_extrapolation_only_continuation
+                    or args.uncertainty_feature_grad_continuation
+                    or args.joint_nll_grad_continuation) else args.epochs + 1
+        )
         rank_print(
-            f"Post-final continuation: epochs {args.epochs + 1}-{args.final_epoch}, full objective "
+            f"Post-final continuation: epochs {continuation_start}-{args.final_epoch}, full objective "
             f"(lambda_v=lambda_r=1), fixed LR={args.min_lr:g}; no ramps, "
             "convergence transitions, warmup, or reheat."
         )
+        if args.gaussian_u_continuation:
+            rank_print(
+                "Gaussian-u diagnostic continuation: source objective="
+                "student_t_nll (df=3), continuation objective=gaussian_nll; "
+                "settled three-phase K=1 reuse remains unchanged; Phase D is disabled."
+            )
+        if args.temporal_extrapolation_continuation:
+            rank_print(
+                "Temporal-task diagnostic continuation: objective=student_t_nll "
+                "(df=3); temporal_block draw replaced by "
+                "temporal_extrapolation with probability=0.2; horizon is "
+                "UniformInteger(1,23), visible prefix -> hidden future suffix; "
+                "settled three-phase K=1 reuse remains unchanged; Phase D is disabled."
+            )
+        if args.uncertainty_feature_grad_continuation:
+            rank_print(
+                "Uncertainty feature-gradient diagnostic: variance features are not "
+                "detached in training; NLL mean predictions remain detached; "
+                "source epoch=276; 10 additional epochs; 20% extrapolation masks unchanged."
+            )
+        if args.joint_nll_grad_continuation:
+            rank_print(
+                "Joint NLL gradient diagnostic: Student-t NLL gradients enabled "
+                "in both the mean head (Path A) and variance head/shared features (Path B); "
+                "source epoch=276; 10 additional epochs; 20% extrapolation masks unchanged."
+            )
+        if args.temporal_extrapolation_only_continuation:
+            rank_print(
+                "Temporal-task 100% extrapolation diagnostic continuation: "
+                "diagnostic=temporal_extrapolation_only; "
+                f"source checkpoint={args.post_final_continuation}; source epoch=276; "
+                "objective=student_t_nll; student_t_df=3; "
+                "temporal_extrapolation training fraction=1.0; "
+                "horizon range=1..23 uniform; lambda_v=1; lambda_r=1; "
+                f"LR={args.min_lr:g}; settled three-phase K=1 reuse remains unchanged; "
+                "Phase D is disabled."
+            )
     rank_print("Mask pattern weights:", args.mask_pattern_weights)
     rank_print("Validation mask patterns:", args.val_patterns)
     if args.uncertainty_aware:
         rank_print("Uncertainty objective:", args.uncertainty_loss)
         if args.uncertainty_loss == "student_t_nll":
             rank_print("Student-t df:", args.student_t_df)
-        if args.uncertainty_loss in ("gaussian_nll", "student_t_nll"):
+        if args.joint_nll_grad:
+            rank_print(
+                "Joint NLL gradient curriculum: Student-t NLL gradients enabled "
+                "in both the mean head (Path A) and variance head/shared features (Path B) "
+                "during Phase B and Phase C."
+            )
+        if args.gkl_continuation_20ep:
+            rank_print(
+                "GKL continuation: diagnostic=generalized_kl_continuation; "
+                f"source checkpoint={args.post_final_continuation}; source epoch=256; "
+                "target epoch=276; 2-epoch cosine transition from Student-t A+B to GKL; "
+                f"LR={args.min_lr:g}; settled three-phase K=1 reuse remains unchanged; "
+                "Phase D is disabled."
+            )
+        if args.gkl_joint_grad_continuation_20ep:
+            rank_print(
+                "GKL joint-gradient continuation: diagnostic=generalized_kl_joint_grad_continuation; "
+                f"source checkpoint={args.post_final_continuation}; source epoch=256; "
+                "target epoch=276; 2-epoch cosine transition from Student-t A+B to GKL; "
+                "Path A ON; Path B ON; "
+                f"LR={args.min_lr:g}; settled three-phase K=1 reuse remains unchanged; "
+                "Phase D is disabled."
+            )
+        if args.student_t_unnormalized_control_20ep:
+            rank_print(
+                "Student-t unnormalized control: diagnostic=student_t_unnormalized_control; "
+                f"source checkpoint={args.post_final_continuation}; source epoch=256; "
+                "target epoch=276; objective=student_t_nll; student_t_df=3; "
+                "Path A ON; Path B ON; "
+                f"LR={args.min_lr:g}; settled three-phase K=1 reuse remains unchanged; "
+                "Phase D is disabled."
+            )
+        if args.uncertainty_loss in ("gaussian_nll", "student_t_nll", "generalized_kl", "gkl"):
             input_label = "Curriculum first pass" if args.curriculum_training else "Stage-1"
             rank_print(f"{input_label}: binary input variance checked every batch; FP32 NLL floor={GAUSSIAN_NLL_VARIANCE_FLOOR:g}; no upper cap")
     if args.curriculum_training:
@@ -3264,7 +4033,8 @@ def main():
         )
 
     phase_d_stream = None
-    if curriculum_state is not None:
+    if (curriculum_state is not None
+            and args.curriculum_config != "three_phase_global_cosine"):
         phase_d_stream = PhaseDStreamingBatch(
             dataset=dataset,
             train_runs=sorted(selected_train_runs),
@@ -3331,6 +4101,51 @@ def main():
                 "data_split": split_metadata,
                 "channel_mean": stats["mean"],
                 "channel_std": stats["std"],
+                **({
+                    "diagnostic": "temporal_extrapolation_sampling",
+                    "temporal_extrapolation_probability": 0.2,
+                    "temporal_extrapolation_horizon_range": "1..23 uniform",
+                } if args.temporal_extrapolation_continuation else {}),
+                **({
+                    "diagnostic": "temporal_extrapolation_only",
+                    "temporal_extrapolation_probability": 1.0,
+                    "temporal_extrapolation_horizon_range": "1..23 uniform",
+                } if args.temporal_extrapolation_only_continuation else {}),
+                **({
+                    "diagnostic": "joint_nll_gradient",
+                    "nll_grad_path_a_mean": True,
+                    "nll_grad_path_b_variance": True,
+                    "temporal_extrapolation_probability": 0.2,
+                    "temporal_extrapolation_horizon_range": "1..23 uniform",
+                } if args.joint_nll_grad_continuation else {}),
+                **({
+                    "joint_nll_gradient": True,
+                    "nll_grad_path_a_mean": True,
+                    "nll_grad_path_b_variance": True,
+                } if args.joint_nll_grad else {}),
+                **({
+                    "diagnostic": "gkl_continuation",
+                    "uncertainty_objective": "generalized_kl",
+                    "transition_epochs": 2,
+                    "transition_schedule": "cosine",
+                    "nll_grad_path_a_mean": False,
+                    "nll_grad_path_b_variance": True,
+                } if args.gkl_continuation_20ep else {}),
+                **({
+                    "diagnostic": "gkl_joint_grad_continuation",
+                    "uncertainty_objective": "generalized_kl",
+                    "transition_epochs": 2,
+                    "transition_schedule": "cosine",
+                    "nll_grad_path_a_mean": True,
+                    "nll_grad_path_b_variance": True,
+                } if args.gkl_joint_grad_continuation_20ep else {}),
+                **({
+                    "diagnostic": "student_t_unnormalized_control",
+                    "uncertainty_objective": "student_t_nll",
+                    "student_t_df": 3.0,
+                    "nll_grad_path_a_mean": True,
+                    "nll_grad_path_b_variance": True,
+                } if args.student_t_unnormalized_control_20ep else {}),
             },
             allow_val_change=True,
         )
@@ -3351,6 +4166,10 @@ def main():
         with open(history_path) as f:
             history = json.load(f)
         first_history_epoch = args.epochs + 1 if args.post_final_continuation else 1
+        if (args.temporal_extrapolation_only_continuation
+                or args.uncertainty_feature_grad_continuation
+                or args.joint_nll_grad_continuation):
+            first_history_epoch = 277
         history = history_through_checkpoint(
             history, start_epoch - 1, first_epoch=first_history_epoch,
         )
@@ -3428,6 +4247,27 @@ def main():
             curriculum_state=curriculum_state,
             curriculum_log_every=args.curriculum_log_every,
             phase_d_stream=active_phase_d_stream,
+            curriculum_config=args.curriculum_config,
+            temporal_extrapolation_continuation=(
+                args.temporal_extrapolation_continuation
+            ),
+            temporal_extrapolation_only_continuation=(
+                args.temporal_extrapolation_only_continuation
+            ),
+            uncertainty_feature_grad_continuation=(
+                args.uncertainty_feature_grad_continuation
+            ),
+            joint_nll_grad_continuation=(
+                args.joint_nll_grad_continuation
+            ),
+            joint_nll_grad=args.joint_nll_grad,
+            gkl_continuation_20ep=getattr(args, "gkl_continuation_20ep", False),
+            gkl_joint_grad_continuation_20ep=getattr(
+                args, "gkl_joint_grad_continuation_20ep", False,
+            ),
+            student_t_unnormalized_control_20ep=getattr(
+                args, "student_t_unnormalized_control_20ep", False,
+            ),
         )
 
         rollout_validation = bool(
@@ -3530,7 +4370,9 @@ def main():
             epoch_log("  Phase-D streaming diagnostics: " + json.dumps(row["phase_d"]))
         if args.uncertainty_aware:
             row["uncertainty_objective"] = args.uncertainty_loss
-            nll_active = args.uncertainty_loss in ("gaussian_nll", "student_t_nll")
+            nll_active = args.uncertainty_loss in (
+                "gaussian_nll", "student_t_nll", "generalized_kl", "gkl",
+            )
             key = args.uncertainty_loss if nll_active else "uncertainty_mse"
             row[f"train_{key}"] = train_metrics[key]
             row[f"val_{key}"] = val_metrics["mean"][key]

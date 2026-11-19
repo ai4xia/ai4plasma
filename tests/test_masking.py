@@ -27,6 +27,7 @@ from data.masking import (  # noqa: E402
     sample_mask,
     sample_patterns,
     sample_training_severity_counts,
+    temporal_extrapolation_frames,
 )
 
 
@@ -660,6 +661,29 @@ def test_training_temporal_block_from_visible_count_stays_oriented():
     )
     assert float(full.mean()) == 1.0
     assert full_info["num_visible_frames"] == 16
+
+
+def test_temporal_extrapolation_is_uniform_future_suffix_only():
+    generator = make_generator(1234)
+    counts = torch.zeros(23, dtype=torch.int64)
+    for _ in range(23000):
+        mask, info = temporal_extrapolation_frames(24, generator)
+        horizon = info["horizon"]
+        counts[horizon - 1] += 1
+        frames = mask[0, 0, :, 0, 0]
+        assert torch.all(frames[:24 - horizon] == 1)
+        assert torch.all(frames[24 - horizon:] == 0)
+        assert info["temporal_mode"] == "temporal_extrapolation"
+        assert info["temporal_direction"] == "future"
+    assert torch.all((counts > 850) & (counts < 1150)), counts
+
+    # The new helper does not alter the historical oriented temporal block.
+    old, old_info = _temporal_block_from_visible_count(
+        24, 7, generator=make_generator(99)
+    )
+    assert old_info["temporal_mode"] == "oriented_block"
+    assert old_info["num_visible_frames"] == 7
+    assert int(old.sum()) == 7
 
 
 def test_independent_masks_honor_training_temporal_visible_counts():
