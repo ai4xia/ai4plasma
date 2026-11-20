@@ -443,7 +443,7 @@ def parse_args(argv=None):
         "--joint-nll-grad",
         action="store_true",
         help=(
-            "Enable joint Path A and Path B Student-t uncertainty gradients "
+            "Enable joint Path A and Path B uncertainty gradients "
             "during curriculum training (Phase B and Phase C)."
         ),
     )
@@ -468,6 +468,17 @@ def parse_args(argv=None):
         ),
     )
     p.add_argument(
+        "--differentiable-phase-c-reuse",
+        action="store_true",
+        help="Ramp cross-forward prediction gradients with lambda_r for fresh GKL A+B "
+             "or with alpha for its continuation.",
+    )
+    p.add_argument(
+        "--mean-only-phase-c-reuse",
+        action="store_true",
+        help="Limit differentiable Phase-C reuse to mean predictions.",
+    )
+    p.add_argument(
         "--student-t-unnormalized-control-20ep",
         action="store_true",
         help=(
@@ -478,6 +489,15 @@ def parse_args(argv=None):
     )
 
     args = p.parse_args(argv)
+    if args.differentiable_phase_c_reuse and not (
+        args.gkl_joint_grad_continuation_20ep
+        or (args.joint_nll_grad and args.uncertainty_loss in ("generalized_kl", "gkl"))
+    ):
+        p.error("--differentiable-phase-c-reuse requires fresh or continuation GKL A+B")
+    if args.mean_only_phase_c_reuse and not (
+        args.differentiable_phase_c_reuse and args.gkl_joint_grad_continuation_20ep
+    ):
+        p.error("--mean-only-phase-c-reuse requires differentiable GKL A+B continuation")
 
     # Normalized weights are what training actually consumes, and what resume
     # compatibility is checked against. The raw token list is kept for the record.
@@ -566,11 +586,10 @@ def parse_args(argv=None):
                 "--joint-nll-grad requires --curriculum-training and "
                 "--curriculum-config three_phase_global_cosine"
             )
-        if (args.uncertainty_loss != "student_t_nll"
-                or args.student_t_df != 3.0):
+        if (args.uncertainty_loss not in ("student_t_nll", "generalized_kl", "gkl")
+                or (args.uncertainty_loss == "student_t_nll" and args.student_t_df != 3.0)):
             p.error(
-                "--joint-nll-grad requires --uncertainty-loss student_t_nll "
-                "--student-t-df 3"
+                "--joint-nll-grad requires generalized_kl or student_t_nll with df=3"
             )
         if args.post_final_continuation is not None:
             p.error(
@@ -1164,6 +1183,8 @@ def validate_resume_parameters(args, checkpoint_args: Dict[str, Any]) -> None:
         ("joint_nll_grad", False),
         ("gkl_continuation_20ep", False),
         ("gkl_joint_grad_continuation_20ep", False),
+        ("differentiable_phase_c_reuse", False),
+        ("mean_only_phase_c_reuse", False),
         ("student_t_unnormalized_control_20ep", False),
     ):
         if key == "amp_dtype" and not getattr(args, "amp", False):
@@ -1407,6 +1428,8 @@ def validate_post_final_continuation(
         compatible_args.gkl_joint_grad_continuation_20ep = source_args.get(
             "gkl_joint_grad_continuation_20ep", False,
         )
+        compatible_args.differentiable_phase_c_reuse = False
+        compatible_args.mean_only_phase_c_reuse = False
         compatible_args.uncertainty_loss = source_args["uncertainty_loss"]
         compatible_args.student_t_df = source_args.get("student_t_df", 3.0)
         compatible_args.joint_nll_grad = source_args.get("joint_nll_grad", False)
@@ -1940,29 +1963,41 @@ def phase_b_convergence(history, args, curriculum_state):
     mse_rows = positive_metric_convergence(history, half_life=half_life, window=window,
                                           threshold=threshold, patience=patience, segment_start_epoch=cutoff)
     objective = getattr(args, "uncertainty_loss", "gaussian_nll")
-    nll_metric = f"val_{objective if objective in ('gaussian_nll', 'student_t_nll') else 'gaussian_nll'}"
-    nll_rows = nll_metric_convergence(
-        history, half_life=half_life, window=window,
-        segment_start_epoch=cutoff, metric=nll_metric,
-    )
+    is_gkl = objective in ("generalized_kl", "gkl")
+    metric_name = "gkl" if is_gkl else "nll"
+    if is_gkl:
+        # GKL is nonnegative. Monitor relative changes in its positive loss,
+        # as for MSE, instead of exponentiating a signed likelihood slope.
+        uncertainty_rows = positive_metric_convergence(
+            history, metric=f"val_{objective}", half_life=half_life, window=window,
+            threshold=threshold, patience=patience, segment_start_epoch=cutoff,
+        )
+    else:
+        nll_metric = f"val_{objective if objective in ('gaussian_nll', 'student_t_nll') else 'gaussian_nll'}"
+        uncertainty_rows = nll_metric_convergence(
+            history, half_life=half_life, window=window,
+            segment_start_epoch=cutoff, metric=nll_metric,
+        )
     stable_count, previous_epoch = 0, None
-    for mse, nll in zip(mse_rows, nll_rows):
+    for mse, uncertainty in zip(mse_rows, uncertainty_rows):
         if previous_epoch is not None and mse["epoch"] != previous_epoch + 1:
             stable_count = 0
         previous_epoch = mse["epoch"]
-        burn_in_complete = mse["burn_in_complete"] and nll["burn_in_complete"]
-        rates = (mse["smoothed_rate_per_epoch"], nll["smoothed_rate_per_epoch"])
+        burn_in_complete = mse["burn_in_complete"] and uncertainty["burn_in_complete"]
+        rates = (mse["smoothed_rate_per_epoch"], uncertainty["smoothed_rate_per_epoch"])
         stable = burn_in_complete and all(rate is not None and math.isfinite(rate) and abs(rate) < threshold for rate in rates)
         stable_count = stable_count + 1 if stable else 0
-    ages = (mse["segment_age"], nll["segment_age"])
+    ages = (mse["segment_age"], uncertainty["segment_age"])
     phase_b = candidate and segment_start is not None
     return dict(epoch=history[-1]["epoch"], phase_b=phase_b, variance_ramp_complete=completed,
-                segment_start_epoch=segment_start, ema_val_mse=mse["ema_value"], ema_val_nll=nll["ema_value"],
-                mse_rate_per_epoch=rates[0], nll_rate_per_epoch=rates[1], stable_count=stable_count,
+                segment_start_epoch=segment_start, ema_val_mse=mse["ema_value"],
+                mse_rate_per_epoch=rates[0], stable_count=stable_count,
                 segment_age=min(ages) if all(age is not None for age in ages) else None,
                 minimum_segment_age=2.0 * half_life, burn_in_complete=burn_in_complete,
                 threshold=threshold, patience_target=patience,
-                ready_for_rollout_ramp=phase_b and burn_in_complete and stable_count >= patience)
+                ready_for_rollout_ramp=phase_b and burn_in_complete and stable_count >= patience,
+                **{f"ema_val_{metric_name}": uncertainty["ema_value"],
+                   f"{metric_name}_rate_per_epoch": rates[1]})
 
 
 def phase_c_convergence(history, args, curriculum_state):
@@ -2466,12 +2501,26 @@ def make_phase_c_reuse_input(
     prediction: torch.Tensor,
     output_variance: torch.Tensor,
     observation_mask: torch.Tensor,
+    *,
+    reuse_gradient_scale: float = 0.0,
+    mean_only_phase_c_reuse: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Reuse detached same-window state; a fresh mask supplies exact observations."""
+    """Reuse same-window predictions with optional cross-forward gradients."""
+    def scale_gradient(value):
+        if reuse_gradient_scale == 1.0:
+            return value
+        detached = value.detach()
+        if reuse_gradient_scale == 0.0:
+            return detached
+        return detached + reuse_gradient_scale * (value - detached)
+
     exact = observation_mask > 0.5
-    values = torch.where(exact, target, prediction.detach())
+    values = torch.where(exact, target, scale_gradient(prediction))
+    reused_variance = (
+        output_variance.detach() if mean_only_phase_c_reuse else scale_gradient(output_variance)
+    )
     input_variance = torch.where(
-        exact, torch.zeros_like(target), output_variance.detach(),
+        exact, torch.zeros_like(target), reused_variance,
     )
     return torch.cat([values, input_variance], dim=1), observation_mask
 
@@ -2483,8 +2532,10 @@ def curriculum_forward_loss(
     detach_variance_features=True,
     detach_mean=True,
     gkl_alpha=None,
+    reuse_gradient_scale=0.0,
+    mean_only_phase_c_reuse=False,
 ):
-    """Phase A/B pass or detached Phase-C reuse for the selected curriculum."""
+    """Phase A/B pass or Phase-C reuse for the selected curriculum."""
     three_phase = curriculum_config == "three_phase_global_cosine"
     if three_phase:
         normalizer = 1.0 + float(lambda_r)
@@ -2551,6 +2602,8 @@ def curriculum_forward_loss(
         for pass_index, reuse_mask in enumerate(reuse_masks, 1):
             reuse_input, exact_mask = make_phase_c_reuse_input(
                 target, previous_mean, previous_variance, reuse_mask,
+                reuse_gradient_scale=reuse_gradient_scale,
+                mean_only_phase_c_reuse=mean_only_phase_c_reuse,
             )
             next_mean, next_variance = model(
                 reuse_input, detach_variance_features=detach_variance_features,
@@ -2652,6 +2705,8 @@ def train_one_epoch(
     joint_nll_grad: bool = False,
     gkl_continuation_20ep: bool = False,
     gkl_joint_grad_continuation_20ep: bool = False,
+    differentiable_phase_c_reuse: bool = False,
+    mean_only_phase_c_reuse: bool = False,
     student_t_unnormalized_control_20ep: bool = False,
 ) -> Dict[str, Any]:
     model.train()
@@ -2829,12 +2884,17 @@ def train_one_epoch(
                     current_step = curriculum_state["successful_optimizer_steps"]
                     step_progress = min(max((current_step - gkl_start_step) / gkl_duration_steps, 0.0), 1.0)
                     gkl_alpha = 0.5 * (1.0 - math.cos(math.pi * step_progress))
+                reuse_gradient_scale = 0.0
+                if differentiable_phase_c_reuse:
+                    reuse_gradient_scale = lambda_r if gkl_alpha is None else gkl_alpha
                 loss, pred, output_variance, components = curriculum_forward_loss(
                     model, model_input, y, mask, lambda_v, lambda_r, reuse_masks,
                     uncertainty_loss, student_t_df, curriculum_config,
                     detach_variance_features=not enable_variance_feature_grad,
                     detach_mean=not enable_mean_nll_grad,
                     gkl_alpha=gkl_alpha,
+                    reuse_gradient_scale=reuse_gradient_scale,
+                    mean_only_phase_c_reuse=mean_only_phase_c_reuse,
                 )
                 reconstruction_loss = components["L_mu_0"]
                 variance_loss = components["L_var_0"]
@@ -3539,8 +3599,9 @@ def build_epoch_wandb_log(
         diagnostic = row["phase_b_convergence"]
         if diagnostic["mse_rate_per_epoch"] is not None:
             log_data["curriculum/mse_rate_per_epoch"] = diagnostic["mse_rate_per_epoch"]
-        if diagnostic["nll_rate_per_epoch"] is not None:
-            log_data["curriculum/nll_rate_per_epoch"] = diagnostic["nll_rate_per_epoch"]
+        for key in ("nll_rate_per_epoch", "gkl_rate_per_epoch"):
+            if diagnostic.get(key) is not None:
+                log_data[f"curriculum/{key}"] = diagnostic[key]
         log_data.update({
             "curriculum/convergence_stable_count": diagnostic["stable_count"],
             "curriculum/convergence_segment_age": diagnostic["segment_age"],
@@ -3739,10 +3800,12 @@ def main():
             rank_print("Student-t df:", args.student_t_df)
         if args.joint_nll_grad:
             rank_print(
-                "Joint NLL gradient curriculum: Student-t NLL gradients enabled "
+                f"Joint gradient curriculum: {args.uncertainty_loss} gradients enabled "
                 "in both the mean head (Path A) and variance head/shared features (Path B) "
                 "during Phase B and Phase C."
             )
+            if args.differentiable_phase_c_reuse:
+                rank_print("Phase C: cross-forward mean and variance gradients scaled by lambda_r.")
         if args.gkl_continuation_20ep:
             rank_print(
                 "GKL continuation: diagnostic=generalized_kl_continuation; "
@@ -3752,12 +3815,17 @@ def main():
                 "Phase D is disabled."
             )
         if args.gkl_joint_grad_continuation_20ep:
+            reuse_description = "detached reuse"
+            if args.mean_only_phase_c_reuse:
+                reuse_description = "cross-forward mean gradients scaled by alpha, detached variance reuse"
+            elif args.differentiable_phase_c_reuse:
+                reuse_description = "cross-forward mean and variance gradients scaled by alpha"
             rank_print(
                 "GKL joint-gradient continuation: diagnostic=generalized_kl_joint_grad_continuation; "
                 f"source checkpoint={args.post_final_continuation}; source epoch=256; "
                 "target epoch=276; 2-epoch cosine transition from Student-t A+B to GKL; "
                 "Path A ON; Path B ON; "
-                f"LR={args.min_lr:g}; settled three-phase K=1 reuse remains unchanged; "
+                f"LR={args.min_lr:g}; settled three-phase K=1 with {reuse_description}; "
                 "Phase D is disabled."
             )
         if args.student_t_unnormalized_control_20ep:
@@ -4265,6 +4333,8 @@ def main():
             gkl_joint_grad_continuation_20ep=getattr(
                 args, "gkl_joint_grad_continuation_20ep", False,
             ),
+            differentiable_phase_c_reuse=args.differentiable_phase_c_reuse,
+            mean_only_phase_c_reuse=args.mean_only_phase_c_reuse,
             student_t_unnormalized_control_20ep=getattr(
                 args, "student_t_unnormalized_control_20ep", False,
             ),
@@ -4415,7 +4485,9 @@ def main():
                         row["phase_b_convergence"] = diagnostic
                         transition_diagnostic = diagnostic
                         fields = []
-                        for name in ("ema_val_mse", "mse_rate_per_epoch", "ema_val_nll", "nll_rate_per_epoch"):
+                        uncertainty_name = "gkl" if "ema_val_gkl" in diagnostic else "nll"
+                        for name in ("ema_val_mse", "mse_rate_per_epoch",
+                                     f"ema_val_{uncertainty_name}", f"{uncertainty_name}_rate_per_epoch"):
                             value = diagnostic[name]
                             text = (f"{100 * value:+.3f}%" if "rate" in name else f"{value:.8g}") if value is not None else "n/a"
                             fields.append(f"{name}={text}")

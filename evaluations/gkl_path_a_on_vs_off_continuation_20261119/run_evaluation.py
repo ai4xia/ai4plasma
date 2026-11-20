@@ -5,7 +5,6 @@ GKL Path A OFF (B-only) 20-epoch continuations from epoch 256 to 276.
 Extends the previous GKL vs Student-t evaluation with:
  - New GKL A+B checkpoint inference
  - Reused archived results from GKL B-only, Student-t, and baselines
- - Targeted Path-A reconstruction analysis (error-decile decomposition)
  - Extended comparison tables across all 4 checkpoints
 """
 
@@ -127,6 +126,8 @@ def load_model(ckpt_path: Path, device: torch.device):
 def infer(model, model_input):
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         pred, var = model(model_input, detach_variance_features=True)
+    if not (torch.isfinite(pred).all() & torch.isfinite(var).all() & (var > 0).all()):
+        raise ValueError("Invalid pass-0 model output")
     return pred.float(), var.float()
 
 
@@ -223,7 +224,9 @@ def main():
     print("=" * 80, flush=True)
 
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for this evaluation")
+    device = torch.device("cuda")
     print(f"Device: {device} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})", flush=True)
 
     # =========================================================================
@@ -255,6 +258,8 @@ def main():
     assert gkl_ab_latest["epoch"] == 276
     assert gkl_b_latest["epoch"] == 276
 
+    # Verify identical checkpoint normalization and split.
+    assert gkl_ab_ckpt["stats"] == gkl_b_ckpt["stats"]
     # Split SHA256 check
     assert gkl_ab_ckpt["split_sha256"] == src_ckpt["split_sha256"]
     assert gkl_b_ckpt["split_sha256"] == src_ckpt["split_sha256"]
@@ -476,15 +481,6 @@ def main():
     model_window_spatial_spearman = defaultdict(dict)
     model_calibration_samples = defaultdict(list)
 
-    # ------- NEW: voxel-level error collection for Path-A decile analysis -------
-    # For each of GKL_AB and GKL_B, at h=18, collect per-window squared errors
-    # and predicted variances at all hidden voxels (subsampled for memory).
-    # We store these as lists of (e2, u) arrays.
-    gkl_ab_voxel_e2_u_h18 = defaultdict(list)  # ch -> [(e2, u), ...]
-    # We'll also need the reference GKL B-only data, run separately below.
-    gkl_b_voxel_e2_u_h18 = defaultdict(list)
-    VOXEL_SUBSAMPLE = 8192  # per window
-
     print(f"\n>>> Running Pass-0 Evaluation for {model_name} on GPU <<<", flush=True)
     ckpt_meta, model, mean_norm, std_norm = load_model(GKL_AB_CKPT, device)
 
@@ -650,21 +646,6 @@ def main():
                         if ch in ("Magnetic", "Density") and h == 18:
                             model_calibration_samples[(model_name, ch)].append((e_flat[take], u_flat[take]))
 
-            # ------- NEW: Collect voxel-level data for Path-A decile analysis -------
-            if h == 18:
-                for ch in ("Magnetic", "Density", "All"):
-                    ci = list(GROUPS[ch])
-                    for b, idx in enumerate(chosen):
-                        e2 = np.square(res_np[b, ci, prefix:], dtype=np.float64).ravel()
-                        u = var_np[b, ci, prefix:].astype(np.float64).ravel()
-                        keep = np.isfinite(e2) & np.isfinite(u) & (u > 0)
-                        e2, u = e2[keep], u[keep]
-                        if e2.size > VOXEL_SUBSAMPLE:
-                            rng_v = np.random.default_rng(SEED + 400000 + idx)
-                            take = rng_v.choice(e2.size, VOXEL_SUBSAMPLE, replace=False)
-                            e2, u = e2[take], u[take]
-                        gkl_ab_voxel_e2_u_h18[ch].append((e2.astype(np.float32), u.astype(np.float32)))
-
         if batch_number == 0 or (batch_number + 1) % 15 == 0 or batch_number + 1 == len(test_indices) // 2 + 1:
             print(
                 f"[{model_name}] Forecast: {min((batch_number + 1) * 2, len(test_indices))}/{len(test_indices)} windows complete",
@@ -785,48 +766,6 @@ def main():
     torch.cuda.empty_cache()
 
     # =========================================================================
-    # 3c. NEW: Run GKL B-only inference ONLY for h=18 voxel decile collection
-    # =========================================================================
-    print(f"\n>>> Running GKL B-only h=18 voxel collection (for Path-A decile analysis) <<<", flush=True)
-    _, model_b, mean_norm_b, std_norm_b = load_model(GKL_B_CKPT, device)
-    for batch_number, (chosen, block, _meta) in enumerate(batches(dataset, test_indices)):
-        target = ((block.to(device) - mean_norm_b) / (std_norm_b + 1e-8)).float()
-        noise_gen = torch.Generator(device=device).manual_seed(SEED + 200000 + batch_number)
-        noise = torch.randn(target.shape, generator=noise_gen, device=device, dtype=target.dtype)
-
-        h = 18
-        prefix = 24 - h
-        mask = torch.ones_like(target)
-        mask[:, :, prefix:] = 0.0
-        input_var = 1.0 - mask
-        model_input = torch.cat([make_uncertain_input(target, input_var, noise), input_var], dim=1)
-
-        pred, var = infer(model_b, model_input)
-        res = pred - target
-        res_np = res.cpu().numpy()
-        var_np = var.cpu().numpy()
-
-        for ch in ("Magnetic", "Density", "All"):
-            ci = list(GROUPS[ch])
-            for b, idx in enumerate(chosen):
-                e2 = np.square(res_np[b, ci, prefix:], dtype=np.float64).ravel()
-                u = var_np[b, ci, prefix:].astype(np.float64).ravel()
-                keep = np.isfinite(e2) & np.isfinite(u) & (u > 0)
-                e2, u = e2[keep], u[keep]
-                if e2.size > VOXEL_SUBSAMPLE:
-                    rng_v = np.random.default_rng(SEED + 400000 + idx)
-                    take = rng_v.choice(e2.size, VOXEL_SUBSAMPLE, replace=False)
-                    e2, u = e2[take], u[take]
-                gkl_b_voxel_e2_u_h18[ch].append((e2.astype(np.float32), u.astype(np.float32)))
-
-        if batch_number == 0 or (batch_number + 1) % 30 == 0:
-            print(f"[gkl_bonly] voxel collection: {min((batch_number + 1) * 2, len(test_indices))}/{len(test_indices)}", flush=True)
-
-    del model_b
-    torch.cuda.empty_cache()
-    print("GKL B-only h=18 voxel collection complete.", flush=True)
-
-    # =========================================================================
     # 4. Integrate Archived Results from Previous Evaluations
     # =========================================================================
     print("\n--- Section 4: Integrating Archived Results ---", flush=True)
@@ -842,7 +781,8 @@ def main():
         for r in csv.DictReader(f):
             if r["model"] in rename_map:
                 r["model"] = rename_map[r["model"]]
-                all_standard_rows.append(r)
+                if r["pass"] == "pass0":
+                    all_standard_rows.append(r)
 
     with (PREV_EVAL_DIR / "forecast_horizon_metrics.csv").open() as f:
         for r in csv.DictReader(f):
@@ -872,7 +812,8 @@ def main():
     with (BASE_EVAL_DIR / "standard_mask_metrics.csv").open() as f:
         for r in csv.DictReader(f):
             if r["model"] in ("new_joint_256ep", "original_256ep"):
-                all_standard_rows.append(r)
+                if r["pass"] == "pass0":
+                    all_standard_rows.append(r)
 
     with (BASE_EVAL_DIR / "forecast_horizon_metrics.csv").open() as f:
         for r in csv.DictReader(f):
@@ -980,7 +921,7 @@ def main():
             elif r["model"] in ("new_joint_256ep", "original_256ep"):
                 cal_rows.append(r)
 
-    # Add GKL A+B calibration using identical pooled-boundary approach
+    # A+B uses model-specific deciles; archived shared-bin ACE is a separate metric.
     for ch in ("Magnetic", "Density"):
         gkl_ab_samples = model_calibration_samples[("gkl_ab_epoch276", ch)]
         if not gkl_ab_samples:
@@ -989,8 +930,6 @@ def main():
         gkl_ab_e = np.concatenate([x[0] for x in gkl_ab_samples])
         gkl_ab_u = np.concatenate([x[1] for x in gkl_ab_samples])
 
-        # Use same bin edges as previous eval: based on pooled GKL B-only + Control boundaries
-        # For self-consistent comparison, also compute with self-defined deciles
         bin_edges = np.percentile(gkl_ab_u, np.linspace(0, 100, 11))
         bin_edges[0] = 0.0
         bin_edges[-1] = np.inf
@@ -1134,95 +1073,32 @@ def main():
                 row["ab_vs_bonly_diff"] = float(ab_sp["mean_frame_spatial_spearman"]) - float(b_sp["mean_frame_spatial_spearman"])
             summary_rows.append(row)
 
+    # Match the cached whole-suffix per-window collapse definition.
+    with (PREV_EVAL_DIR / "paired_comparison_summary.csv").open() as f:
+        cached_collapse = {
+            r["channel"]: float(r["treatment_mean (GKL)"])
+            for r in csv.DictReader(f) if r["domain"] == "extreme_horizon_collapse"
+        }
+    for ch in ("Magnetic", "Density", "All"):
+        ab_fraction = sum(
+            model_window_forecast_mse[(model_name, 23, ch)][i]
+            > model_window_forecast_mse[(model_name, 22, ch)][i]
+            and model_window_forecast_u[(model_name, 23, ch)][i]
+            < model_window_forecast_u[(model_name, 22, ch)][i]
+            for i in test_indices
+        ) / len(test_indices)
+        summary_rows.append({
+            "domain": "extreme_horizon_collapse",
+            "horizon": "22 to 23",
+            "channel": ch,
+            "metric": "collapse_window_fraction",
+            model_labels[model_name]: ab_fraction,
+            model_labels["gkl_bonly_epoch276"]: cached_collapse[ch],
+            "ab_vs_bonly_diff": ab_fraction - cached_collapse[ch],
+        })
+
     write_csv(OUTPUT / "paired_comparison_summary.csv", summary_rows)
     print("Wrote paired_comparison_summary.csv", flush=True)
-
-    # =========================================================================
-    # 8. NEW: Path-A Error-Decile Redistribution Analysis
-    # =========================================================================
-    print("\n--- Section 8: Path-A Error-Decile Redistribution Analysis ---", flush=True)
-    decile_rows = []
-
-    for ch in ("Magnetic", "Density", "All"):
-        ab_e2 = np.concatenate([x[0] for x in gkl_ab_voxel_e2_u_h18[ch]])
-        ab_u = np.concatenate([x[1] for x in gkl_ab_voxel_e2_u_h18[ch]])
-        b_e2 = np.concatenate([x[0] for x in gkl_b_voxel_e2_u_h18[ch]])
-        b_u = np.concatenate([x[1] for x in gkl_b_voxel_e2_u_h18[ch]])
-
-        # Use GKL B-only error deciles as the reference partition
-        # (based on B-only squared errors, which define the error landscape)
-        b_edges = np.percentile(b_e2, np.linspace(0, 100, 11))
-        b_edges[0] = 0.0
-        b_edges[-1] = np.inf
-
-        # Also create AB error deciles for self-reference
-        ab_edges = np.percentile(ab_e2, np.linspace(0, 100, 11))
-        ab_edges[0] = 0.0
-        ab_edges[-1] = np.inf
-
-        for label, edges, e2_data, u_data, model_tag in [
-            ("bonly_error_decile", b_edges, b_e2, b_u, "gkl_bonly"),
-            ("bonly_error_decile", b_edges, ab_e2, ab_u, "gkl_ab"),
-            ("ab_error_decile", ab_edges, ab_e2, ab_u, "gkl_ab"),
-            ("ab_error_decile", ab_edges, b_e2, b_u, "gkl_bonly"),
-        ]:
-            b_indices = np.digitize(e2_data, edges) - 1
-            b_indices = np.clip(b_indices, 0, 9)
-
-            for d in range(10):
-                mask_d = (b_indices == d)
-                n_d = int(np.sum(mask_d))
-                if n_d > 0:
-                    mean_e2_d = float(np.mean(e2_data[mask_d]))
-                    mean_u_d = float(np.mean(u_data[mask_d]))
-                    cal_d = mean_u_d / mean_e2_d if mean_e2_d > 0 else float("nan")
-                    median_e2_d = float(np.median(e2_data[mask_d]))
-                    median_u_d = float(np.median(u_data[mask_d]))
-                else:
-                    mean_e2_d = mean_u_d = cal_d = median_e2_d = median_u_d = 0.0
-
-                decile_rows.append({
-                    "channel": ch,
-                    "decile_reference": label,
-                    "model": model_tag,
-                    "decile": d + 1,
-                    "voxel_count": n_d,
-                    "mean_squared_error": mean_e2_d,
-                    "mean_predicted_u": mean_u_d,
-                    "calibration_ratio": cal_d,
-                    "median_squared_error": median_e2_d,
-                    "median_predicted_u": median_u_d,
-                })
-
-        # Cross-model decile comparison on the B-only reference partition
-        b_bins_b = np.clip(np.digitize(b_e2, b_edges) - 1, 0, 9)
-        b_bins_ab = np.clip(np.digitize(ab_e2, b_edges) - 1, 0, 9)
-
-        for d in range(10):
-            m_b = b_bins_b == d
-            m_ab = b_bins_ab == d
-            n_b = int(np.sum(m_b))
-            n_ab = int(np.sum(m_ab))
-            if n_b > 0 and n_ab > 0:
-                b_mse_d = float(np.mean(b_e2[m_b]))
-                ab_mse_d = float(np.mean(ab_e2[m_ab]))
-                b_u_d = float(np.mean(b_u[m_b]))
-                ab_u_d = float(np.mean(ab_u[m_ab]))
-                decile_rows.append({
-                    "channel": ch,
-                    "decile_reference": "bonly_error_decile_comparison",
-                    "model": "comparison",
-                    "decile": d + 1,
-                    "voxel_count": f"{n_b} vs {n_ab}",
-                    "mean_squared_error": f"{b_mse_d:.6f} vs {ab_mse_d:.6f}",
-                    "mean_predicted_u": f"{b_u_d:.6f} vs {ab_u_d:.6f}",
-                    "calibration_ratio": f"{b_u_d/b_mse_d:.4f} vs {ab_u_d/ab_mse_d:.4f}" if b_mse_d > 0 and ab_mse_d > 0 else "N/A",
-                    "mse_change_pct": f"{(ab_mse_d - b_mse_d) / b_mse_d * 100:.2f}%" if b_mse_d > 0 else "N/A",
-                    "u_change_pct": f"{(ab_u_d - b_u_d) / b_u_d * 100:.2f}%" if b_u_d > 0 else "N/A",
-                })
-
-    write_csv(OUTPUT / "error_decile_redistribution.csv", decile_rows)
-    print("Wrote error_decile_redistribution.csv", flush=True)
 
     # =========================================================================
     # 9. Generate Publication Figures
@@ -1410,63 +1286,6 @@ def main():
     plt.savefig(OUTPUT / "spatial_uncertainty_correlation.png", dpi=200)
     plt.close()
     print("Saved spatial_uncertainty_correlation.png", flush=True)
-
-    # ----- Figure 5: Error-Decile Redistribution (NEW Path-A Analysis) -----
-    fig, axes = plt.subplots(2, 3, figsize=(16, 9), constrained_layout=True)
-
-    for col, ch in enumerate(["Magnetic", "Density", "All"]):
-        # Row 0: MSE per decile (B-only reference partition)
-        ax = axes[0, col]
-        deciles = np.arange(1, 11)
-        b_mses_dec = []
-        ab_mses_dec = []
-        b_us_dec = []
-        ab_us_dec = []
-        for d in deciles:
-            b_row = next(
-                (r for r in decile_rows
-                 if r["channel"] == ch and r["decile_reference"] == "bonly_error_decile"
-                 and r["model"] == "gkl_bonly" and r["decile"] == d),
-                None
-            )
-            ab_row = next(
-                (r for r in decile_rows
-                 if r["channel"] == ch and r["decile_reference"] == "bonly_error_decile"
-                 and r["model"] == "gkl_ab" and r["decile"] == d),
-                None
-            )
-            b_mses_dec.append(float(b_row["mean_squared_error"]) if b_row else 0)
-            ab_mses_dec.append(float(ab_row["mean_squared_error"]) if ab_row else 0)
-            b_us_dec.append(float(b_row["mean_predicted_u"]) if b_row else 0)
-            ab_us_dec.append(float(ab_row["mean_predicted_u"]) if ab_row else 0)
-
-        bar_w = 0.35
-        ax.bar(deciles - bar_w / 2, b_mses_dec, width=bar_w, label="GKL B-only MSE", color="green", alpha=0.7)
-        ax.bar(deciles + bar_w / 2, ab_mses_dec, width=bar_w, label="GKL A+B MSE", color="crimson", alpha=0.7)
-        ax.set_xlabel("Error Decile (B-only reference)")
-        ax.set_ylabel("Mean Squared Error")
-        ax.set_title(f"{ch}: MSE by Error Decile")
-        ax.set_yscale("log")
-        ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=7)
-
-        # Row 1: Calibration ratio per decile
-        ax = axes[1, col]
-        b_cal = [b_us_dec[i] / b_mses_dec[i] if b_mses_dec[i] > 0 else 0 for i in range(10)]
-        ab_cal = [ab_us_dec[i] / ab_mses_dec[i] if ab_mses_dec[i] > 0 else 0 for i in range(10)]
-        ax.axhline(1.0, color="black", ls=":", lw=1.5, label="Ideal (1.0)")
-        ax.bar(deciles - bar_w / 2, b_cal, width=bar_w, label="GKL B-only", color="green", alpha=0.7)
-        ax.bar(deciles + bar_w / 2, ab_cal, width=bar_w, label="GKL A+B", color="crimson", alpha=0.7)
-        ax.set_xlabel("Error Decile (B-only reference)")
-        ax.set_ylabel("Calibration (u / MSE)")
-        ax.set_title(f"{ch}: Calibration by Error Decile")
-        ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=7)
-
-    fig.suptitle("Path-A Ablation: Error-Decile Redistribution at h=18 (GKL B-only Reference Partition)", fontsize=13)
-    plt.savefig(OUTPUT / "error_decile_redistribution.png", dpi=200)
-    plt.close()
-    print("Saved error_decile_redistribution.png", flush=True)
 
     # ----- Figure 6: Extreme Horizon Dynamics -----
     fig, axes = plt.subplots(2, 2, figsize=(14, 9), constrained_layout=True)

@@ -33,6 +33,9 @@ UNCERTAINTY_FEATURE_GRAD_CONTINUATION=false
 JOINT_NLL_GRAD_CONTINUATION=false
 GKL_CONTINUATION=false
 GKL_JOINT_GRAD_CONTINUATION=false
+DIFFERENTIABLE_PHASE_C_REUSE=false
+MEAN_ONLY_PHASE_C_REUSE=false
+FRESH_GKL_JOINT_GRAD=false
 STUDENT_T_UNNORMALIZED_CONTROL=false
 PHASE_D_PROBE=false
 PHASE_C_K2_PROBE=false
@@ -141,6 +144,15 @@ case "${1:-}" in
         POST_FINAL_CONTINUATION=true; GKL_JOINT_GRAD_CONTINUATION=true
         CURRICULUM_STOP=276; FINAL_EPOCH=276
         MODEL_ARGS=(--model-version direct_unet3d_no_activation_norm_v3); shift ;;
+    --gkl-joint-grad-differentiable-reuse-continuation-20ep|--resume-gkl-joint-grad-differentiable-reuse-continuation-20ep|\
+    --gkl-joint-grad-mean-only-reuse-continuation-20ep|--resume-gkl-joint-grad-mean-only-reuse-continuation-20ep)
+        CURRICULUM=true; GLOBAL_COSINE=true; THREE_PHASE_GLOBAL_COSINE=true
+        POST_FINAL_CONTINUATION=true; GKL_JOINT_GRAD_CONTINUATION=true
+        DIFFERENTIABLE_PHASE_C_REUSE=true
+        if [[ "$1" == --gkl-* ]]; then RESUMING=false; fi
+        if [[ "$1" == *-mean-only-reuse-* ]]; then MEAN_ONLY_PHASE_C_REUSE=true; fi
+        CURRICULUM_STOP=276; FINAL_EPOCH=276
+        MODEL_ARGS=(--model-version direct_unet3d_no_activation_norm_v3); shift ;;
     --student-t-unnormalized-control-20ep)
         CURRICULUM=true; GLOBAL_COSINE=true; THREE_PHASE_GLOBAL_COSINE=true
         POST_FINAL_CONTINUATION=true; STUDENT_T_UNNORMALIZED_CONTROL=true; RESUMING=false
@@ -193,6 +205,13 @@ case "${1:-}" in
         FROMSCRATCH_48H=true
         CURRICULUM_STOP=256; FINAL_EPOCH=256
         MODEL_ARGS=(--model-version direct_unet3d_no_activation_norm_v3); shift ;;
+    --gkl-joint-grad-globalcosine-256ep|--resume-gkl-joint-grad-globalcosine-256ep)
+        CURRICULUM=true; GLOBAL_COSINE=true; THREE_PHASE_GLOBAL_COSINE=true
+        THREE_PHASE_JOINT_NLL_GRAD=true; FRESH_GKL_JOINT_GRAD=true
+        FROMSCRATCH_48H=true
+        if [[ "$1" == --gkl-joint-grad-globalcosine-256ep ]]; then RESUMING=false; fi
+        CURRICULUM_STOP=256; FINAL_EPOCH=256
+        MODEL_ARGS=(--model-version direct_unet3d_no_activation_norm_v3); shift ;;
     "") ;;
     *) echo "Unknown training mode: $1" >&2; exit 2 ;;
 esac
@@ -206,7 +225,7 @@ while (( $# )); do
     elif [[ "$1" == --model-version ]] && (( $# >= 2 )); then
         MODEL_ARGS=(--model-version "$2"); shift 2
     else
-        echo "Usage: bash $0 [--stage1-gaussian-nll|--resume-stage1-gaussian-nll|--curriculum|--resume-curriculum|--abcd-symmetric-lr|--resume-abcd-symmetric-lr|--global-cosine-lr|--resume-global-cosine-lr|--post-final-continuation|--resume-post-final-continuation|--gaussian-u-continuation-20ep|--resume-gaussian-u-continuation-20ep|--temporal-extrapolation-continuation-20ep|--resume-temporal-extrapolation-continuation-20ep|--temporal-extrapolation-only-continuation-10ep|--resume-temporal-extrapolation-only-continuation-10ep|--uncertainty-feature-grad-continuation-10ep|--resume-uncertainty-feature-grad-continuation-10ep|--joint-nll-grad-continuation-10ep|--resume-joint-nll-grad-continuation-10ep|--gkl-continuation-20ep|--resume-gkl-continuation-20ep|--gkl-joint-grad-continuation-20ep|--resume-gkl-joint-grad-continuation-20ep|--student-t-unnormalized-control-20ep|--resume-student-t-unnormalized-control-20ep|--phase-d-stateful-probe|--resume-phase-d-stateful-probe|--phase-c-k2-probe|--fromscratch-global-cosine-48h|--resume-fromscratch-global-cosine-48h|--three-phase-global-cosine-48h|--resume-three-phase-global-cosine-48h|--three-phase-joint-nll-grad-globalcosine-256ep|--resume-three-phase-joint-nll-grad-globalcosine-256ep] [--arm-variance-ramp|--arm-rollout-ramp] [--stop-after-epochs N] [--final-epoch N] [--model-version VERSION]" >&2
+        echo "Usage: bash $0 [--stage1-gaussian-nll|--resume-stage1-gaussian-nll|--curriculum|--resume-curriculum|--abcd-symmetric-lr|--resume-abcd-symmetric-lr|--global-cosine-lr|--resume-global-cosine-lr|--post-final-continuation|--resume-post-final-continuation|--gaussian-u-continuation-20ep|--resume-gaussian-u-continuation-20ep|--temporal-extrapolation-continuation-20ep|--resume-temporal-extrapolation-continuation-20ep|--temporal-extrapolation-only-continuation-10ep|--resume-temporal-extrapolation-only-continuation-10ep|--uncertainty-feature-grad-continuation-10ep|--resume-uncertainty-feature-grad-continuation-10ep|--joint-nll-grad-continuation-10ep|--resume-joint-nll-grad-continuation-10ep|--gkl-continuation-20ep|--resume-gkl-continuation-20ep|--gkl-joint-grad-continuation-20ep|--resume-gkl-joint-grad-continuation-20ep|--gkl-joint-grad-differentiable-reuse-continuation-20ep|--resume-gkl-joint-grad-differentiable-reuse-continuation-20ep|--gkl-joint-grad-mean-only-reuse-continuation-20ep|--resume-gkl-joint-grad-mean-only-reuse-continuation-20ep|--student-t-unnormalized-control-20ep|--resume-student-t-unnormalized-control-20ep|--phase-d-stateful-probe|--resume-phase-d-stateful-probe|--phase-c-k2-probe|--fromscratch-global-cosine-48h|--resume-fromscratch-global-cosine-48h|--three-phase-global-cosine-48h|--resume-three-phase-global-cosine-48h|--three-phase-joint-nll-grad-globalcosine-256ep|--resume-three-phase-joint-nll-grad-globalcosine-256ep|--gkl-joint-grad-globalcosine-256ep|--resume-gkl-joint-grad-globalcosine-256ep] [--arm-variance-ramp|--arm-rollout-ramp] [--stop-after-epochs N] [--final-epoch N] [--model-version VERSION]" >&2
         exit 2
     fi
 done
@@ -335,7 +354,11 @@ export NCCL_ASYNC_ERROR_HANDLING=1
 
 H5_DIR=/pscratch/sd/b/binxia/VPIC_PPPL_HDF5_by_beta_official2500_none_compat
 RUN_NAME=multi_beta_smoothl1_6ep_horizon20_20261018
-if ${GKL_JOINT_GRAD_CONTINUATION}; then
+if ${MEAN_ONLY_PHASE_C_REUSE}; then
+    RUN_NAME=${CURRICULUM_RUN_NAME:-multi_beta_gkl_joint_grad_mean_only_reuse_continuation_20ep_20261119}
+elif ${DIFFERENTIABLE_PHASE_C_REUSE}; then
+    RUN_NAME=${CURRICULUM_RUN_NAME:-multi_beta_gkl_joint_grad_differentiable_reuse_continuation_20ep_20261119}
+elif ${GKL_JOINT_GRAD_CONTINUATION}; then
     RUN_NAME=${CURRICULUM_RUN_NAME:-multi_beta_gkl_joint_grad_continuation_20ep_20261119}
 elif ${GKL_CONTINUATION}; then
     RUN_NAME=${CURRICULUM_RUN_NAME:-multi_beta_gkl_continuation_20ep_20261119}
@@ -353,6 +376,8 @@ elif ${TEMPORAL_EXTRAPOLATION_CONTINUATION}; then
     RUN_NAME=${CURRICULUM_RUN_NAME:-multi_beta_three_phase_temporal_extrapolation_continuation_20ep_20261116}
 elif ${TEMPORAL_EXTRAPOLATION_ONLY_CONTINUATION}; then
     RUN_NAME=${CURRICULUM_RUN_NAME:-multi_beta_three_phase_temporal_extrapolation_only_continuation_10ep_20261117}
+elif ${FRESH_GKL_JOINT_GRAD}; then
+    RUN_NAME=${CURRICULUM_RUN_NAME:-multi_beta_three_phase_gkl_joint_grad_globalcosine_256ep_20261119}
 elif ${THREE_PHASE_JOINT_NLL_GRAD}; then
     RUN_NAME=${CURRICULUM_RUN_NAME:-multi_beta_three_phase_joint_nll_grad_globalcosine_256ep_20261117}
 elif ${FROMSCRATCH_48H}; then
@@ -597,7 +622,7 @@ TRAIN_ARGS=(
     --wandb-name "${RUN_NAME}"
 )
 if ${STAGE1_NLL} || ${CURRICULUM}; then
-    if ${GKL_JOINT_GRAD_CONTINUATION} || ${GKL_CONTINUATION}; then
+    if ${FRESH_GKL_JOINT_GRAD} || ${GKL_JOINT_GRAD_CONTINUATION} || ${GKL_CONTINUATION}; then
         TRAIN_ARGS+=(--uncertainty-loss generalized_kl)
     elif ${STUDENT_T_UNNORMALIZED_CONTROL}; then
         TRAIN_ARGS+=(--uncertainty-loss student_t_nll --student-t-df 3.0)
@@ -624,6 +649,13 @@ if ${STAGE1_NLL} || ${CURRICULUM}; then
             if ${GKL_JOINT_GRAD_CONTINUATION}; then
                 TRAIN_ARGS+=(--gkl-joint-grad-continuation-20ep
                              --wandb-tags post-final-continuation gkl-joint-grad-continuation-20ep from-three-phase-joint-256)
+                if ${DIFFERENTIABLE_PHASE_C_REUSE}; then
+                    if ${MEAN_ONLY_PHASE_C_REUSE}; then
+                        TRAIN_ARGS+=(mean-only-phase-c-reuse --differentiable-phase-c-reuse --mean-only-phase-c-reuse)
+                    else
+                        TRAIN_ARGS+=(differentiable-phase-c-reuse --differentiable-phase-c-reuse)
+                    fi
+                fi
             elif ${GKL_CONTINUATION}; then
                 TRAIN_ARGS+=(--gkl-continuation-20ep
                              --wandb-tags post-final-continuation gkl-continuation-20ep from-three-phase-joint-256)
@@ -657,7 +689,10 @@ if ${STAGE1_NLL} || ${CURRICULUM}; then
             TRAIN_ARGS+=(
                 --wandb-tags from-scratch global-cosine-2e4-1e5 48h
             )
-            if ${THREE_PHASE_JOINT_NLL_GRAD}; then
+            if ${FRESH_GKL_JOINT_GRAD}; then
+                TRAIN_ARGS+=(three-phase k1-reuse joint-gkl-gradient differentiable-phase-c-reuse no-phase-d)
+                TRAIN_ARGS+=(--joint-nll-grad --differentiable-phase-c-reuse)
+            elif ${THREE_PHASE_JOINT_NLL_GRAD}; then
                 TRAIN_ARGS+=(three-phase k1-reuse joint-nll-gradient)
                 TRAIN_ARGS+=(--joint-nll-grad)
             elif ${THREE_PHASE_GLOBAL_COSINE}; then
@@ -961,9 +996,14 @@ if ${CURRICULUM}; then
         echo "Phase-C K=2 probe lambda_v/lambda_r: ${PROBE_LAMBDA_V} / ${PROBE_LAMBDA_R}"
         echo "Phase-C K=2 probe guard: rollout ramp cannot complete; Phase D remains inactive"
     elif ${FROMSCRATCH_48H}; then
-        echo "Curriculum state: fresh adaptive Phase A from random model initialization"
-        echo "Uncertainty objective: student_t_nll"
-        echo "Student-t df: 3.0"
+        if ${FRESH_GKL_JOINT_GRAD}; then
+            echo "Adaptive three-phase curriculum: GKL Path A ON, Path B ON"
+            echo "Phase C cross-forward mean and uncertainty gradients scaled by lambda_r"
+        else
+            echo "Curriculum state: fresh adaptive Phase A from random model initialization"
+            echo "Uncertainty objective: student_t_nll"
+            echo "Student-t df: 3.0"
+        fi
     elif ${POST_FINAL_CONTINUATION}; then
         echo "Curriculum state: fixed full objective; adaptive transitions disabled"
     else
@@ -981,6 +1021,11 @@ if ${CURRICULUM}; then
         elif ${GKL_JOINT_GRAD_CONTINUATION}; then
             echo "Post-final continuation: Generalized KL joint-gradient (A+B) 20-epoch continuation from epoch ${EPOCHS} to ${FINAL_EPOCH}"
             echo "Smooth 2-epoch cosine transition from Student-t A+B to GKL (alpha: 0 -> 1); Path A ON, Path B ON"
+            if ${MEAN_ONLY_PHASE_C_REUSE}; then
+                echo "Phase C cross-forward mean gradients scaled by alpha, with detached uncertainty reuse"
+            elif ${DIFFERENTIABLE_PHASE_C_REUSE}; then
+                echo "Phase C cross-forward mean and variance gradients scaled by the same alpha"
+            fi
             echo "Fixed LR=${MIN_LR}; no warmup, reheat, convergence detector, or curriculum ramp"
             echo "Source checkpoint: ${CONTINUATION_SOURCE_CHECKPOINT}"
         elif ${STUDENT_T_UNNORMALIZED_CONTROL}; then

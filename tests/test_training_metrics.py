@@ -665,6 +665,23 @@ def test_phase_b_completion_burn_in_patience_and_guards():
     assert not phase_b_convergence(history, args, state)["ready_for_rollout_ramp"]
 
 
+@pytest.mark.parametrize("scale", [1.0, 0.001])
+def test_phase_b_gkl_monitors_relative_validation_loss(scale):
+    args, state, history = _phase_b_example()
+    args.uncertainty_loss = "generalized_kl"
+    for row in history:
+        row["val_generalized_kl"] = scale
+    stable = phase_b_convergence(history, args, state)
+    assert stable["ready_for_rollout_ramp"]
+    assert stable["gkl_rate_per_epoch"] == pytest.approx(0)
+    assert stable["ema_val_gkl"] == pytest.approx(scale)
+    for row in history:
+        row["val_generalized_kl"] *= math.exp(-0.02 * (row["epoch"] - 120))
+    drifting = phase_b_convergence(history, args, state)
+    assert not drifting["ready_for_rollout_ramp"]
+    assert drifting["gkl_rate_per_epoch"] < -0.005
+
+
 def test_phase_b_joint_patience_resets_if_either_metric_moves():
     args, state, history = _phase_b_example()
     # A change in either metric must break the shared stability streak.
@@ -1853,26 +1870,30 @@ def test_validation_metrics_do_not_select_a_checkpoint():
     assert 'out_dir / "final.pt"' in source
 
 
-def test_fromscratch_three_phase_joint_nll_grad_cli_and_schedule(monkeypatch):
+@pytest.mark.parametrize("objective", ["student_t_nll", "generalized_kl"])
+def test_fromscratch_three_phase_joint_nll_grad_cli_and_schedule(monkeypatch, objective):
     from types import SimpleNamespace
     from train_masked_unet3d import (
-        curriculum_learning_rate_for_epoch, global_cosine_learning_rate,
-        make_curriculum_state, parse_args, validate_resume_parameters,
+        arm_curriculum_ramp, curriculum_learning_rate_for_epoch, curriculum_weights,
+        global_cosine_learning_rate, make_curriculum_state, parse_args, validate_resume_parameters,
     )
 
     argv = [
         "train", "--curriculum-training", "--curriculum-config",
         "three_phase_global_cosine", "--uncertainty-aware",
-        "--uncertainty-loss", "student_t_nll", "--student-t-df", "3.0",
+        "--uncertainty-loss", objective, "--student-t-df", "3.0",
         "--epochs", "256", "--warmup-epochs", "5", "--lr", "2e-4",
         "--min-lr", "1e-5", "--variance-ramp-epochs", "40",
         "--rollout-ramp-epochs", "40", "--final-epoch", "256",
         "--stop-after-epochs", "256", "--no-auto-resume",
         "--joint-nll-grad",
     ]
+    if objective == "generalized_kl":
+        argv.append("--differentiable-phase-c-reuse")
     monkeypatch.setattr(sys, "argv", argv)
     args = parse_args()
     assert args.joint_nll_grad is True
+    assert args.differentiable_phase_c_reuse == (objective == "generalized_kl")
     assert args.curriculum_config == "three_phase_global_cosine"
     assert (args.epochs, args.final_epoch, args.stop_after_epochs) == (256, 256, 256)
     assert args.post_final_continuation is None
@@ -1891,6 +1912,24 @@ def test_fromscratch_three_phase_joint_nll_grad_cli_and_schedule(monkeypatch):
     # Verify resume parameter validation
     saved = vars(args).copy()
     validate_resume_parameters(args, saved)
+    if objective == "generalized_kl":
+        with pytest.raises(ValueError, match="uncertainty_loss"):
+            validate_resume_parameters(args, dict(saved, uncertainty_loss="student_t_nll"))
+        with pytest.raises(ValueError, match="differentiable_phase_c_reuse"):
+            validate_resume_parameters(args, dict(saved, differentiable_phase_c_reuse=False))
+        with pytest.raises(SystemExit):
+            parse_args(argv[1:] + ["--mean-only-phase-c-reuse"])
+        state["successful_optimizer_steps"] = 500
+        arm_curriculum_ramp(state, "variance")
+        state["successful_optimizer_steps"] += 200
+        assert curriculum_weights(state) == pytest.approx((0.5, 0.0))
+        state["successful_optimizer_steps"] += 200
+        arm_curriculum_ramp(state, "rollout")
+        state["successful_optimizer_steps"] += 200
+        restored = make_curriculum_state(args, 10, {"curriculum_state": state})
+        assert restored == state
+        assert curriculum_weights(restored) == pytest.approx((1.0, 0.5))
+        assert curriculum_learning_rate_for_epoch(111, args, restored) == expected_lrs[110]
     # Checkpoint without joint_nll_grad must be rejected
     saved_no_grad = vars(args).copy()
     saved_no_grad["joint_nll_grad"] = False
