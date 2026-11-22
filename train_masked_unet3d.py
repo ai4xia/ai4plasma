@@ -38,6 +38,7 @@ from data.masking import (
     PATTERN_TO_ID,
     PROBE_COUNT_PATTERNS,
     TEMPORAL_EXTRAPOLATION_PATTERN,
+    TEMPORAL_MASK_PATTERNS,
     full_mse_loss,
     make_visible_input,
     make_uncertain_input,
@@ -50,6 +51,10 @@ from data.masking import (
     temporal_extrapolation_frames,
     make_fixed_validation_mask,
 )
+try:
+    from data.masking import sample_training_patterns
+except ImportError:
+    sample_training_patterns = None
 from models.unet3d import DIRECT_MODEL_VERSION, MODEL_VERSION, UNet3D
 
 
@@ -487,10 +492,21 @@ def parse_args(argv=None):
             "Requires --post-final-continuation; all other continuation state is restored."
         ),
     )
+    p.add_argument(
+        "--gkl-masking-continuation-20ep",
+        action="store_true",
+        help=(
+            "Matched 20-epoch masking continuation: continue the completed "
+            "fresh 256-epoch GKL A+B checkpoint for epochs 257-276 with settled "
+            "Phase C (lambda_v=lambda_r=1), fixed LR=min_lr, Paths A and B ON, "
+            "and fully differentiable Phase C reuse."
+        ),
+    )
 
     args = p.parse_args(argv)
     if args.differentiable_phase_c_reuse and not (
         args.gkl_joint_grad_continuation_20ep
+        or args.gkl_masking_continuation_20ep
         or (args.joint_nll_grad and args.uncertainty_loss in ("generalized_kl", "gkl"))
     ):
         p.error("--differentiable-phase-c-reuse requires fresh or continuation GKL A+B")
@@ -608,6 +624,7 @@ def parse_args(argv=None):
                 or args.joint_nll_grad_continuation
                 or args.gkl_continuation_20ep
                 or args.gkl_joint_grad_continuation_20ep
+                or args.gkl_masking_continuation_20ep
                 or args.student_t_unnormalized_control_20ep):
             p.error(
                 "--joint-nll-grad cannot be combined with continuation diagnostic flags"
@@ -625,6 +642,7 @@ def parse_args(argv=None):
                 or args.uncertainty_feature_grad_continuation
                 or args.joint_nll_grad_continuation
                 or args.gkl_joint_grad_continuation_20ep
+                or args.gkl_masking_continuation_20ep
                 or args.student_t_unnormalized_control_20ep):
             p.error("--gkl-continuation-20ep cannot be combined with other continuation flags")
     if args.gkl_joint_grad_continuation_20ep:
@@ -640,8 +658,27 @@ def parse_args(argv=None):
                 or args.uncertainty_feature_grad_continuation
                 or args.joint_nll_grad_continuation
                 or args.gkl_continuation_20ep
+                or args.gkl_masking_continuation_20ep
                 or args.student_t_unnormalized_control_20ep):
             p.error("--gkl-joint-grad-continuation-20ep cannot be combined with other continuation flags")
+    if args.gkl_masking_continuation_20ep:
+        if args.post_final_continuation is None:
+            p.error("--gkl-masking-continuation-20ep requires --post-final-continuation")
+        if args.curriculum_config != "three_phase_global_cosine":
+            p.error("--gkl-masking-continuation-20ep requires three_phase_global_cosine")
+        if args.uncertainty_loss not in ("generalized_kl", "gkl"):
+            p.error("--gkl-masking-continuation-20ep requires --uncertainty-loss generalized_kl")
+        if not args.differentiable_phase_c_reuse:
+            p.error("--gkl-masking-continuation-20ep requires --differentiable-phase-c-reuse")
+        if (args.gaussian_u_continuation
+                or args.temporal_extrapolation_continuation
+                or args.temporal_extrapolation_only_continuation
+                or args.uncertainty_feature_grad_continuation
+                or args.joint_nll_grad_continuation
+                or args.gkl_continuation_20ep
+                or args.gkl_joint_grad_continuation_20ep
+                or args.student_t_unnormalized_control_20ep):
+            p.error("--gkl-masking-continuation-20ep cannot be combined with other continuation flags")
     if args.student_t_unnormalized_control_20ep:
         if args.post_final_continuation is None:
             p.error("--student-t-unnormalized-control-20ep requires --post-final-continuation")
@@ -1183,6 +1220,7 @@ def validate_resume_parameters(args, checkpoint_args: Dict[str, Any]) -> None:
         ("joint_nll_grad", False),
         ("gkl_continuation_20ep", False),
         ("gkl_joint_grad_continuation_20ep", False),
+        ("gkl_masking_continuation_20ep", False),
         ("differentiable_phase_c_reuse", False),
         ("mean_only_phase_c_reuse", False),
         ("student_t_unnormalized_control_20ep", False),
@@ -1417,10 +1455,56 @@ def validate_post_final_continuation(
             raise ValueError(
                 "Student-t control continuation must run exactly 20 additional epochs"
             )
+    if getattr(args, "gkl_masking_continuation_20ep", False):
+        if source_epoch != 256:
+            raise ValueError(
+                "GKL masking continuation requires the completed epoch-256 source"
+            )
+        if source_args.get("curriculum_config") != "three_phase_global_cosine":
+            raise ValueError(
+                "GKL masking continuation requires a three-phase source checkpoint"
+            )
+        if source_args.get("uncertainty_loss") not in ("generalized_kl", "gkl"):
+            raise ValueError(
+                "GKL masking continuation requires a Generalized KL source checkpoint"
+            )
+        if not source_args.get("joint_nll_grad", False):
+            raise ValueError(
+                "GKL masking continuation requires a joint-NLL-gradient source checkpoint"
+            )
+        if not source_args.get("differentiable_phase_c_reuse", False):
+            raise ValueError(
+                "GKL masking continuation requires a differentiable Phase-C reuse source checkpoint"
+            )
+        if args.uncertainty_loss not in ("generalized_kl", "gkl"):
+            raise ValueError("GKL masking continuation must optimize generalized_kl")
+        if not args.differentiable_phase_c_reuse:
+            raise ValueError(
+                "GKL masking continuation requires --differentiable-phase-c-reuse"
+            )
+        if args.mask_pattern_weights != DEFAULT_PATTERN_WEIGHTS:
+            raise ValueError(
+                "GKL masking continuation requires the equal five-category mask weights"
+            )
+        if args.final_epoch != source_epoch + 20:
+            raise ValueError(
+                "GKL masking continuation must run exactly 20 additional epochs"
+            )
 
     compatible_args = argparse.Namespace(**vars(args))
     compatible_args.final_epoch = source_args["final_epoch"]
     compatible_args.post_final_continuation = None
+    if getattr(args, "gkl_masking_continuation_20ep", False):
+        compatible_args.gkl_masking_continuation_20ep = source_args.get(
+            "gkl_masking_continuation_20ep", False,
+        )
+        compatible_args.joint_nll_grad = source_args.get("joint_nll_grad", False)
+        source_masking = source_args.get("masking_version")
+        if (
+            source_masking == "independentBD_fiveMask_logUniformCounts_orientedSpatialBlock_v9"
+            and args.masking_version == "independentBD_fiveMask_logUniformCounts_orientedSpatialBlock_sharedTemporal_v11"
+        ):
+            compatible_args.masking_version = source_masking
     if getattr(args, "gkl_continuation_20ep", False) or getattr(args, "gkl_joint_grad_continuation_20ep", False):
         compatible_args.gkl_continuation_20ep = source_args.get(
             "gkl_continuation_20ep", False,
@@ -2087,6 +2171,47 @@ def sample_training_mask(y, pattern_weights, density_p_zero, density_p_full,
         magnetic_counts, density_counts = [None] * batch_size, [None] * batch_size
         mask = torch.empty_like(y)
         infos = [{} for _ in range(batch_size)]
+    elif sample_training_patterns is not None:
+        magnetic_patterns, density_patterns = sample_training_patterns(
+            pattern_weights, batch_size
+        )
+        magnetic_fractions = torch.rand(batch_size).tolist()
+        density_fractions = torch.rand(batch_size).tolist()
+        magnetic_counts: List[Optional[int]] = [None] * batch_size
+        density_counts: List[Optional[int]] = [None] * batch_size
+
+        for i in range(batch_size):
+            m_pat = magnetic_patterns[i]
+            d_pat = density_patterns[i]
+            if m_pat in TEMPORAL_MASK_PATTERNS:
+                c = sample_training_severity_counts(
+                    [m_pat], spatial_sites=spatial_sites, time_steps=time_steps,
+                    p_zero=magnetic_p_zero, p_full=magnetic_p_full,
+                )[0]
+                magnetic_counts[i] = c
+                density_counts[i] = c
+                density_fractions[i] = magnetic_fractions[i]
+            else:
+                magnetic_counts[i] = sample_training_severity_counts(
+                    [m_pat], spatial_sites=spatial_sites, time_steps=time_steps,
+                    p_zero=magnetic_p_zero, p_full=magnetic_p_full,
+                )[0]
+                density_counts[i] = sample_training_severity_counts(
+                    [d_pat], spatial_sites=spatial_sites, time_steps=time_steps,
+                    p_zero=density_p_zero, p_full=density_p_full,
+                )[0]
+
+        for patterns, counts, fractions, modality in (
+            (density_patterns, density_counts, density_fractions, "Density"),
+            (magnetic_patterns, magnetic_counts, magnetic_fractions, "magnetic"),
+        ):
+            _apply_training_visible_counts(patterns, counts, fractions,
+                                           spatial_sites=spatial_sites, time_steps=time_steps, modality=modality)
+        mask, infos = sample_independent_batch_masks(
+            y.shape, magnetic_patterns=magnetic_patterns, density_patterns=density_patterns,
+            magnetic_mask_fractions=magnetic_fractions, density_mask_fractions=density_fractions,
+            device=y.device, dtype=y.dtype, density_probe_counts=density_counts,
+            magnetic_visible_counts=magnetic_counts)
     else:
         magnetic_patterns = sample_patterns(pattern_weights, batch_size)
         density_patterns = sample_patterns(pattern_weights, batch_size)
@@ -2110,38 +2235,61 @@ def sample_training_mask(y, pattern_weights, density_p_zero, density_p_full,
             device=y.device, dtype=y.dtype, density_probe_counts=density_counts,
             magnetic_visible_counts=magnetic_counts)
     if temporal_extrapolation or temporal_extrapolation_only:
-        for i in range(batch_size):
-            for modality, channels, patterns, fractions, counts in (
-                ("magnetic", slice(0, 3), magnetic_patterns,
-                 magnetic_fractions, magnetic_counts),
-                ("density", slice(3, 4), density_patterns,
-                 density_fractions, density_counts),
-            ):
-                if not temporal_extrapolation_only and patterns[i] != "temporal_block":
-                    continue
-                temporal_mask, temporal_info = temporal_extrapolation_frames(
-                    time_steps
-                )
-                mask[i, channels] = temporal_mask[0].expand(
-                    channels.stop - channels.start, time_steps, nx, nz,
-                ).to(device=y.device, dtype=y.dtype)
-                patterns[i] = TEMPORAL_EXTRAPOLATION_PATTERN
-                horizon = int(temporal_info["horizon"])
-                fractions[i] = horizon / time_steps
-                counts[i] = time_steps - horizon
-                infos[i][f"{modality}_pattern"] = TEMPORAL_EXTRAPOLATION_PATTERN
-                infos[i].update({
-                    f"{modality}_{key}": value
-                    for key, value in temporal_info.items()
-                })
-                infos[i][f"{modality}_actual_mask_fraction"] = horizon / time_steps
-                infos[i][f"{modality}_visible_fraction"] = 1.0 - horizon / time_steps
-                if temporal_extrapolation_only:
-                    infos[i][f"{modality}_target_mask_fraction"] = horizon / time_steps
-            infos[i]["actual_mask_fraction"] = (
-                3.0 * infos[i]["magnetic_actual_mask_fraction"]
-                + infos[i]["density_actual_mask_fraction"]
-            ) / 4.0
+        if sample_training_patterns is not None:
+            for i in range(batch_size):
+                if temporal_extrapolation_only or (magnetic_patterns[i] == "temporal_block" and temporal_extrapolation):
+                    temporal_mask, temporal_info = temporal_extrapolation_frames(time_steps)
+                    mask[i, :4] = temporal_mask[0].expand(4, time_steps, nx, nz).to(device=y.device, dtype=y.dtype)
+                    magnetic_patterns[i] = TEMPORAL_EXTRAPOLATION_PATTERN
+                    density_patterns[i] = TEMPORAL_EXTRAPOLATION_PATTERN
+                    horizon = int(temporal_info["horizon"])
+                    frac = horizon / time_steps
+                    cnt = time_steps - horizon
+                    magnetic_fractions[i] = frac
+                    density_fractions[i] = frac
+                    magnetic_counts[i] = cnt
+                    density_counts[i] = cnt
+                    for mod in ("magnetic", "density"):
+                        infos[i][f"{mod}_pattern"] = TEMPORAL_EXTRAPOLATION_PATTERN
+                        infos[i].update({f"{mod}_{k}": v for k, v in temporal_info.items()})
+                        infos[i][f"{mod}_actual_mask_fraction"] = frac
+                        infos[i][f"{mod}_visible_fraction"] = 1.0 - frac
+                        if temporal_extrapolation_only:
+                            infos[i][f"{mod}_target_mask_fraction"] = frac
+                    infos[i]["actual_mask_fraction"] = frac
+        else:
+            for i in range(batch_size):
+                for modality, channels, patterns, fractions, counts in (
+                    ("magnetic", slice(0, 3), magnetic_patterns,
+                     magnetic_fractions, magnetic_counts),
+                    ("density", slice(3, 4), density_patterns,
+                     density_fractions, density_counts),
+                ):
+                    if not temporal_extrapolation_only and patterns[i] != "temporal_block":
+                        continue
+                    temporal_mask, temporal_info = temporal_extrapolation_frames(
+                        time_steps
+                    )
+                    mask[i, channels] = temporal_mask[0].expand(
+                        channels.stop - channels.start, time_steps, nx, nz,
+                    ).to(device=y.device, dtype=y.dtype)
+                    patterns[i] = TEMPORAL_EXTRAPOLATION_PATTERN
+                    horizon = int(temporal_info["horizon"])
+                    fractions[i] = horizon / time_steps
+                    counts[i] = time_steps - horizon
+                    infos[i][f"{modality}_pattern"] = TEMPORAL_EXTRAPOLATION_PATTERN
+                    infos[i].update({
+                        f"{modality}_{key}": value
+                        for key, value in temporal_info.items()
+                    })
+                    infos[i][f"{modality}_actual_mask_fraction"] = horizon / time_steps
+                    infos[i][f"{modality}_visible_fraction"] = 1.0 - horizon / time_steps
+                    if temporal_extrapolation_only:
+                        infos[i][f"{modality}_target_mask_fraction"] = horizon / time_steps
+                infos[i]["actual_mask_fraction"] = (
+                    3.0 * infos[i]["magnetic_actual_mask_fraction"]
+                    + infos[i]["density_actual_mask_fraction"]
+                ) / 4.0
     return (mask, infos, magnetic_patterns, density_patterns, magnetic_fractions,
             density_fractions, magnetic_counts, density_counts)
 
@@ -2705,6 +2853,7 @@ def train_one_epoch(
     joint_nll_grad: bool = False,
     gkl_continuation_20ep: bool = False,
     gkl_joint_grad_continuation_20ep: bool = False,
+    gkl_masking_continuation_20ep: bool = False,
     differentiable_phase_c_reuse: bool = False,
     mean_only_phase_c_reuse: bool = False,
     student_t_unnormalized_control_20ep: bool = False,
@@ -2869,12 +3018,14 @@ def train_one_epoch(
                     or joint_nll_grad
                     or gkl_continuation_20ep
                     or gkl_joint_grad_continuation_20ep
+                    or gkl_masking_continuation_20ep
                     or student_t_unnormalized_control_20ep
                 )
                 enable_mean_nll_grad = (
                     joint_nll_grad_continuation
                     or joint_nll_grad
                     or gkl_joint_grad_continuation_20ep
+                    or gkl_masking_continuation_20ep
                     or student_t_unnormalized_control_20ep
                 )
                 gkl_alpha = None
@@ -3837,6 +3988,16 @@ def main():
                 f"LR={args.min_lr:g}; settled three-phase K=1 reuse remains unchanged; "
                 "Phase D is disabled."
             )
+        if getattr(args, "gkl_masking_continuation_20ep", False):
+            rank_print(
+                "GKL masking continuation: diagnostic=gkl_masking_continuation; "
+                f"source checkpoint={args.post_final_continuation}; source epoch=256; "
+                f"target epoch={args.final_epoch}; objective=generalized_kl; "
+                "Path A ON; Path B ON; "
+                f"LR={args.min_lr:g}; settled three-phase K=1 with differentiable Phase C reuse; "
+                f"masking_version={args.masking_version}; "
+                "Phase D is disabled."
+            )
         if args.uncertainty_loss in ("gaussian_nll", "student_t_nll", "generalized_kl", "gkl"):
             input_label = "Curriculum first pass" if args.curriculum_training else "Stage-1"
             rank_print(f"{input_label}: binary input variance checked every batch; FP32 NLL floor={GAUSSIAN_NLL_VARIANCE_FLOOR:g}; no upper cap")
@@ -4214,6 +4375,14 @@ def main():
                     "nll_grad_path_a_mean": True,
                     "nll_grad_path_b_variance": True,
                 } if args.student_t_unnormalized_control_20ep else {}),
+                **({
+                    "diagnostic": "gkl_masking_continuation",
+                    "uncertainty_objective": "generalized_kl",
+                    "nll_grad_path_a_mean": True,
+                    "nll_grad_path_b_variance": True,
+                    "differentiable_phase_c_reuse": True,
+                    "masking_version": args.masking_version,
+                } if getattr(args, "gkl_masking_continuation_20ep", False) else {}),
             },
             allow_val_change=True,
         )
@@ -4337,6 +4506,9 @@ def main():
             mean_only_phase_c_reuse=args.mean_only_phase_c_reuse,
             student_t_unnormalized_control_20ep=getattr(
                 args, "student_t_unnormalized_control_20ep", False,
+            ),
+            gkl_masking_continuation_20ep=getattr(
+                args, "gkl_masking_continuation_20ep", False,
             ),
         )
 

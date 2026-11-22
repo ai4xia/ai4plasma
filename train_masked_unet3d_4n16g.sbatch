@@ -15,7 +15,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="/pscratch/sd/b/binxia/ai4plasma"
+PROJECT_DIR="${PROJECT_DIR:-${SCRIPT_DIR}}"
 NNODES=4
 GPUS_PER_NODE=4
 STAGE1_NLL=false
@@ -33,6 +33,7 @@ UNCERTAINTY_FEATURE_GRAD_CONTINUATION=false
 JOINT_NLL_GRAD_CONTINUATION=false
 GKL_CONTINUATION=false
 GKL_JOINT_GRAD_CONTINUATION=false
+GKL_MASKING_CONTINUATION=false
 DIFFERENTIABLE_PHASE_C_REUSE=false
 MEAN_ONLY_PHASE_C_REUSE=false
 FRESH_GKL_JOINT_GRAD=false
@@ -151,6 +152,13 @@ case "${1:-}" in
         DIFFERENTIABLE_PHASE_C_REUSE=true
         if [[ "$1" == --gkl-* ]]; then RESUMING=false; fi
         if [[ "$1" == *-mean-only-reuse-* ]]; then MEAN_ONLY_PHASE_C_REUSE=true; fi
+        CURRICULUM_STOP=276; FINAL_EPOCH=276
+        MODEL_ARGS=(--model-version direct_unet3d_no_activation_norm_v3); shift ;;
+    --gkl-masking-continuation-20ep|--resume-gkl-masking-continuation-20ep)
+        CURRICULUM=true; GLOBAL_COSINE=true; THREE_PHASE_GLOBAL_COSINE=true
+        POST_FINAL_CONTINUATION=true; GKL_MASKING_CONTINUATION=true
+        DIFFERENTIABLE_PHASE_C_REUSE=true
+        if [[ "$1" == --gkl-* ]]; then RESUMING=false; fi
         CURRICULUM_STOP=276; FINAL_EPOCH=276
         MODEL_ARGS=(--model-version direct_unet3d_no_activation_norm_v3); shift ;;
     --student-t-unnormalized-control-20ep)
@@ -338,6 +346,9 @@ PY
     esac
 fi
 
+if [[ -z "${SLURM_JOB_NODELIST:-}" ]] && [[ "${JOB_INFO}" =~ [[:space:]]NodeList=([^[:space:]]+) ]]; then
+    SLURM_JOB_NODELIST="${BASH_REMATCH[1]}"
+fi
 mapfile -t SLURM_HOSTS < <(scontrol show hostnames "${SLURM_JOB_NODELIST}")
 MASTER_ADDR=${SLURM_HOSTS[0]}
 JOB_NUMBER=${SLURM_JOB_ID%%_*}
@@ -354,7 +365,9 @@ export NCCL_ASYNC_ERROR_HANDLING=1
 
 H5_DIR=/pscratch/sd/b/binxia/VPIC_PPPL_HDF5_by_beta_official2500_none_compat
 RUN_NAME=multi_beta_smoothl1_6ep_horizon20_20261018
-if ${MEAN_ONLY_PHASE_C_REUSE}; then
+if ${GKL_MASKING_CONTINUATION}; then
+    RUN_NAME=${CURRICULUM_RUN_NAME:-multi_beta_gkl_v11_shared_temporal_20ep_20261121}
+elif ${MEAN_ONLY_PHASE_C_REUSE}; then
     RUN_NAME=${CURRICULUM_RUN_NAME:-multi_beta_gkl_joint_grad_mean_only_reuse_continuation_20ep_20261119}
 elif ${DIFFERENTIABLE_PHASE_C_REUSE}; then
     RUN_NAME=${CURRICULUM_RUN_NAME:-multi_beta_gkl_joint_grad_differentiable_reuse_continuation_20ep_20261119}
@@ -447,6 +460,7 @@ if ${TEMPORAL_EXTRAPOLATION_ONLY_CONTINUATION}; then MIN_LR=1e-5; fi
 if ${JOINT_NLL_GRAD_CONTINUATION}; then MIN_LR=1e-5; fi
 if ${GKL_CONTINUATION}; then MIN_LR=1e-5; fi
 if ${GKL_JOINT_GRAD_CONTINUATION}; then MIN_LR=1e-5; fi
+if ${GKL_MASKING_CONTINUATION}; then MIN_LR=1e-5; fi
 if ${STUDENT_T_UNNORMALIZED_CONTROL}; then MIN_LR=1e-5; fi
 if ${PHASE_D_PROBE}; then MIN_LR=1e-5; fi
 if ${PHASE_C_K2_PROBE}; then
@@ -472,10 +486,12 @@ MASK_PATTERNS=(
     temporal_block  1
 )
 
-OUT_DIR=runs/${RUN_NAME}
+OUT_DIR="${OUT_DIR:-/pscratch/sd/b/binxia/ai4plasma/runs/${RUN_NAME}}"
 CHECKPOINT=${OUT_DIR}/latest.pt
 ACTIVE_JOB_REGISTRY=${OUT_DIR}/active_slurm_job_id
-if ${GKL_JOINT_GRAD_CONTINUATION} || ${GKL_CONTINUATION} || ${STUDENT_T_UNNORMALIZED_CONTROL}; then
+if ${GKL_MASKING_CONTINUATION}; then
+    CONTINUATION_SOURCE_CHECKPOINT=${CONTINUATION_SOURCE_CHECKPOINT:-/pscratch/sd/b/binxia/ai4plasma/runs/multi_beta_three_phase_gkl_joint_grad_globalcosine_256ep_20261119/final.pt}
+elif ${GKL_JOINT_GRAD_CONTINUATION} || ${GKL_CONTINUATION} || ${STUDENT_T_UNNORMALIZED_CONTROL}; then
     CONTINUATION_SOURCE_CHECKPOINT=${CONTINUATION_SOURCE_CHECKPOINT:-runs/multi_beta_three_phase_joint_nll_grad_globalcosine_256ep_20261117/final.pt}
 elif ${TEMPORAL_EXTRAPOLATION_ONLY_CONTINUATION} || ${UNCERTAINTY_FEATURE_GRAD_CONTINUATION} || ${JOINT_NLL_GRAD_CONTINUATION}; then
     CONTINUATION_SOURCE_CHECKPOINT=${CONTINUATION_SOURCE_CHECKPOINT:-runs/multi_beta_three_phase_temporal_extrapolation_continuation_20ep_20261116/final.pt}
@@ -622,7 +638,7 @@ TRAIN_ARGS=(
     --wandb-name "${RUN_NAME}"
 )
 if ${STAGE1_NLL} || ${CURRICULUM}; then
-    if ${FRESH_GKL_JOINT_GRAD} || ${GKL_JOINT_GRAD_CONTINUATION} || ${GKL_CONTINUATION}; then
+    if ${FRESH_GKL_JOINT_GRAD} || ${GKL_JOINT_GRAD_CONTINUATION} || ${GKL_CONTINUATION} || ${GKL_MASKING_CONTINUATION}; then
         TRAIN_ARGS+=(--uncertainty-loss generalized_kl)
     elif ${STUDENT_T_UNNORMALIZED_CONTROL}; then
         TRAIN_ARGS+=(--uncertainty-loss student_t_nll --student-t-df 3.0)
@@ -646,7 +662,11 @@ if ${STAGE1_NLL} || ${CURRICULUM}; then
         fi
         if ${POST_FINAL_CONTINUATION}; then
             TRAIN_ARGS+=(--post-final-continuation "${CONTINUATION_SOURCE_CHECKPOINT}")
-            if ${GKL_JOINT_GRAD_CONTINUATION}; then
+            if ${GKL_MASKING_CONTINUATION}; then
+                TRAIN_ARGS+=(--gkl-masking-continuation-20ep
+                             --differentiable-phase-c-reuse
+                             --wandb-tags post-final-continuation gkl-masking-continuation-20ep from-gkl-joint-256)
+            elif ${GKL_JOINT_GRAD_CONTINUATION}; then
                 TRAIN_ARGS+=(--gkl-joint-grad-continuation-20ep
                              --wandb-tags post-final-continuation gkl-joint-grad-continuation-20ep from-three-phase-joint-256)
                 if ${DIFFERENTIABLE_PHASE_C_REUSE}; then
@@ -1060,7 +1080,7 @@ elif ${STAGE1_NLL}; then
 else
     echo "Resume: ${CHECKPOINT} (model, optimizer, AMP scaler, channel stats)"
 fi
-echo "Masking version: independentBD_fiveMask_logUniformCounts_orientedSpatialBlock_v9"
+echo "Masking version: $("${PYTHON}" -c 'import data.masking; print(data.masking.MASKING_VERSION)' 2>/dev/null || echo 'unknown')"
 echo "Unified spatiotemporal attention: enabled"
 echo "Spatial-only pooling: enabled"
 echo "Master: ${MASTER_ADDR}:${MASTER_PORT}"

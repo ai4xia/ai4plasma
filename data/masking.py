@@ -24,7 +24,7 @@ TEMPORAL_EXTRAPOLATION_PATTERN = "temporal_extrapolation"
 # Increment this whenever the training-time meaning of a mask changes. It is
 # stored in checkpoints so auto-resume cannot silently mix incompatible mask
 # distributions in one run.
-MASKING_VERSION = "independentBD_fiveMask_logUniformCounts_orientedSpatialBlock_v9"
+MASKING_VERSION = "independentBD_fiveMask_logUniformCounts_orientedSpatialBlock_sharedTemporal_v11"
 
 PATTERN_TO_ID: Dict[str, int] = {name: i for i, name in enumerate(MASK_PATTERNS)}
 
@@ -153,6 +153,60 @@ def sample_patterns(
     return [names[i] for i in idx.tolist()]
 
 
+def sample_training_patterns(
+    weights: Dict[str, float],
+    n: int,
+    generator: Optional[torch.Generator] = None,
+) -> Tuple[List[str], List[str]]:
+    """Sample coordinated training patterns for (Magnetic, Density).
+
+    Category rule:
+        Temporal masks are shared across Magnetic and Density; spatial masks
+        remain independent. Both modalities always use the same category
+        (spatial or temporal) within each sample.
+        Category and pattern probabilities are derived from pattern weights,
+        preserving each modality's marginal pattern frequencies.
+    """
+    spatial_names = [p for p in SPATIAL_MASK_PATTERNS if weights.get(p, 0.0) > 0]
+    temporal_names = [p for p in TEMPORAL_MASK_PATTERNS if weights.get(p, 0.0) > 0]
+
+    spatial_weight = sum(weights.get(p, 0.0) for p in spatial_names)
+    temporal_weight = sum(weights.get(p, 0.0) for p in temporal_names)
+    total_weight = spatial_weight + temporal_weight
+
+    if total_weight <= 0:
+        raise ValueError("At least one mask pattern must have a positive weight.")
+
+    magnetic_patterns: List[str] = []
+    density_patterns: List[str] = []
+
+    spatial_probs = (
+        torch.tensor([weights[p] for p in spatial_names], dtype=torch.float32)
+        if spatial_names else None
+    )
+    temporal_probs = (
+        torch.tensor([weights[p] for p in temporal_names], dtype=torch.float32)
+        if temporal_names else None
+    )
+
+    for _ in range(n):
+        u = _rand(generator) * total_weight
+        if u < temporal_weight:
+            # Temporal sample: both modalities share the exact same temporal pattern
+            idx = int(torch.multinomial(temporal_probs, 1, generator=generator).item())
+            pattern = temporal_names[idx]
+            magnetic_patterns.append(pattern)
+            density_patterns.append(pattern)
+        else:
+            # Spatial sample: both modalities independently sample spatial patterns
+            m_idx = int(torch.multinomial(spatial_probs, 1, generator=generator).item())
+            d_idx = int(torch.multinomial(spatial_probs, 1, generator=generator).item())
+            magnetic_patterns.append(spatial_names[m_idx])
+            density_patterns.append(spatial_names[d_idx])
+
+    return magnetic_patterns, density_patterns
+
+
 PROBE_COUNT_PATTERNS: Tuple[str, ...] = ("spatial_random", "spatial_grid")
 UNIFORM_FRAME_COUNT_PATTERNS: Tuple[str, ...] = (
     "temporal_random",
@@ -208,8 +262,9 @@ def sample_training_severity_counts(
 ) -> List[Optional[int]]:
     """Draw training-time visible counts for one modality.
 
-    Probe patterns use the 0 / log-uniform / full mixture. Temporal patterns
-    draw a uniform visible-frame count in [0, T]. spatial_block keeps its
+    Probe patterns use the 0 / log-uniform / full mixture. temporal_random
+    draws a uniform visible-frame count in [0, T]. temporal_block draws a
+    uniform visible-frame count in [1, T-1]. spatial_block keeps its
     Uniform(0, 1) area fraction and therefore returns None.
     """
     _validate_endpoint_probabilities(p_zero, p_full)
@@ -232,11 +287,23 @@ def sample_training_severity_counts(
                     spatial_sites, p_zero, p_full, generator
                 )
             )
-        elif pattern in UNIFORM_FRAME_COUNT_PATTERNS:
+        elif pattern == "temporal_random":
             counts.append(
                 int(
                     torch.randint(
                         0, time_steps + 1, (1,), generator=generator
+                    ).item()
+                )
+            )
+        elif pattern == "temporal_block":
+            if time_steps < 2:
+                raise ValueError(
+                    f"temporal_block requires time_steps >= 2, got {time_steps}."
+                )
+            counts.append(
+                int(
+                    torch.randint(
+                        1, time_steps, (1,), generator=generator
                     ).item()
                 )
             )
@@ -506,14 +573,63 @@ def _temporal_block_from_boundaries(T: int, start: int, end: int):
     return tmask, info
 
 
-def _temporal_block_frames(T, generator):
-    """Uniformly sample two oriented boundaries from [0, T]."""
-    boundaries = torch.randperm(T + 1, generator=generator)[:2]
-    return _temporal_block_from_boundaries(
-        T,
-        int(boundaries[0]),
-        int(boundaries[1]),
-    )
+def _circular_temporal_block(
+    T: int,
+    n_visible: int,
+    start: Optional[int] = None,
+    generator: Optional[torch.Generator] = None,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """Unified circular temporal block mask for a temporal window of length T.
+
+    Sampling logic:
+        1. n_visible in [1, T-1] (or [0, T] for boundary cases).
+        2. start in [0, T-1].
+        3. n_masked = T - n_visible.
+        4. masked = ((torch.arange(T) - start) % T) < n_masked.
+    The remaining frames are observed.
+    """
+    if T < 2:
+        raise ValueError(f"temporal_block requires T >= 2, got {T}.")
+    n_visible = int(n_visible)
+    if not (0 <= n_visible <= T):
+        raise ValueError(f"n_visible must lie in [0, {T}], got {n_visible}.")
+
+    if start is None:
+        start = int(torch.randint(0, T, (1,), generator=generator).item())
+    else:
+        start = int(start)
+        if not (0 <= start < T):
+            raise ValueError(f"start must lie in [0, {T - 1}], got {start}.")
+
+    n_masked = T - n_visible
+    masked = ((torch.arange(T) - start) % T) < n_masked
+    tmask = (~masked).to(dtype=torch.float32).view(1, 1, T, 1, 1)
+
+    visible_indices = torch.nonzero(~masked, as_tuple=False).flatten()
+    info = {
+        "temporal_mode": "circular_block",
+        "start": int(start),
+        "end": int((start + n_masked) % T),
+        "n_visible": int(n_visible),
+        "n_masked": int(n_masked),
+        "num_visible_frames": int(n_visible),
+        "num_masked_frames": int(n_masked),
+        "visible_frames": [int(t) for t in visible_indices.tolist()],
+        "actual_mask_fraction": float(n_masked / T),
+        "wrapped": bool(start + n_masked > T),
+    }
+    return tmask, info
+
+
+def _temporal_block_frames(
+    T: int,
+    generator: Optional[torch.Generator] = None,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """Uniformly sample n_visible in [1, T-1] and circular start in [0, T-1]."""
+    if T < 2:
+        raise ValueError(f"temporal_block requires T >= 2, got {T}.")
+    n_visible = int(torch.randint(1, T, (1,), generator=generator).item())
+    return _circular_temporal_block(T, n_visible, generator=generator)
 
 
 def temporal_extrapolation_frames(T, generator=None):
@@ -531,27 +647,16 @@ def temporal_extrapolation_frames(T, generator=None):
     return tmask, info
 
 
-def _temporal_block_from_visible_count(T, n_visible, generator):
-    """Build an oriented contiguous block with an exact visible-frame count."""
-    n_visible = int(n_visible)
-    if not (0 <= n_visible <= T):
-        raise ValueError(f"n_visible must lie in [0, {T}], got {n_visible}.")
-
-    if n_visible == 0:
-        return _temporal_block_from_boundaries(T, 0, T)
-    if n_visible == T:
-        return _temporal_block_from_boundaries(T, T, 0)
-
-    # Both orientations can realize any interior count. inside_masked hides a
-    # contiguous block of T - n_visible frames; inside_visible keeps a
-    # contiguous block of n_visible frames.
-    if _rand(generator) < 0.5:
-        hidden = T - n_visible
-        start = int(torch.randint(0, T - hidden + 1, (1,), generator=generator).item())
-        return _temporal_block_from_boundaries(T, start, start + hidden)
-
-    end = int(torch.randint(0, T - n_visible + 1, (1,), generator=generator).item())
-    return _temporal_block_from_boundaries(T, end + n_visible, end)
+def _temporal_block_from_visible_count(
+    T: int,
+    n_visible: int,
+    generator: Optional[torch.Generator] = None,
+    start: Optional[int] = None,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """Build a circular temporal block with an exact visible-frame count."""
+    return _circular_temporal_block(
+        T, n_visible, start=start, generator=generator
+    )
 
 
 def _sample_modality_mask(
@@ -976,57 +1081,104 @@ def sample_independent_batch_masks(
         magnetic_fraction = float(magnetic_mask_fractions[i])
         density_fraction = float(density_mask_fractions[i])
 
-        magnetic_small, magnetic_info = _sample_modality_mask(
-            modality="magnetic",
-            pattern=magnetic_pattern,
-            T=T,
-            X=X,
-            Z=Z,
-            mask_fraction=magnetic_fraction,
-            generator=generator,
-            visible_count=magnetic_visible_counts[i],
-        )
-        density_small, density_info = _sample_modality_mask(
-            modality="density",
-            pattern=density_pattern,
-            T=T,
-            X=X,
-            Z=Z,
-            mask_fraction=density_fraction,
-            generator=generator,
-            visible_count=density_probe_counts[i],
-        )
+        m_is_temporal = magnetic_pattern in TEMPORAL_MASK_PATTERNS
+        d_is_temporal = density_pattern in TEMPORAL_MASK_PATTERNS
 
-        # Spatial masks are shaped (1, 1, 1, X, Z) and temporal masks are
-        # shaped (1, 1, T, 1, 1). Independent modalities may choose one of
-        # each, so broadcast both to the common spatiotemporal shape before
-        # concatenating channels.
-        magnetic_small = magnetic_small.expand(1, 3, T, X, Z)
-        density_small = density_small.expand(1, 1, T, X, Z)
-        small = torch.cat([magnetic_small, density_small], dim=1)
-        mask = small.to(device=device, dtype=dtype).contiguous()
+        if m_is_temporal and d_is_temporal:
+            if magnetic_pattern != density_pattern:
+                raise ValueError(
+                    f"Temporal masking requires identical patterns for Magnetic and Density within a sample, "
+                    f"got {magnetic_pattern!r} and {density_pattern!r}."
+                )
+            # Shared temporal mask across all four channels (Bx, By, Bz, Density)
+            count = (
+                magnetic_visible_counts[i]
+                if magnetic_visible_counts[i] is not None
+                else density_probe_counts[i]
+            )
+            temporal_small, temporal_info = _sample_modality_mask(
+                modality="shared_temporal",
+                pattern=magnetic_pattern,
+                T=T,
+                X=X,
+                Z=Z,
+                mask_fraction=magnetic_fraction,
+                generator=generator,
+                visible_count=count,
+            )
+            small = temporal_small.expand(1, 4, T, X, Z)
+            mask = small.to(device=device, dtype=dtype).contiguous()
+            actual_frac = float(1.0 - temporal_small.mean().item())
+            info = {
+                "magnetic_pattern": magnetic_pattern,
+                "density_pattern": density_pattern,
+                "magnetic_target_mask_fraction": magnetic_fraction,
+                "density_target_mask_fraction": density_fraction,
+                "magnetic_actual_mask_fraction": actual_frac,
+                "density_actual_mask_fraction": actual_frac,
+                "magnetic_visible_fraction": 1.0 - actual_frac,
+                "density_visible_fraction": 1.0 - actual_frac,
+                "actual_mask_fraction": actual_frac,
+            }
+            info.update({f"magnetic_{key}": value for key, value in temporal_info.items()})
+            info.update({f"density_{key}": value for key, value in temporal_info.items()})
+            info.update(temporal_info)
+            masks.append(mask)
+            infos.append(info)
+        elif not m_is_temporal and not d_is_temporal:
+            # Spatial masking: independent patterns, severities, and random layouts
+            magnetic_small, magnetic_info = _sample_modality_mask(
+                modality="magnetic",
+                pattern=magnetic_pattern,
+                T=T,
+                X=X,
+                Z=Z,
+                mask_fraction=magnetic_fraction,
+                generator=generator,
+                visible_count=magnetic_visible_counts[i],
+            )
+            density_small, density_info = _sample_modality_mask(
+                modality="density",
+                pattern=density_pattern,
+                T=T,
+                X=X,
+                Z=Z,
+                mask_fraction=density_fraction,
+                generator=generator,
+                visible_count=density_probe_counts[i],
+            )
+            magnetic_small = magnetic_small.expand(1, 3, T, X, Z)
+            density_small = density_small.expand(1, 1, T, X, Z)
+            small = torch.cat([magnetic_small, density_small], dim=1)
+            mask = small.to(device=device, dtype=dtype).contiguous()
 
-        magnetic_actual = float(1.0 - magnetic_small.mean().item())
-        density_actual = float(1.0 - density_small.mean().item())
-        info: Dict[str, Any] = {
-            "magnetic_pattern": magnetic_pattern,
-            "density_pattern": density_pattern,
-            "magnetic_target_mask_fraction": magnetic_fraction,
-            "density_target_mask_fraction": density_fraction,
-            "magnetic_actual_mask_fraction": magnetic_actual,
-            "density_actual_mask_fraction": density_actual,
-            "magnetic_visible_fraction": 1.0 - magnetic_actual,
-            "density_visible_fraction": 1.0 - density_actual,
-            "actual_mask_fraction": (3.0 * magnetic_actual + density_actual) / 4.0,
-        }
-        info.update(
-            {f"magnetic_{key}": value for key, value in magnetic_info.items()}
-        )
-        info.update(
-            {f"density_{key}": value for key, value in density_info.items()}
-        )
-        masks.append(mask)
-        infos.append(info)
+            magnetic_actual = float(1.0 - magnetic_small.mean().item())
+            density_actual = float(1.0 - density_small.mean().item())
+            info = {
+                "magnetic_pattern": magnetic_pattern,
+                "density_pattern": density_pattern,
+                "magnetic_target_mask_fraction": magnetic_fraction,
+                "density_target_mask_fraction": density_fraction,
+                "magnetic_actual_mask_fraction": magnetic_actual,
+                "density_actual_mask_fraction": density_actual,
+                "magnetic_visible_fraction": 1.0 - magnetic_actual,
+                "density_visible_fraction": 1.0 - density_actual,
+                "actual_mask_fraction": (3.0 * magnetic_actual + density_actual) / 4.0,
+            }
+            info.update(
+                {f"magnetic_{key}": value for key, value in magnetic_info.items()}
+            )
+            info.update(
+                {f"density_{key}": value for key, value in density_info.items()}
+            )
+            masks.append(mask)
+            infos.append(info)
+        else:
+            raise ValueError(
+                f"Sample {i} mixes spatial and temporal patterns: "
+                f"magnetic_pattern={magnetic_pattern!r} vs density_pattern={density_pattern!r}. "
+                "In v11, both modalities must use the same category (spatial or temporal)."
+            )
 
     return torch.cat(masks, dim=0), infos
 

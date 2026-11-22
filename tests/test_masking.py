@@ -16,7 +16,9 @@ from data.masking import (  # noqa: E402
     MASK_PATTERNS,
     SPATIAL_MASK_PATTERNS,
     TEMPORAL_MASK_PATTERNS,
+    _circular_temporal_block,
     _spatial_block_plane,
+    _temporal_block_frames,
     _temporal_block_from_boundaries,
     _temporal_block_from_visible_count,
     make_fixed_validation_mask,
@@ -26,9 +28,11 @@ from data.masking import (  # noqa: E402
     sample_independent_batch_masks,
     sample_mask,
     sample_patterns,
+    sample_training_patterns,
     sample_training_severity_counts,
     temporal_extrapolation_frames,
 )
+from train_masked_unet3d import sample_training_mask
 
 
 SHAPE = (2, 4, 8, 154, 62)
@@ -403,7 +407,7 @@ def test_independent_batch_masks_keep_b_shared_and_density_independent():
     assert torch.equal(mask[:, 0], mask[:, 1])
     assert torch.equal(mask[:, 1], mask[:, 2])
     assert not torch.equal(mask[0, 0], mask[0, 3])
-    assert not torch.equal(mask[1, 0], mask[1, 3])
+    assert torch.equal(mask[1, 0], mask[1, 3])
     assert infos[0]["magnetic_pattern"] == "spatial_block"
     assert infos[0]["density_pattern"] == "spatial_block"
     assert infos[0]["magnetic_rect_x0"] != infos[0]["density_rect_x0"] or (
@@ -411,24 +415,21 @@ def test_independent_batch_masks_keep_b_shared_and_density_independent():
     )
 
 
-def test_independent_batch_masks_mix_spatial_and_temporal_modalities():
+def test_independent_batch_masks_forbids_mixing_spatial_and_temporal_modalities():
     shape = (2, 4, 8, 20, 12)
-    mask, infos = sample_independent_batch_masks(
-        shape,
-        magnetic_patterns=["spatial_random", "temporal_block"],
-        density_patterns=["temporal_block", "spatial_grid"],
-        magnetic_mask_fractions=[0.4, 0.5],
-        density_mask_fractions=[0.5, 0.6],
-        generator=make_generator(19),
-    )
-
-    assert tuple(mask.shape) == shape
-    assert torch.equal(mask[:, 0], mask[:, 1])
-    assert torch.equal(mask[:, 1], mask[:, 2])
-    assert infos[0]["magnetic_pattern"] == "spatial_random"
-    assert infos[0]["density_pattern"] == "temporal_block"
-    assert infos[1]["magnetic_pattern"] == "temporal_block"
-    assert infos[1]["density_pattern"] == "spatial_grid"
+    try:
+        sample_independent_batch_masks(
+            shape,
+            magnetic_patterns=["spatial_random", "temporal_block"],
+            density_patterns=["temporal_block", "spatial_grid"],
+            magnetic_mask_fractions=[0.4, 0.5],
+            density_mask_fractions=[0.5, 0.6],
+            generator=make_generator(19),
+        )
+    except ValueError as exc:
+        assert "mixes spatial and temporal" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError when mixing spatial and temporal patterns in v11")
 
 
 def test_training_spatial_grid_uses_sparse_grid_for_magnetic_and_density():
@@ -600,17 +601,26 @@ def test_training_severity_keeps_block_and_temporal_count_semantics():
         for pattern, count in zip(patterns, counts)
         if pattern == "spatial_block"
     ]
-    temporal_counts = [
+    temporal_random_counts = [
         count
         for pattern, count in zip(patterns, counts)
-        if pattern in {"temporal_random", "temporal_block"}
+        if pattern == "temporal_random"
+    ]
+    temporal_block_counts = [
+        count
+        for pattern, count in zip(patterns, counts)
+        if pattern == "temporal_block"
     ]
 
     assert all(count is None for count in spatial_block_counts)
-    assert all(0 <= count <= time_steps for count in temporal_counts)
-    assert set(temporal_counts) == set(range(time_steps + 1))
-    mean_frames = sum(temporal_counts) / len(temporal_counts)
-    assert abs(mean_frames - time_steps / 2) < 0.3
+    assert all(0 <= count <= time_steps for count in temporal_random_counts)
+    assert set(temporal_random_counts) == set(range(time_steps + 1))
+    assert all(1 <= count <= time_steps - 1 for count in temporal_block_counts)
+    assert set(temporal_block_counts) == set(range(1, time_steps))
+    mean_random = sum(temporal_random_counts) / len(temporal_random_counts)
+    mean_block = sum(temporal_block_counts) / len(temporal_block_counts)
+    assert abs(mean_random - time_steps / 2) < 0.3
+    assert abs(mean_block - time_steps / 2) < 0.3
 
 
 def test_shared_spatial_block_and_temporal_block_paths_are_unchanged():
@@ -623,10 +633,9 @@ def test_shared_spatial_block_and_temporal_block_paths_are_unchanged():
         SHAPE, "temporal_block", 0.9, generator=make_generator(7)
     )
     assert torch.equal(a, b)
-    assert info_a["orientation"] == info_b["orientation"]
     assert info_a["start"] == info_b["start"]
     assert info_a["end"] == info_b["end"]
-    assert info_a["temporal_mode"] == "oriented_block"
+    assert info_a["temporal_mode"] == "circular_block"
 
     mask, info = sample_mask(
         SHAPE, "spatial_block", 0.35, generator=make_generator(5)
@@ -640,13 +649,17 @@ def test_shared_spatial_block_and_temporal_block_paths_are_unchanged():
     assert int(xs.max()) == info["rect_z0"] + info["rect_width"] - 1
 
 
-def test_training_temporal_block_from_visible_count_stays_oriented():
+def test_training_circular_temporal_block():
     tmask, info = _temporal_block_from_visible_count(
         16, 5, generator=make_generator(51)
     )
-    assert info["temporal_mode"] == "oriented_block"
+    assert info["temporal_mode"] == "circular_block"
     assert info["num_visible_frames"] == 5
+    assert info["n_visible"] == 5
+    assert info["n_masked"] == 11
     frames = tmask[0, 0, :, 0, 0]
+    assert int((frames == 1.0).sum()) == 5
+    assert int((frames == 0.0).sum()) == 11
     transitions = int(torch.count_nonzero(frames[1:] != frames[:-1]))
     assert transitions in {1, 2}
 
@@ -655,12 +668,14 @@ def test_training_temporal_block_from_visible_count_stays_oriented():
     )
     assert float(empty.mean()) == 0.0
     assert empty_info["num_visible_frames"] == 0
+    assert empty_info["num_masked_frames"] == 16
 
     full, full_info = _temporal_block_from_visible_count(
         16, 16, generator=make_generator(53)
     )
     assert float(full.mean()) == 1.0
     assert full_info["num_visible_frames"] == 16
+    assert full_info["num_masked_frames"] == 0
 
 
 def test_temporal_extrapolation_is_uniform_future_suffix_only():
@@ -677,33 +692,32 @@ def test_temporal_extrapolation_is_uniform_future_suffix_only():
         assert info["temporal_direction"] == "future"
     assert torch.all((counts > 850) & (counts < 1150)), counts
 
-    # The new helper does not alter the historical oriented temporal block.
-    old, old_info = _temporal_block_from_visible_count(
-        24, 7, generator=make_generator(99)
-    )
+    # Legacy boundary helper remains intact and produces oriented blocks.
+    old, old_info = _temporal_block_from_boundaries(24, 7, 14)
     assert old_info["temporal_mode"] == "oriented_block"
-    assert old_info["num_visible_frames"] == 7
-    assert int(old.sum()) == 7
+    assert old_info["num_visible_frames"] == 17
+    assert int(old.sum()) == 17
 
 
 def test_independent_masks_honor_training_temporal_visible_counts():
     mask, infos = sample_independent_batch_masks(
         (1, 4, 8, 10, 6),
-        magnetic_patterns=["temporal_random"],
+        magnetic_patterns=["temporal_block"],
         density_patterns=["temporal_block"],
         magnetic_mask_fractions=[0.5],
         density_mask_fractions=[0.5],
-        density_probe_counts=[3],
+        density_probe_counts=[5],
         magnetic_visible_counts=[5],
         generator=make_generator(60),
     )
 
     assert infos[0]["magnetic_num_visible_frames"] == 5
-    assert infos[0]["magnetic_temporal_direction"] == "scattered"
-    assert infos[0]["density_num_visible_frames"] == 3
-    assert infos[0]["density_temporal_mode"] == "oriented_block"
+    assert infos[0]["density_num_visible_frames"] == 5
+    assert infos[0]["magnetic_temporal_mode"] == "circular_block"
+    assert infos[0]["density_temporal_mode"] == "circular_block"
     assert int(mask[0, 0, :, 0, 0].sum()) == 5
-    assert int(mask[0, 3, :, 0, 0].sum()) == 3
+    assert int(mask[0, 3, :, 0, 0].sum()) == 5
+    assert torch.equal(mask[0, 0], mask[0, 3])
 
 
 def test_endpoint_probabilities_are_validated():
@@ -735,7 +749,7 @@ def _assert_spatial_block_orientation(plane, info, orientation):
 
 def test_training_spatial_block_samples_both_orientations_near_half():
     assert MASKING_VERSION == (
-        "independentBD_fiveMask_logUniformCounts_orientedSpatialBlock_v9"
+        "independentBD_fiveMask_logUniformCounts_orientedSpatialBlock_sharedTemporal_v11"
     )
     generator = make_generator(2026)
     n = 10000
@@ -899,7 +913,7 @@ def test_fixed_validation_masks_are_deterministic():
 
 def test_training_and_probe_validation_samplers_are_unchanged():
     assert MASKING_VERSION == (
-        "independentBD_fiveMask_logUniformCounts_orientedSpatialBlock_v9"
+        "independentBD_fiveMask_logUniformCounts_orientedSpatialBlock_sharedTemporal_v11"
     )
     random_a, _ = sample_mask(
         (1, 4, 8, 32, 16), "spatial_random", 0.5, generator=make_generator(3)
@@ -925,6 +939,273 @@ def test_training_and_probe_validation_samplers_are_unchanged():
         for seed in range(30)
     }
     assert origins == {"inside_masked", "inside_visible"}
+
+
+def test_circular_temporal_block_exhaustive_counts_and_starts():
+    T = 24
+    for n_vis in range(1, T):
+        n_masked = T - n_vis
+        for start in range(T):
+            tmask, info = _circular_temporal_block(T, n_vis, start=start)
+            assert tuple(tmask.shape) == (1, 1, T, 1, 1)
+            frames = tmask[0, 0, :, 0, 0]
+
+            # 1. Exactly n_visible observed frames
+            assert int((frames == 1.0).sum()) == n_vis
+            assert int((frames == 0.0).sum()) == n_masked
+            assert info["num_visible_frames"] == n_vis
+            assert info["num_masked_frames"] == n_masked
+            assert info["n_visible"] == n_vis
+            assert info["n_masked"] == n_masked
+            assert info["start"] == start
+            assert info["end"] == (start + n_masked) % T
+
+            # 2. Formula correctness
+            expected_masked = ((torch.arange(T) - start) % T) < n_masked
+            assert torch.equal(frames == 0.0, expected_masked)
+
+            # 3. Wraparound flag
+            expected_wrapped = (start + n_masked > T)
+            assert info["wrapped"] == expected_wrapped
+
+            # 4. Transitions
+            transitions = int(torch.count_nonzero(frames[1:] != frames[:-1]))
+            assert transitions in {1, 2}
+
+
+def test_circular_temporal_block_canonical_geometries():
+    T = 24
+
+    # Forward suffix (forecasting): past observed [0..n_vis-1], future masked [n_vis..T-1]
+    # Happens when start = n_vis
+    for n_vis in [4, 12, 20]:
+        tmask, info = _circular_temporal_block(T, n_vis, start=n_vis)
+        frames = tmask[0, 0, :, 0, 0]
+        assert torch.all(frames[:n_vis] == 1.0)
+        assert torch.all(frames[n_vis:] == 0.0)
+        assert not info["wrapped"]
+
+    # Backward prefix: future observed [n_masked..T-1], past masked [0..n_masked-1]
+    # Happens when start = 0
+    for n_vis in [4, 12, 20]:
+        tmask, info = _circular_temporal_block(T, n_vis, start=0)
+        frames = tmask[0, 0, :, 0, 0]
+        n_masked = T - n_vis
+        assert torch.all(frames[:n_masked] == 0.0)
+        assert torch.all(frames[n_masked:] == 1.0)
+        assert not info["wrapped"]
+
+    # Middle missing (unwrapped): masked inside [start, start + n_masked)
+    # start = 6, n_vis = 14 (n_masked = 10), start + n_masked = 16 <= 24
+    tmask, info = _circular_temporal_block(T, 14, start=6)
+    frames = tmask[0, 0, :, 0, 0]
+    assert torch.all(frames[:6] == 1.0)
+    assert torch.all(frames[6:16] == 0.0)
+    assert torch.all(frames[16:] == 1.0)
+    assert not info["wrapped"]
+
+    # Middle observed (wrapped): masked wraps around 24, leaving single contiguous block in middle
+    # start = 18, n_vis = 8 (n_masked = 16), start + n_masked = 34 > 24
+    # Masked: [18..24) and [0..10). Visible: [10..18)
+    tmask, info = _circular_temporal_block(T, 8, start=18)
+    frames = tmask[0, 0, :, 0, 0]
+    assert torch.all(frames[:10] == 0.0)
+    assert torch.all(frames[10:18] == 1.0)
+    assert torch.all(frames[18:] == 0.0)
+    assert info["wrapped"]
+
+    # Off-center: start = 1, n_vis = 20 (n_masked = 4)
+    # Masked in [1..5), visible in [0] and [5..24)
+    tmask, info = _circular_temporal_block(T, 20, start=1)
+    frames = tmask[0, 0, :, 0, 0]
+    assert frames[0] == 1.0
+    assert torch.all(frames[1:5] == 0.0)
+    assert torch.all(frames[5:] == 1.0)
+    assert not info["wrapped"]
+
+
+def test_circular_temporal_block_uniform_sampling():
+    # T = 6: n_vis in [1..5] (5 choices), start in [0..5] (6 choices) -> 30 joint states
+    T = 6
+    N = 60000
+    generator = make_generator(20261121)
+    joint_counts = torch.zeros(5, 6, dtype=torch.int64)
+    for _ in range(N):
+        _, info = _temporal_block_frames(T, generator=generator)
+        n_vis = info["n_visible"]
+        start = info["start"]
+        joint_counts[n_vis - 1, start] += 1
+
+    expected_joint = N / 30
+    assert torch.all(joint_counts > expected_joint - 5 * 45)
+    assert torch.all(joint_counts < expected_joint + 5 * 45)
+
+    vis_counts = joint_counts.sum(dim=1)
+    expected_vis = N / 5
+    assert torch.all(vis_counts > expected_vis - 5 * 100)
+    assert torch.all(vis_counts < expected_vis + 5 * 100)
+
+    start_counts = joint_counts.sum(dim=0)
+    expected_start = N / 6
+    assert torch.all(start_counts > expected_start - 5 * 95)
+    assert torch.all(start_counts < expected_start + 5 * 95)
+
+
+def test_circular_temporal_block_modality_sharing_and_channel_identity():
+    generator = make_generator(999)
+    masks, infos = sample_independent_batch_masks(
+        (8, 4, 24, 16, 16),
+        magnetic_patterns=["temporal_block"] * 8,
+        density_patterns=["temporal_block"] * 8,
+        magnetic_mask_fractions=[0.5] * 8,
+        density_mask_fractions=[0.5] * 8,
+        generator=generator,
+    )
+
+    for i in range(8):
+        # 1. All four channels (Bx, By, Bz, Density) strictly share the exact same mask
+        assert torch.equal(masks[i, 0], masks[i, 1])
+        assert torch.equal(masks[i, 1], masks[i, 2])
+        assert torch.equal(masks[i, 2], masks[i, 3])
+
+        # 2. Both modalities report circular_block and identical start
+        assert infos[i]["magnetic_temporal_mode"] == "circular_block"
+        assert infos[i]["density_temporal_mode"] == "circular_block"
+        assert infos[i]["magnetic_start"] == infos[i]["density_start"]
+        assert infos[i]["magnetic_num_visible_frames"] == infos[i]["density_num_visible_frames"]
+
+
+def test_temporal_masks_identical_across_all_four_channels():
+    for pattern in ["temporal_random", "temporal_block"]:
+        masks, infos = sample_independent_batch_masks(
+            (4, 4, 24, 16, 16),
+            magnetic_patterns=[pattern] * 4,
+            density_patterns=[pattern] * 4,
+            magnetic_mask_fractions=[0.5] * 4,
+            density_mask_fractions=[0.5] * 4,
+            generator=make_generator(42),
+        )
+        for i in range(4):
+            assert torch.equal(masks[i, 0], masks[i, 1])
+            assert torch.equal(masks[i, 1], masks[i, 2])
+            assert torch.equal(masks[i, 2], masks[i, 3])
+            assert infos[i]["magnetic_pattern"] == pattern
+            assert infos[i]["density_pattern"] == pattern
+            assert infos[i]["magnetic_actual_mask_fraction"] == infos[i]["density_actual_mask_fraction"]
+
+
+def test_temporal_random_and_temporal_block_never_mixed():
+    try:
+        sample_independent_batch_masks(
+            (1, 4, 24, 16, 16),
+            magnetic_patterns=["temporal_random"],
+            density_patterns=["temporal_block"],
+            magnetic_mask_fractions=[0.5],
+            density_mask_fractions=[0.5],
+        )
+    except ValueError as exc:
+        assert "identical patterns" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError when mixing temporal_random and temporal_block")
+
+
+def test_sample_training_patterns_never_mixes_categories():
+    generator = make_generator(12345)
+    mag_pats, den_pats = sample_training_patterns(DEFAULT_PATTERN_WEIGHTS, 20000, generator=generator)
+    for m, d in zip(mag_pats, den_pats):
+        m_temp = m in TEMPORAL_MASK_PATTERNS
+        d_temp = d in TEMPORAL_MASK_PATTERNS
+        assert m_temp == d_temp
+        if m_temp:
+            assert m == d
+
+
+def test_spatial_patterns_remain_independent_between_modalities():
+    generator = make_generator(54321)
+    masks, infos = sample_independent_batch_masks(
+        (10, 4, 8, 32, 24),
+        magnetic_patterns=["spatial_random"] * 10,
+        density_patterns=["spatial_grid"] * 10,
+        magnetic_mask_fractions=[0.5] * 10,
+        density_mask_fractions=[0.5] * 10,
+        generator=generator,
+    )
+    for i in range(10):
+        assert torch.equal(masks[i, 0], masks[i, 1])
+        assert torch.equal(masks[i, 1], masks[i, 2])
+        assert not torch.equal(masks[i, 0], masks[i, 3])
+        assert infos[i]["magnetic_pattern"] == "spatial_random"
+        assert infos[i]["density_pattern"] == "spatial_grid"
+
+
+def test_marginal_pattern_distribution_preserves_20_percent():
+    generator = make_generator(20261121)
+    N = 100000
+    mag_pats, den_pats = sample_training_patterns(DEFAULT_PATTERN_WEIGHTS, N, generator=generator)
+
+    mag_counts = {p: 0 for p in MASK_PATTERNS}
+    den_counts = {p: 0 for p in MASK_PATTERNS}
+    for m, d in zip(mag_pats, den_pats):
+        mag_counts[m] += 1
+        den_counts[d] += 1
+
+    expected = N / 5.0
+    for p in MASK_PATTERNS:
+        assert abs(mag_counts[p] - expected) < 650, (p, mag_counts[p])
+        assert abs(den_counts[p] - expected) < 650, (p, den_counts[p])
+
+
+def test_training_mask_sampling_ordinary_and_phase_c_reuse():
+    y = torch.randn(4, 4, 24, 16, 16)
+    pattern_weights = dict(DEFAULT_PATTERN_WEIGHTS)
+
+    mask, infos, mag_pats, den_pats, mag_fracs, den_fracs, mag_cnts, den_cnts = sample_training_mask(
+        y, pattern_weights, 0.4, 0.4, 0.4, 0.4
+    )
+    assert mask.shape == y.shape
+    assert len(infos) == 4
+    for i in range(4):
+        if mag_pats[i] in TEMPORAL_MASK_PATTERNS:
+            assert mag_pats[i] == den_pats[i]
+            assert torch.equal(mask[i, 0], mask[i, 1])
+            assert torch.equal(mask[i, 1], mask[i, 2])
+            assert torch.equal(mask[i, 2], mask[i, 3])
+        else:
+            assert mag_pats[i] in SPATIAL_MASK_PATTERNS
+            assert den_pats[i] in SPATIAL_MASK_PATTERNS
+            assert torch.equal(mask[i, 0], mask[i, 1])
+            assert torch.equal(mask[i, 1], mask[i, 2])
+
+    for _ in range(3):
+        reuse_mask, _, _, _, _, _, _, _ = sample_training_mask(
+            y, pattern_weights, 0.4, 0.4, 0.4, 0.4
+        )
+        assert reuse_mask.shape == y.shape
+
+
+def test_fixed_seed_reproducibility_and_masking_metadata():
+    y = torch.randn(2, 4, 24, 16, 16)
+    torch.manual_seed(9999)
+    mask1, infos1, _, _, _, _, _, _ = sample_training_mask(
+        y, dict(DEFAULT_PATTERN_WEIGHTS), 0.4, 0.4, 0.4, 0.4
+    )
+    torch.manual_seed(9999)
+    mask2, infos2, _, _, _, _, _, _ = sample_training_mask(
+        y, dict(DEFAULT_PATTERN_WEIGHTS), 0.4, 0.4, 0.4, 0.4
+    )
+    assert torch.equal(mask1, mask2)
+    assert infos1[0]["magnetic_pattern"] == infos2[0]["magnetic_pattern"]
+    assert infos1[0]["density_pattern"] == infos2[0]["density_pattern"]
+
+
+def test_circular_temporal_block_deterministic_reproducibility():
+    gen1 = make_generator(777)
+    gen2 = make_generator(777)
+    mask1, info1 = sample_mask((2, 4, 24, 8, 8), "temporal_block", 0.5, generator=gen1)
+    mask2, info2 = sample_mask((2, 4, 24, 8, 8), "temporal_block", 0.5, generator=gen2)
+    assert torch.equal(mask1, mask2)
+    assert info1["start"] == info2["start"]
+    assert info1["num_visible_frames"] == info2["num_visible_frames"]
 
 
 if __name__ == "__main__":
