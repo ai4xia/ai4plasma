@@ -248,6 +248,8 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--statistics-max-windows-per-run", type=int, default=None)
+    parser.add_argument("--statistics-max-runs", type=int, default=None,
+        help="Maximum held-out test runs to evaluate for statistical figures (default: None for all test runs).")
     parser.add_argument("--uq-sample-size", "--uq-voxels-per-window", dest="uq_voxels_per_window",
         type=int, default=20000,
         help="Deterministic bounded sample cap for per-run/task correlations (default: 20000).")
@@ -940,11 +942,14 @@ def collect_experiment_statistics(
         layout="C T X Z",
         return_metadata=True,
     )
+    val_runs = set(ctx["val_runs"])
+    if getattr(args, "statistics_max_runs", None):
+        val_runs = set(sorted(val_runs)[: int(args.statistics_max_runs)])
     indices = select_validation_statistics_indices(
         dataset=statistics_dataset,
-        val_runs=ctx["val_runs"],
+        val_runs=val_runs,
         window_stride=ctx["delta_t"],
-        max_windows_per_run=None,
+        max_windows_per_run=getattr(args, "statistics_max_windows_per_run", None),
     )
     collect_args = SimpleNamespace(extent=args.extent)
     stats = collect_validation_statistics(
@@ -1293,7 +1298,10 @@ def build_journal_statistics_cache(ctx: Dict, args: argparse.Namespace) -> Tuple
         raise RuntimeError("Journal uncertainty evaluation requires an uncertainty-aware checkpoint.")
     dataset = VPICWindowDataset(h5_dir=ctx["h5_dir"], betas=ctx["ckpt_args"].get("betas", [.2]),
         delta_t=ctx["delta_t"], stride_t=1, layout="C T X Z", return_metadata=True)
-    indices = select_validation_statistics_indices(dataset, set(ctx["val_runs"]), ctx["delta_t"], args.statistics_max_windows_per_run)
+    val_runs = set(ctx["val_runs"])
+    if getattr(args, "statistics_max_runs", None):
+        val_runs = set(sorted(val_runs)[: int(args.statistics_max_runs)])
+    indices = select_validation_statistics_indices(dataset, val_runs, ctx["delta_t"], args.statistics_max_windows_per_run)
     canonical = _journal_mask_rows(ctx, args)
     by_run: Dict[str, Dict[str, Dict]] = {}
     sample_limit = max(32, int(args.uq_voxels_per_window))
@@ -2842,6 +2850,7 @@ def main() -> None:
             signature = {**sig_base, "figure": "journal_statistics", "test_runs_only": True,
                 "uq_domain_version": 2,
                 "window_stride": 24, "max_windows_per_run": args.statistics_max_windows_per_run,
+                "max_runs": getattr(args, "statistics_max_runs", None),
                 "uq_voxels_per_window": int(args.uq_voxels_per_window)}
             journal_cache = load_or_build_figure_cache(
                 data_dir, "journal_statistics", signature,
@@ -2869,6 +2878,7 @@ def main() -> None:
             "shared_b_probe_layout": True,
             "layout": "1x2_density_jy",
             "b_visible_levels": list(DEFAULT_MAGNETIC_ABLATION_VISIBLE_PERCENTS),
+            "max_runs": getattr(args, "statistics_max_runs", None),
             **_jy_signature_fields(),
         }
 
@@ -2878,6 +2888,7 @@ def main() -> None:
             "figure": "forecast",
             "histories": default_density_forecast_visible_frames(24),
             "b_conditions": ["B_full", "B_hidden"],
+            "max_runs": getattr(args, "statistics_max_runs", None),
             **_jy_signature_fields(),
         }
 
@@ -2888,6 +2899,7 @@ def main() -> None:
             "probe_counts": [int(value) for value in args.density_probe_counts],
             "b_conditions": ["B_full", "B_hidden"],
             "line_style": "two_color_b_conditions",
+            "max_runs": getattr(args, "statistics_max_runs", None),
             **_jy_signature_fields(),
         }
 
