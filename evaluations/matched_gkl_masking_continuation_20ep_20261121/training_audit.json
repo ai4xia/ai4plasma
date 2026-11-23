@@ -1,0 +1,106 @@
+{
+  "experiments": {
+    "v9_control": {
+      "checkpoint": "/pscratch/sd/b/binxia/ai4plasma/runs/multi_beta_gkl_v9_control_20ep_20261121/final.pt",
+      "source_checkpoint": "/pscratch/sd/b/binxia/ai4plasma/runs/multi_beta_three_phase_gkl_joint_grad_globalcosine_256ep_20261119/final.pt",
+      "source_epoch": 256,
+      "final_epoch": 276,
+      "completed_epochs": 20,
+      "status": "COMPLETED",
+      "effective_learning_rate": 1e-05,
+      "curriculum_phase": "rollout_settled (Phase C)",
+      "lambda_v": 1.0,
+      "lambda_r": 1.0,
+      "uncertainty_loss": "generalized_kl",
+      "gradient_routing": {
+        "path_a": "ON",
+        "path_b": "ON",
+        "reuse_grad": "ON"
+      },
+      "masking_version": "independentBD_fiveMask_logUniformCounts_orientedSpatialBlock_v9",
+      "nonfinite_events": 0,
+      "amp_skipped_steps": 0.0,
+      "mean_epoch_wall_seconds": 222.57834649614816,
+      "total_wall_hours": 1.2365463694230452,
+      "final_train_mse": 0.01175073823491695,
+      "final_val_mse": 0.014927229098975658,
+      "final_val_gkl": 0.015665059071034194,
+      "final_val_per_pattern": {
+        "spatial_random": {
+          "mse": 0.0032378635369241238,
+          "generalized_kl": 0.0031909120734781027
+        },
+        "spatial_grid": {
+          "mse": 0.004072037059813738,
+          "generalized_kl": 0.0037074657157063484
+        },
+        "spatial_block": {
+          "mse": 0.038976628333330154,
+          "generalized_kl": 0.04309818521142006
+        },
+        "temporal_random": {
+          "mse": 0.0035817930474877357,
+          "generalized_kl": 0.003764026565477252
+        },
+        "temporal_block": {
+          "mse": 0.02476782351732254,
+          "generalized_kl": 0.024564705789089203
+        }
+      }
+    },
+    "v11_experiment": {
+      "checkpoint": "/pscratch/sd/b/binxia/ai4plasma/runs/multi_beta_gkl_v11_shared_temporal_20ep_20261121/final.pt",
+      "source_checkpoint": "/pscratch/sd/b/binxia/ai4plasma/runs/multi_beta_three_phase_gkl_joint_grad_globalcosine_256ep_20261119/final.pt",
+      "source_epoch": 256,
+      "final_epoch": 276,
+      "completed_epochs": 20,
+      "status": "COMPLETED",
+      "effective_learning_rate": 1e-05,
+      "curriculum_phase": "rollout_settled (Phase C)",
+      "lambda_v": 1.0,
+      "lambda_r": 1.0,
+      "uncertainty_loss": "generalized_kl",
+      "gradient_routing": {
+        "path_a": "ON",
+        "path_b": "ON",
+        "reuse_grad": "ON"
+      },
+      "masking_version": "independentBD_fiveMask_logUniformCounts_orientedSpatialBlock_sharedTemporal_v11",
+      "nonfinite_events": 0,
+      "amp_skipped_steps": 0.0,
+      "mean_epoch_wall_seconds": 222.9204289665533,
+      "total_wall_hours": 1.2384468275919627,
+      "final_train_mse": 0.01754869279513524,
+      "final_val_mse": 0.01411611600778997,
+      "final_val_gkl": 0.014824662264436484,
+      "final_val_per_pattern": {
+        "spatial_random": {
+          "mse": 0.003146564355120063,
+          "generalized_kl": 0.003026025602594018
+        },
+        "spatial_grid": {
+          "mse": 0.004200883209705353,
+          "generalized_kl": 0.003555125091224909
+        },
+        "spatial_block": {
+          "mse": 0.03744367137551308,
+          "generalized_kl": 0.04156423732638359
+        },
+        "temporal_random": {
+          "mse": 0.003390883095562458,
+          "generalized_kl": 0.0035725280176848173
+        },
+        "temporal_block": {
+          "mse": 0.022398578003048897,
+          "generalized_kl": 0.022405395284295082
+        }
+      }
+    }
+  },
+  "source_checkpoint": {
+    "checkpoint": "/pscratch/sd/b/binxia/ai4plasma/runs/multi_beta_three_phase_gkl_joint_grad_globalcosine_256ep_20261119/final.pt",
+    "epoch": 256,
+    "final_val_mse": 0.014945463044568896
+  },
+  "experimental_integrity_verified": true
+}
