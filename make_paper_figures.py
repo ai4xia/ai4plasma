@@ -23,6 +23,7 @@ import torch
 from matplotlib.lines import Line2D
 
 from data.vpic_hdf5_dataset import (
+    KNOWN_SHORT_TRAIN_RUNS,
     VPICWindowDataset,
     find_h5_files,
     fixed_split_metadata,
@@ -191,6 +192,13 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=["all"],
         choices=[*ALL_FIGURES, "all"],
+    )
+    parser.add_argument(
+        "--betas",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Explicit beta values to evaluate (default: None to use all betas in checkpoint).",
     )
     parser.add_argument("--t0", type=int, default=DEFAULT_T0)
     parser.add_argument("--global-frame", type=int, default=DEFAULT_GLOBAL_FRAME)
@@ -866,21 +874,42 @@ def load_inference_context(args: argparse.Namespace) -> Dict:
     stats = ckpt["stats"]
     h5_dir = expand_path(args.h5_dir or ckpt_args["h5_dir"])
     delta_t = int(ckpt_args.get("delta_t", ckpt_args.get("delta-t", 24)))
+    eval_betas = (
+        [float(b) for b in args.betas]
+        if getattr(args, "betas", None) is not None
+        else [float(b) for b in ckpt_args.get("betas", [0.2])]
+    )
     dataset = VPICWindowDataset(
         h5_dir=h5_dir,
-        betas=ckpt_args.get("betas", [0.2]),
+        betas=eval_betas,
         delta_t=delta_t,
         stride_t=int(ckpt_args.get("stride_t", ckpt_args.get("stride-t", 2))),
         layout="C T X Z",
         return_metadata=True,
     )
-    val_runs = get_test_runs()
+    all_test_runs = get_test_runs()
+    available_runs = (
+        {s[1] for s in getattr(dataset, "samples", [])}
+        or set(getattr(dataset, "run_file_indices", {}).keys())
+    )
+    val_runs = sorted(set(all_test_runs) & available_runs) if available_runs else all_test_runs
     train_runs = get_train_runs()
     mean = torch.tensor(stats["mean"], dtype=torch.float32, device=device).view(1, 4, 1, 1, 1)
     std = torch.tensor(stats["std"], dtype=torch.float32, device=device).view(1, 4, 1, 1, 1)
+    jy_dataset = dataset
+    missing_train = set(train_runs) - {s[1] for s in getattr(dataset, "samples", [])}
+    if missing_train and not missing_train <= KNOWN_SHORT_TRAIN_RUNS:
+        jy_dataset = VPICWindowDataset(
+            h5_dir=h5_dir,
+            betas=ckpt_args.get("betas", [0.2]),
+            delta_t=delta_t,
+            stride_t=int(ckpt_args.get("stride_t", ckpt_args.get("stride-t", 2))),
+            layout="C T X Z",
+            return_metadata=True,
+        )
     jy_stats = load_or_compute_jy_training_stats(
         run_dir=run_dir,
-        dataset=dataset,
+        dataset=jy_dataset,
         train_runs=train_runs,
         mean=mean,
         std=std,
@@ -914,6 +943,7 @@ def load_inference_context(args: argparse.Namespace) -> Dict:
         "model": model,
         "delta_t": delta_t,
         "h5_dir": h5_dir,
+        "betas": eval_betas,
     }
 
 
@@ -936,7 +966,7 @@ def collect_experiment_statistics(
 ) -> Dict[str, List[Dict]]:
     statistics_dataset = VPICWindowDataset(
         h5_dir=ctx["h5_dir"],
-        betas=ctx["ckpt_args"].get("betas", [0.2]),
+        betas=ctx.get("betas", ctx["ckpt_args"].get("betas", [0.2])),
         delta_t=ctx["delta_t"],
         stride_t=1,
         layout="C T X Z",
@@ -1296,7 +1326,7 @@ def build_journal_statistics_cache(ctx: Dict, args: argparse.Namespace) -> Tuple
         torch.cuda.manual_seed_all(int(args.seed))
     if not bool(ctx["ckpt_args"].get("uncertainty_aware", False)):
         raise RuntimeError("Journal uncertainty evaluation requires an uncertainty-aware checkpoint.")
-    dataset = VPICWindowDataset(h5_dir=ctx["h5_dir"], betas=ctx["ckpt_args"].get("betas", [.2]),
+    dataset = VPICWindowDataset(h5_dir=ctx["h5_dir"], betas=ctx.get("betas", ctx["ckpt_args"].get("betas", [.2])),
         delta_t=ctx["delta_t"], stride_t=1, layout="C T X Z", return_metadata=True)
     val_runs = set(ctx["val_runs"])
     if getattr(args, "statistics_max_runs", None):
@@ -2205,7 +2235,7 @@ def compute_sliding_aggregate_rmse(
     device = ctx["device"]
     mean = ctx["mean"].reshape(4, 1, 1, 1)
     std = ctx["std"].reshape(4, 1, 1, 1)
-    betas = ctx["ckpt_args"].get("betas", [0.2])
+    betas = ctx.get("betas", ctx["ckpt_args"].get("betas", [0.2]))
     window_size = int(ctx["delta_t"])
     frame_index = np.arange(int(n_frames), dtype=np.int32)
     b_keys = ("B_full", "B_hidden")
@@ -2315,7 +2345,7 @@ def reconstruct_sliding_qualitative(
     n_frames: int = SLIDING_AGGREGATE_N_FRAMES,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[int, np.ndarray], Dict]:
     """Canonical-run B-hidden reconstructions for the right-hand qualitative panel."""
-    betas = ctx["ckpt_args"].get("betas", [0.2])
+    betas = ctx.get("betas", ctx["ckpt_args"].get("betas", [0.2]))
     fields, frame_ids, h5_path = find_and_load_run(
         ctx["h5_dir"], betas, args.run_name
     )
@@ -2818,7 +2848,13 @@ def main() -> None:
         require_final=not bool(getattr(args, "allow_incomplete_checkpoint", False)),
     )
     checkpoint_header = torch.load(checkpoint_path, map_location="cpu", weights_only=False, mmap=True)
-    checkpoint_model_version = checkpoint_header.get("args", {}).get("model_version")
+    ckpt_args = checkpoint_header.get("args", {})
+    checkpoint_model_version = ckpt_args.get("model_version")
+    eval_betas = (
+        [float(b) for b in args.betas]
+        if getattr(args, "betas", None) is not None
+        else [float(b) for b in ckpt_args.get("betas", [0.2])]
+    )
     del checkpoint_header
     provenance = provenance_for_checkpoint(checkpoint_path, checkpoint_epoch)
     requested_output = getattr(args, "output_dir", None) or getattr(args, "paper_dir", None)
@@ -2834,6 +2870,7 @@ def main() -> None:
 
     sig_base = base_signature(args, run_dir, checkpoint_path)
     sig_base["model_version"] = checkpoint_model_version
+    sig_base["betas"] = eval_betas
     ctx: Dict | None = None
     figure_manifest: List[Dict] = []
     journal_cache: Tuple[Dict, Dict] | None = None
