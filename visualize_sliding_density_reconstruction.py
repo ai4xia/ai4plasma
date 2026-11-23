@@ -479,6 +479,9 @@ def reconstruct_with_slide_step(
     amp: bool,
     retain_state: bool = False,
     hide_magnetic: bool = False,
+    noise_seed: int | None = None,
+    overwrite_policy: str = "last_write",
+    track_overwrites: bool = False,
 ) -> Dict:
     """Run recursive reconstruction and retain a compact projection per update."""
     channels, run_length, size_x, size_z = target_normalized.shape
@@ -499,6 +502,23 @@ def reconstruct_with_slide_step(
     target_density_normalized = target_normalized[3].detach().cpu().numpy()
     snapshots = []
     covered_end = 0
+
+    first_write_raw_reconstruction = (
+        torch.full_like(raw_reconstruction, float("nan"))
+        if track_overwrites
+        else None
+    )
+    first_write_variance_state = (
+        torch.full_like(variance_state, float("nan"))
+        if (track_overwrites and uncertainty_aware)
+        else None
+    )
+    write_counts = (
+        torch.zeros(run_length, dtype=torch.int32, device=target_normalized.device)
+        if track_overwrites
+        else None
+    )
+    overwrite_events = [] if track_overwrites else None
 
     for update_index, start in enumerate(starts):
         valid_end = min(start + window_size, run_length)
@@ -544,8 +564,16 @@ def reconstruct_with_slide_step(
             input_variance[0, 3, :valid_length, probe_bool] = 0.0
             # Generate noise only for unknown slots. The binary availability
             # mask preserves reused fields exactly, regardless of their variance.
+            if noise_seed is not None:
+                g = torch.Generator(device=values.device)
+                g.manual_seed((int(noise_seed) + int(start) * 10007) & 0x7FFFFFFF)
+                noise = torch.randn(
+                    values.shape, generator=g, device=values.device, dtype=values.dtype
+                )
+            else:
+                noise = None
             model_input = torch.cat(
-                [make_uncertain_input(values, 1.0 - mask), input_variance], dim=1
+                [make_uncertain_input(values, 1.0 - mask, noise=noise), input_variance], dim=1
             )
         else:
             model_input = torch.cat([values * mask, mask], dim=1)
@@ -562,13 +590,71 @@ def reconstruct_with_slide_step(
         # figures and residual metrics. Use a separately clamped copy only as
         # pseudo-visible conditioning for later overlapping windows.
         raw_window = prediction[0, 3, :valid_length].float()
-        raw_reconstruction[start:valid_end] = raw_window
-        if uncertainty_aware:
-            variance_state[start:valid_end] = output_variance[0, 3, :valid_length].float()
-        conditioned_window = raw_window.clone()
-        conditioned_window[:, probe_bool] = density_target[:, probe_bool]
-        conditioning_reconstruction[start:valid_end] = conditioned_window
-        covered_end = max(covered_end, valid_end)
+        out_var_window = (
+            output_variance[0, 3, :valid_length].float()
+            if uncertainty_aware
+            else None
+        )
+
+        if track_overwrites:
+            hidden_voxels = ~probe_bool
+            for local_idx in range(valid_length):
+                gt = start + local_idx
+                if write_counts[gt] == 0:
+                    first_write_raw_reconstruction[gt] = raw_window[local_idx]
+                    if uncertainty_aware:
+                        first_write_variance_state[gt] = out_var_window[local_idx]
+                write_counts[gt] += 1
+
+                frame_target = density_target[local_idx]
+                frame_pred = raw_window[local_idx]
+                diff_sq = (frame_pred - frame_target) ** 2
+                e2_hidden = float(diff_sq[hidden_voxels].mean().item())
+                var_hidden = (
+                    float(out_var_window[local_idx][hidden_voxels].mean().item())
+                    if uncertainty_aware
+                    else 0.0
+                )
+                e2_full = float(diff_sq.mean().item())
+                var_full = (
+                    float(out_var_window[local_idx].mean().item())
+                    if uncertainty_aware
+                    else 0.0
+                )
+
+                overwrite_events.append(
+                    {
+                        "update_index": update_index,
+                        "window_start": start,
+                        "global_frame": gt,
+                        "local_frame": local_idx,
+                        "write_count": int(write_counts[gt].item()),
+                        "e2_hidden": e2_hidden,
+                        "var_hidden": var_hidden,
+                        "e2_full": e2_full,
+                        "var_full": var_full,
+                    }
+                )
+
+        if overwrite_policy == "frozen":
+            new_start = overlap_end
+            if new_start < valid_end:
+                offset = new_start - start
+                raw_reconstruction[new_start:valid_end] = raw_window[offset:]
+                if uncertainty_aware:
+                    variance_state[new_start:valid_end] = out_var_window[offset:]
+                conditioned_window = raw_window[offset:].clone()
+                conditioned_window[:, probe_bool] = density_target[offset:, probe_bool]
+                conditioning_reconstruction[new_start:valid_end] = conditioned_window
+            covered_end = max(covered_end, valid_end)
+        else:
+            raw_reconstruction[start:valid_end] = raw_window
+            if uncertainty_aware:
+                variance_state[start:valid_end] = out_var_window
+            conditioned_window = raw_window.clone()
+            conditioned_window[:, probe_bool] = density_target[:, probe_bool]
+            conditioning_reconstruction[start:valid_end] = conditioned_window
+            covered_end = max(covered_end, valid_end)
 
         raw_plot_tensor = convert_density_units(
             raw_reconstruction,
@@ -688,6 +774,23 @@ def reconstruct_with_slide_step(
             result["variance_state_normalized"] = variance_state.detach().clone()
     if uncertainty_aware:
         result["predicted_squared_error_normalized"] = variance_state.detach().cpu().numpy()
+    if track_overwrites:
+        first_write_plot = convert_density_units(
+            first_write_raw_reconstruction,
+            density_mean=density_mean,
+            density_std=density_std,
+            plot_units=plot_units,
+        ).detach().cpu().numpy()
+        result["first_write_reconstruction"] = first_write_plot
+        result["first_write_raw_normalized"] = (
+            first_write_raw_reconstruction.detach().cpu().numpy()
+        )
+        result["write_counts"] = write_counts.detach().cpu().numpy()
+        result["overwrite_events"] = overwrite_events
+        if uncertainty_aware:
+            result["first_write_squared_error_normalized"] = (
+                first_write_variance_state.detach().cpu().numpy()
+            )
     return result
 
 

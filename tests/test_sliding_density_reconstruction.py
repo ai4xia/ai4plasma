@@ -269,3 +269,92 @@ def test_bidirectional_rows_match_requested_six_experiments():
     assert "window_start" not in events[2]["snapshots"][0]
     assert "window_start" in events[2]["snapshots"][1]
     assert "synchronized window call=8/8" in events[-1]["label"]
+
+
+def test_sliding_overwrite_variants_and_tracking():
+    # Model that outputs: frame t in window -> prediction = model_input + 10.0
+    # and has uncertainty_aware = True
+    class UncertainTrackingModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.uncertainty_aware = True
+            self.inputs = []
+
+        def forward(self, x):
+            self.inputs.append(x.detach().clone())
+            batch, _channels, time, sx, sz = x.shape
+            pred = torch.zeros((batch, 4, time, sx, sz), device=x.device, dtype=x.dtype)
+            # prediction depends on whether slot was reused or unknown
+            pred[:, 3] = x[:, 3] + 1.0
+            var = torch.full((batch, 4, time, sx, sz), 0.25, device=x.device, dtype=x.dtype)
+            return pred, var
+
+    model_ab = UncertainTrackingModel()
+    target = torch.full((4, 6, 2, 2), 2.0)
+    probes = torch.zeros((2, 2))
+    probes[0, 0] = 1.0
+    mean_val = torch.tensor(0.0)
+    std_val = torch.tensor(1.0)
+
+    # Variant A & B: last_write with track_overwrites
+    res_ab = reconstruct_with_slide_step(
+        model=model_ab,
+        target_normalized=target,
+        target_density_plot=target[3].numpy(),
+        density_mean=mean_val,
+        density_std=std_val,
+        probe_mask=probes,
+        window_size=4,
+        slide_step=2,
+        plot_units="normalized",
+        x_index=None,
+        amp=False,
+        noise_seed=123,
+        overwrite_policy="last_write",
+        track_overwrites=True,
+    )
+
+    # Verify write counts:
+    # starts are [0, 2].
+    # window 0 covers frames 0, 1, 2, 3.
+    # window 1 covers frames 2, 3, 4, 5.
+    # So frames 0, 1 written 1 time. Frames 2, 3 written 2 times. Frames 4, 5 written 1 time.
+    write_counts = res_ab["write_counts"]
+    np.testing.assert_array_equal(write_counts, [1, 1, 2, 2, 1, 1])
+
+    # In Variant A (last-write), frames 2, 3 were overwritten by window 1.
+    # In Variant B (first-write), frames 2, 3 retain their window 0 values!
+    first_write = res_ab["first_write_raw_normalized"]
+    final_reconstruction = res_ab["final_reconstruction"]
+    # Check that for frames 0, 1: first-write == final
+    np.testing.assert_allclose(first_write[:2], final_reconstruction[:2])
+    # Check that for frames 2, 3: first-write differs from final (overwritten)
+    assert not np.allclose(first_write[2:4, 1, 1], final_reconstruction[2:4, 1, 1])
+
+    # Now run Variant C (frozen state) with same noise seed
+    model_c = UncertainTrackingModel()
+    res_c = reconstruct_with_slide_step(
+        model=model_c,
+        target_normalized=target,
+        target_density_plot=target[3].numpy(),
+        density_mean=mean_val,
+        density_std=std_val,
+        probe_mask=probes,
+        window_size=4,
+        slide_step=2,
+        plot_units="normalized",
+        x_index=None,
+        amp=False,
+        noise_seed=123,
+        overwrite_policy="frozen",
+        track_overwrites=True,
+    )
+
+    # In Variant C, frames 2, 3 in final reconstruction were NOT overwritten by window 1!
+    # They should match first_write!
+    final_c = res_c["final_reconstruction"]
+    np.testing.assert_allclose(final_c[2:4, 1, 1], first_write[2:4, 1, 1])
+
+    # Check paired noise: window 0 model inputs for genuinely unknown slots must be identical
+    torch.testing.assert_close(model_ab.inputs[0], model_c.inputs[0])
+
