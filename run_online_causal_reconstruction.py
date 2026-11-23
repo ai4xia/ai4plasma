@@ -51,7 +51,6 @@ from models.unet3d import UNet3D
 from visualize_sliding_density_reconstruction import (
     convert_density_units,
     framewise_rmse_mae,
-    nrmse_nmae,
     project_time_z,
     rmse_mae,
 )
@@ -249,7 +248,6 @@ def build_causal_window_input(
             # 2. Density component (channel 3)
             if tau == t:
                 # Current frame: genuine probes available, non-probes are unknown (noise)
-                # Keep noise where unobserved
                 values[0, 3, l, probe_bool] = target_normalized[3, tau, probe_bool]
                 input_variance[0, 3, l, probe_bool] = 0.0
                 # Non-probe slots remain noise and input_variance = 1.0
@@ -284,6 +282,8 @@ def reconstruct_online_causal(
       - Extract Density prediction and variance at local temporal index 23.
       - Save into history_pred[t] and history_var[t].
 
+    Uses torch.bfloat16 for GPU inference matching established v11 convention.
+
     Returns:
       pred_density_norm: [n_frames, H, W] normalized density predictions
       pred_var_norm: [n_frames, H, W] predicted normalized variance (squared error)
@@ -316,7 +316,11 @@ def reconstruct_online_causal(
             generator=g,
         )
 
-        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=(amp and device.type == "cuda")):
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
+            enabled=(amp and device.type == "cuda"),
+        ):
             prediction = model(model_input)
 
         if getattr(model, "uncertainty_aware", True):
@@ -373,32 +377,41 @@ def evaluate_run_online(
 
     pred_phys = pred_norm * float(std[3].item()) + float(mean[3].item())
 
-    # Overall metrics on hidden voxels
-    full_nrmse, _ = nrmse_nmae(pred_phys, target_density_plot, mask=hidden_mask)
+    # Full-field and hidden-voxel standardized errors
     e2_all = np.square(pred_norm - target_density_norm)
-    mean_e2 = float(np.mean(e2_all[:, hidden_mask]))
-    mean_var = float(np.mean(var_norm[:, hidden_mask]))
-    u_ratio = float(mean_var / (mean_e2 + 1e-12))
+    full_field_nrmse = float(np.sqrt(np.mean(e2_all)))
 
-    # Correlation on hidden voxels across entire rollout
-    e2_flat = e2_all[:, hidden_mask].ravel()
-    var_flat = var_norm[:, hidden_mask].ravel()
-    pear_r, spear_r = pearson_spearman(var_flat, e2_flat)
+    sel_hidden = np.broadcast_to(hidden_mask, pred_norm.shape)
+    e2_hidden_voxels = e2_all[sel_hidden]
+    var_hidden_voxels = var_norm[sel_hidden]
+
+    mean_e2_hidden = float(np.mean(e2_hidden_voxels))
+    hidden_voxel_nrmse = float(np.sqrt(mean_e2_hidden))
+    mean_var_hidden = float(np.mean(var_hidden_voxels))
+    u_ratio_hidden = float(mean_var_hidden / (mean_e2_hidden + 1e-12))
+
+    # Pearson & Spearman correlations on hidden voxels
+    corr_dict = pearson_spearman(var_hidden_voxels.ravel(), e2_hidden_voxels.ravel())
+    pear_r = float(corr_dict["pearson"])
+    spear_r = float(corr_dict["spearman"])
 
     # Framewise metrics
+    framewise_full_nrmse = []
+    framewise_hidden_nrmse = []
     framewise_e2_hidden = []
     framewise_var_hidden = []
-    framewise_nrmse = []
     framewise_u_ratio = []
     for t in range(n_frames):
-        fnrmse, _ = nrmse_nmae(pred_phys[t : t + 1], target_density_plot[t : t + 1], mask=hidden_mask)
-        e2_t = float(np.mean(e2_all[t, hidden_mask]))
-        var_t = float(np.mean(var_norm[t, hidden_mask]))
-        u_rat_t = float(var_t / (e2_t + 1e-12))
-        framewise_nrmse.append(float(fnrmse))
-        framewise_e2_hidden.append(e2_t)
-        framewise_var_hidden.append(var_t)
-        framewise_u_ratio.append(u_rat_t)
+        e2_full_t = np.mean(e2_all[t])
+        e2_hid_t = np.mean(e2_all[t][hidden_mask])
+        var_hid_t = np.mean(var_norm[t][hidden_mask])
+        u_rat_t = var_hid_t / (e2_hid_t + 1e-12)
+
+        framewise_full_nrmse.append(float(np.sqrt(e2_full_t)))
+        framewise_hidden_nrmse.append(float(np.sqrt(e2_hid_t)))
+        framewise_e2_hidden.append(float(e2_hid_t))
+        framewise_var_hidden.append(float(var_hid_t))
+        framewise_u_ratio.append(float(u_rat_t))
 
     # Partition into temporal regimes:
     # Cold start: frames 0-5
@@ -411,25 +424,33 @@ def evaluate_run_online(
     }
     regime_metrics = {}
     for reg_name, (r_start, r_end) in regimes.items():
-        reg_nrmse, _ = nrmse_nmae(pred_phys[r_start:r_end], target_density_plot[r_start:r_end], mask=hidden_mask)
-        reg_e2 = float(np.mean(e2_all[r_start:r_end, hidden_mask]))
-        reg_var = float(np.mean(var_norm[r_start:r_end, hidden_mask]))
-        reg_urat = float(reg_var / (reg_e2 + 1e-12))
+        sub_e2_all = e2_all[r_start:r_end]
+        sub_var = var_norm[r_start:r_end]
+        sub_sel = sel_hidden[r_start:r_end]
+
+        reg_full_nrmse = float(np.sqrt(np.mean(sub_e2_all)))
+        reg_e2_hid = float(np.mean(sub_e2_all[sub_sel]))
+        reg_hid_nrmse = float(np.sqrt(reg_e2_hid))
+        reg_var_hid = float(np.mean(sub_var[sub_sel]))
+        reg_urat = float(reg_var_hid / (reg_e2_hid + 1e-12))
         regime_metrics[reg_name] = {
-            "nrmse": float(reg_nrmse),
-            "mse_hidden": reg_e2,
-            "var_hidden": reg_var,
+            "density_nrmse_full": reg_full_nrmse,
+            "density_nrmse_hidden": reg_hid_nrmse,
+            "mse_hidden": reg_e2_hid,
+            "var_hidden": reg_var_hid,
             "u_ratio": reg_urat,
         }
 
     return {
-        "density_nrmse": float(full_nrmse),
-        "mean_e2_hidden": mean_e2,
-        "mean_var_hidden": mean_var,
-        "u_ratio_hidden": u_ratio,
-        "pearson_r": float(pear_r),
-        "spearman_r": float(spear_r),
-        "framewise_nrmse": framewise_nrmse,
+        "density_nrmse": full_field_nrmse,
+        "density_nrmse_hidden": hidden_voxel_nrmse,
+        "mean_e2_hidden": mean_e2_hidden,
+        "mean_var_hidden": mean_var_hidden,
+        "u_ratio_hidden": u_ratio_hidden,
+        "pearson_r": pear_r,
+        "spearman_r": spear_r,
+        "framewise_full_nrmse": framewise_full_nrmse,
+        "framewise_hidden_nrmse": framewise_hidden_nrmse,
         "framewise_e2_hidden": framewise_e2_hidden,
         "framewise_var_hidden": framewise_var_hidden,
         "framewise_u_ratio": framewise_u_ratio,
@@ -455,7 +476,7 @@ def generate_online_figures(
     fig, axes = plt.subplots(2, 2, figsize=(13, 9), sharex=True)
     for row_idx, cond in enumerate(["B_full", "B_hidden"]):
         sub = df_framewise[df_framewise["b_condition"] == cond]
-        grp = sub.groupby("global_frame")[["e2_hidden", "var_hidden", "density_nrmse"]].mean()
+        grp = sub.groupby("global_frame")[["e2_hidden", "var_hidden", "density_nrmse_hidden"]].mean()
 
         # Left: Framewise MSE (hidden)
         ax_err = axes[row_idx, 0]
@@ -486,40 +507,75 @@ def generate_online_figures(
     plt.close(fig)
 
     # Figure 2: Online Causal vs Offline Sliding Reconstruction
-    # (Explicitly distinguished information-availability protocol)
+    # (Explicitly matched on (run_name, b_condition), evaluating hidden-voxel RMSE)
     fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
     offline_data = None
     if offline_summary_path is not None and offline_summary_path.exists():
         try:
             offline_df = pd.read_csv(offline_summary_path)
-            # Find step=24 Variant A (authoritative offline baseline)
-            offline_data = offline_df[offline_df["step"] == 24]
+            # Select strictly step == 24 and variant == 'A'
+            offline_data = offline_df[(offline_df["step"] == 24) & (offline_df["variant"] == "A")]
         except Exception as e:
             print(f"Notice: Could not parse offline summary: {e}")
 
     for idx, cond in enumerate(["B_full", "B_hidden"]):
         ax = axes[idx]
-        online_sub = df_summary[df_summary["b_condition"] == cond]
-        online_nrmse = online_sub["density_nrmse"].values
-
-        x = np.arange(len(online_sub))
-        width = 0.35
-        ax.bar(x - width/2, online_nrmse, width, label="Online Causal (1 frame at a time)", color="#2ca02c", alpha=0.85)
+        online_sub = df_summary[df_summary["b_condition"] == cond].copy()
 
         if offline_data is not None:
-            off_sub = offline_data[offline_data["b_condition"] == cond]
-            if len(off_sub) == len(online_sub):
-                ax.bar(x + width/2, off_sub["density_nrmse"].values, width, label="Offline Window (24 frames initial context)", color="#1f77b4", alpha=0.85)
+            off_sub = offline_data[offline_data["b_condition"] == cond].copy()
+            # Explicit join by run_name to guarantee exact run-by-run pairing
+            merged = pd.merge(
+                online_sub,
+                off_sub,
+                on="run_name",
+                suffixes=("_online", "_offline"),
+                how="inner",
+            )
+            # Hidden-voxel RMSE: sqrt(mean_e2_hidden)
+            online_rmse = np.sqrt(merged["mean_e2_hidden_online"].values)
+            offline_rmse = np.sqrt(merged["mean_e2_hidden_offline"].values)
+            run_labels = [f"R{i+1}" for i in range(len(merged))]
+
+            x = np.arange(len(merged))
+            width = 0.35
+            ax.bar(
+                x - width / 2,
+                online_rmse,
+                width,
+                label="Online Causal Filter (1 frame/step, causal)",
+                color="#2ca02c",
+                alpha=0.85,
+            )
+            ax.bar(
+                x + width / 2,
+                offline_rmse,
+                width,
+                label="Offline Window (24 frames initial context)",
+                color="#1f77b4",
+                alpha=0.85,
+            )
+            ax.set_xticks(x)
+            ax.set_xticklabels(run_labels, fontsize=8)
+        else:
+            online_rmse = np.sqrt(online_sub["mean_e2_hidden"].values)
+            x = np.arange(len(online_sub))
+            ax.bar(x, online_rmse, 0.5, label="Online Causal Filter", color="#2ca02c", alpha=0.85)
+            ax.set_xticks(x)
+            ax.set_xticklabels([f"R{i+1}" for i in range(len(online_sub))], fontsize=8)
 
         ax.set_title(f"{cond}: Online Causal vs. Offline Protocol", fontsize=11)
-        ax.set_xlabel("Held-Out Simulation Run (10 runs)")
-        ax.set_ylabel("Density NRMSE")
-        ax.set_xticks(x)
-        ax.set_xticklabels([f"R{i+1}" for i in range(len(online_sub))], fontsize=8)
+        ax.set_xlabel("Held-Out Simulation Run")
+        ax.set_ylabel("Hidden-Voxel Density RMSE (Standardized)")
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8, loc="upper right")
 
-    fig.suptitle("Figure 2: Online Causal Filtering vs. Offline Sliding Protocol (Different Information Availability)", fontsize=12, y=0.98)
+    fig.suptitle(
+        "Figure 2: Online Causal Filtering vs. Offline Window Protocol\n"
+        "(Different Information Availability: Sequential Online Arrival vs. 24-Frame Initial Batch)",
+        fontsize=11,
+        y=0.98,
+    )
     fig.tight_layout()
     fig.savefig(figures_dir / "figure2_online_vs_offline_comparison.png", dpi=200)
     fig.savefig(figures_dir / "figure2_online_vs_offline_comparison.pdf")
@@ -548,8 +604,8 @@ def generate_online_figures(
 
     # Figure 4: B_full vs. B_hidden Online Reconstruction Direct Comparison
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    grp_bf = df_framewise[df_framewise["b_condition"] == "B_full"].groupby("global_frame")[["e2_hidden", "density_nrmse"]].mean()
-    grp_bh = df_framewise[df_framewise["b_condition"] == "B_hidden"].groupby("global_frame")[["e2_hidden", "density_nrmse"]].mean()
+    grp_bf = df_framewise[df_framewise["b_condition"] == "B_full"].groupby("global_frame")[["e2_hidden", "density_nrmse_hidden"]].mean()
+    grp_bh = df_framewise[df_framewise["b_condition"] == "B_hidden"].groupby("global_frame")[["e2_hidden", "density_nrmse_hidden"]].mean()
 
     # Left: MSE
     axes[0].plot(grp_bf.index, grp_bf["e2_hidden"], color=colors["B_full"], lw=2.2, label="B_full Online")
@@ -560,12 +616,12 @@ def generate_online_figures(
     axes[0].grid(True, alpha=0.3)
     axes[0].legend(fontsize=9)
 
-    # Right: NRMSE
-    axes[1].plot(grp_bf.index, grp_bf["density_nrmse"], color=colors["B_full"], lw=2.2, label="B_full Online")
-    axes[1].plot(grp_bh.index, grp_bh["density_nrmse"], color=colors["B_hidden"], lw=2.2, label="B_hidden Online")
-    axes[1].set_title("Framewise Density NRMSE", fontsize=11)
+    # Right: Hidden NRMSE
+    axes[1].plot(grp_bf.index, grp_bf["density_nrmse_hidden"], color=colors["B_full"], lw=2.2, label="B_full Online")
+    axes[1].plot(grp_bh.index, grp_bh["density_nrmse_hidden"], color=colors["B_hidden"], lw=2.2, label="B_hidden Online")
+    axes[1].set_title("Framewise Density NRMSE (Hidden Voxels)", fontsize=11)
     axes[1].set_xlabel("Global Time Step t")
-    axes[1].set_ylabel("Density NRMSE")
+    axes[1].set_ylabel("Density NRMSE (Hidden)")
     axes[1].grid(True, alpha=0.3)
     axes[1].legend(fontsize=9)
 
@@ -656,14 +712,19 @@ def main():
 
     for run_idx, run_name in enumerate(eligible_runs):
         print(f"\n--- [{run_idx + 1}/{len(eligible_runs)}] Run: {run_name} ---")
-        run_data, _ = find_and_load_run(args.h5_dir, args.betas, run_name, n_frames=args.n_frames)
-        run_tensor = torch.tensor(run_data, dtype=torch.float32, device=device)
+        # Existing HDF5 loading returns (fields, frame_ids, h5_path) where fields is (T, 4, X, Z)
+        fields, _frame_ids, _h5_path = find_and_load_run(args.h5_dir, args.betas, run_name)
+        fields = np.asarray(fields)[: args.n_frames]
+        # Transpose from (T, 4, X, Z) to (4, T, X, Z)
+        run_tensor = torch.from_numpy(np.transpose(fields, (1, 0, 2, 3))).to(
+            device=device, dtype=torch.float32
+        )
+        run_tensor_norm = (run_tensor - mean) / (std + 1e-8)
 
-        probe_mask_2d = sliding_density_probe_mask(
-            spatial_shape=(run_tensor.shape[2], run_tensor.shape[3]),
-            probe_count=args.density_probe_count,
-            seed=args.seed,
-            device=device,
+        # Standard sliding probe mask matching offline sliding evaluation
+        probe_mask_2d, _probe_info = sliding_density_probe_mask(
+            run_tensor_norm.unsqueeze(0),
+            int(args.density_probe_count),
         )
 
         for b_cond in b_conditions:
@@ -682,7 +743,8 @@ def main():
             )
 
             print(
-                f"  [{b_cond}] Density NRMSE: {res['density_nrmse']:.4f} | "
+                f"  [{b_cond}] Full NRMSE: {res['density_nrmse']:.4f} | "
+                f"Hidden NRMSE: {res['density_nrmse_hidden']:.4f} | "
                 f"MSE e²: {res['mean_e2_hidden']:.5f} | "
                 f"Var u: {res['mean_var_hidden']:.5f} | "
                 f"u/MSE: {res['u_ratio_hidden']:.4f} | "
@@ -693,6 +755,7 @@ def main():
                 "run_name": run_name,
                 "b_condition": b_cond,
                 "density_nrmse": res["density_nrmse"],
+                "density_nrmse_hidden": res["density_nrmse_hidden"],
                 "mean_e2_hidden": res["mean_e2_hidden"],
                 "mean_var_hidden": res["mean_var_hidden"],
                 "u_ratio_hidden": res["u_ratio_hidden"],
@@ -705,7 +768,8 @@ def main():
                     "run_name": run_name,
                     "b_condition": b_cond,
                     "global_frame": t,
-                    "density_nrmse": res["framewise_nrmse"][t],
+                    "density_nrmse": res["framewise_full_nrmse"][t],
+                    "density_nrmse_hidden": res["framewise_hidden_nrmse"][t],
                     "e2_hidden": res["framewise_e2_hidden"][t],
                     "var_hidden": res["framewise_var_hidden"][t],
                     "u_ratio_hidden": res["framewise_u_ratio"][t],
