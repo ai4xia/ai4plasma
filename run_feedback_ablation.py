@@ -72,8 +72,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("evaluations/physworld_v11_feedback_ablation_20261123"),
+        default=Path("evaluations/physworld_v11_history_value_uncertainty_ablation_20261123"),
         help="Output directory for ablation results.",
+    )
+    parser.add_argument(
+        "--strategies",
+        type=str,
+        nargs="+",
+        default=["A", "B", "C", "D", "E"],
+        choices=["A", "B", "C", "D", "E"],
+        help="Conditioning strategies to evaluate.",
     )
     parser.add_argument(
         "--h5-dir",
@@ -288,6 +296,14 @@ def build_feedback_ablation_input(
             # Oracle-history: ground truth Density with variance 0.0
             values[3, l] = window_target[3, l]
             input_variance[3, l] = 0.0
+        elif strategy == "D":
+            # Diagnostic control D: Ground truth Density with variance 1.0
+            values[3, l] = window_target[3, l]
+            input_variance[3, l] = 1.0
+        elif strategy == "E":
+            # Diagnostic control E: Gaussian noise with variance 0.0
+            values[3, l] = window_noise[3, l]
+            input_variance[3, l] = 0.0
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
 
@@ -401,17 +417,33 @@ def plot_feedback_figures(
     target_frame: int,
 ):
     colors = {"B_full": "#1f77b4", "B_hidden": "#d62728"}
-    strat_order = ["Strategy A (No-feedback)", "Strategy B (Prediction-feedback)", "Strategy C (Oracle-history)"]
-    strat_labels = {"A": strat_order[0], "B": strat_order[1], "C": strat_order[2]}
+    all_strats = ["A", "B", "C", "D", "E"]
+    active_strats = [s for s in all_strats if s in df_results["strategy"].unique()]
 
-    # Map strategy code to full label
+    strat_labels = {
+        "A": "Strategy A: Noise (u=1)",
+        "B": "Strategy B: Preds (u_hat)",
+        "C": "Strategy C: GT (u=0)",
+        "D": "Strategy D: GT (u=1)",
+        "E": "Strategy E: Noise (u=0)",
+    }
+    short_labels = {
+        "A": "A\n(Noise, u=1)",
+        "B": "B\n(Pred, u)",
+        "C": "C\n(GT, u=0)",
+        "D": "D\n(GT, u=1)",
+        "E": "E\n(Noise, u=0)",
+    }
+    strat_order = [strat_labels[s] for s in active_strats]
     df_results = df_results.copy()
     df_results["strategy_label"] = df_results["strategy"].map(strat_labels)
 
     # -------------------------------------------------------------
-    # Figure 1: Hidden-voxel MSE across A/B/C
+    # Figure 1: Hidden-voxel MSE across Strategies
     # -------------------------------------------------------------
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharey=True)
+    n_strats = len(active_strats)
+    fig_w = max(10, 2.2 * n_strats)
+    fig, axes = plt.subplots(1, 2, figsize=(fig_w, 5), sharey=True)
     for idx, cond in enumerate(["B_full", "B_hidden"]):
         ax = axes[idx]
         sub = df_results[df_results["b_condition"] == cond]
@@ -419,7 +451,7 @@ def plot_feedback_figures(
         runs = sub["run_name"].unique()
         for r in runs:
             r_sub = sub[sub["run_name"] == r].set_index("strategy_label").reindex(strat_order)
-            ax.plot(strat_order, r_sub["density_mse_hidden"], color="gray", alpha=0.4, lw=1.2, marker="o", markersize=4)
+            ax.plot(strat_order, r_sub["density_mse_hidden"], color="gray", alpha=0.35, lw=1.2, marker="o", markersize=4)
 
         mean_vals = [sub[sub["strategy_label"] == s]["density_mse_hidden"].mean() for s in strat_order]
         ax.plot(strat_order, mean_vals, color=colors[cond], lw=2.8, marker="s", markersize=8, label=f"Mean ({cond})")
@@ -427,13 +459,13 @@ def plot_feedback_figures(
         ax.set_title(f"{cond}: Hidden MSE Across Conditioning Strategies (F{target_frame})", fontsize=10)
         ax.set_ylabel("Standardized MSE (e² on Hidden Voxels)")
         ax.set_xticks(range(len(strat_order)))
-        ax.set_xticklabels(["A (No-fb)", "B (Pred-fb)", "C (Oracle)"], fontsize=9)
+        ax.set_xticklabels([short_labels[s] for s in active_strats], fontsize=9)
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=9, loc="upper right")
 
     fig.suptitle(
-        f"Figure 1: Matched-Noise Prediction-Feedback Ablation (Target Frame F{target_frame})\n"
-        "(Identical Window F1–F24, Target Position idx 23, and F24 Noise Realization)",
+        f"Figure 1: Historical Density vs. Uncertainty Ablation (Target Frame F{target_frame})\n"
+        "(Identical Window F1–F24, Target Position idx 23, and Matched F24 Noise Realization)",
         fontsize=11,
         y=0.98,
     )
@@ -445,7 +477,7 @@ def plot_feedback_figures(
     # -------------------------------------------------------------
     # Figure 2: Predicted Variance vs. Actual MSE (u/MSE)
     # -------------------------------------------------------------
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(fig_w, 5))
     for idx, cond in enumerate(["B_full", "B_hidden"]):
         ax = axes[idx]
         sub = df_results[df_results["b_condition"] == cond]
@@ -463,14 +495,14 @@ def plot_feedback_figures(
             ax.text(x[i], max(mean_mse[i], mean_var[i]) + 0.0002, f"u/MSE={ratio:.2f}", ha="center", fontsize=8)
 
         ax.set_xticks(x)
-        ax.set_xticklabels(["A (No-fb)", "B (Pred-fb)", "C (Oracle)"], fontsize=9)
+        ax.set_xticklabels([short_labels[s] for s in active_strats], fontsize=9)
         ax.set_title(f"{cond}: Uncertainty Calibration (F{target_frame})", fontsize=11)
         ax.set_ylabel("Standardized squared units")
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=9, loc="upper right")
 
     fig.suptitle(
-        f"Figure 2: Predicted Uncertainty vs. Reconstruction Error Across Strategies (F{target_frame})",
+        f"Figure 2: Predicted Uncertainty vs. Actual MSE Across Strategies (F{target_frame})",
         fontsize=11,
         y=0.98,
     )
@@ -480,20 +512,22 @@ def plot_feedback_figures(
     plt.close(fig)
 
     # -------------------------------------------------------------
-    # Figure 3: Representative Reconstruction Comparison (A/B/C)
+    # Figure 3: Representative Reconstruction Comparison
     # -------------------------------------------------------------
     if qualitative_cache is not None:
         target_p = qualitative_cache["target_phys"]
         preds = qualitative_cache["preds"]
 
-        fig, axes = plt.subplots(4, 2, figsize=(11, 10), sharex=True, sharey=True)
+        n_rows = 1 + len(active_strats)
+        fig, axes = plt.subplots(n_rows, 2, figsize=(11, 2.4 * n_rows), sharex=True, sharey=True)
         vmin, vmax = np.nanpercentile(target_p, [2, 98])
 
         res_limits = []
-        for s in ["A", "B", "C"]:
-            res = preds[s] - target_p
-            res_limits.append(max(abs(np.nanpercentile(res, 2)), abs(np.nanpercentile(res, 98))))
-        max_res = max(res_limits)
+        for s in active_strats:
+            if s in preds:
+                res = preds[s] - target_p
+                res_limits.append(max(abs(np.nanpercentile(res, 2)), abs(np.nanpercentile(res, 98))))
+        max_res = max(res_limits) if res_limits else 1.0
 
         # Row 0: Target
         im_tgt = axes[0, 0].imshow(target_p, origin="lower", aspect="auto", cmap="viridis", vmin=vmin, vmax=vmax)
@@ -502,26 +536,33 @@ def plot_feedback_figures(
         fig.colorbar(im_tgt, ax=axes[0, 0], fraction=0.046, pad=0.04)
         axes[0, 1].axis("off")
 
-        strat_names = {
-            "A": "Strategy A: No-feedback (u_hist=1)",
-            "B": "Strategy B: Pred-feedback (rho_hat, u_hat)",
-            "C": "Strategy C: Oracle-history (rho_true, u_hist=0)",
-        }
-
-        for r_idx, s in enumerate(["A", "B", "C"], start=1):
-            pred = preds[s]
+        for r_idx, s in enumerate(active_strats, start=1):
+            pred = preds.get(s, target_p)
             res = pred - target_p
 
             im_p = axes[r_idx, 0].imshow(pred, origin="lower", aspect="auto", cmap="viridis", vmin=vmin, vmax=vmax)
-            axes[r_idx, 0].set_title(f"Reconstruction: {strat_names[s]}", fontsize=9)
+            axes[r_idx, 0].set_title(f"Reconstruction: {strat_labels[s]}", fontsize=9)
             axes[r_idx, 0].set_ylabel("Z index")
             fig.colorbar(im_p, ax=axes[r_idx, 0], fraction=0.046, pad=0.04)
 
             im_r = axes[r_idx, 1].imshow(res, origin="lower", aspect="auto", cmap="coolwarm", vmin=-max_res, vmax=max_res)
-            axes[r_idx, 1].set_title(f"Residual: {strat_names[s]}", fontsize=9)
+            axes[r_idx, 1].set_title(f"Residual: {strat_labels[s]}", fontsize=9)
             fig.colorbar(im_r, ax=axes[r_idx, 1], fraction=0.046, pad=0.04)
 
-        axes[3, 0].set_xlabel("X index")
+        axes[-1, 0].set_xlabel("X index")
+        axes[-1, 1].set_xlabel("X index")
+
+        run_lbl = qualitative_cache.get("run_name", "Test Run")
+        fig.suptitle(
+            f"Figure 3: Representative Target F{target_frame} Reconstruction Across Strategies\n"
+            f"Run: {run_lbl} ({qualitative_cache.get('b_condition', 'B_full')}) — Matched F24 Noise Realization",
+            fontsize=11,
+            y=0.99,
+        )
+        fig.tight_layout()
+        fig.savefig(figures_dir / "figure3_representative_reconstruction_comparison.png", dpi=200)
+        fig.savefig(figures_dir / "figure3_representative_reconstruction_comparison.pdf")
+        plt.close(fig)
         axes[3, 1].set_xlabel("X index")
 
         run_lbl = qualitative_cache.get("run_name", "Test Run")
@@ -571,7 +612,15 @@ def main():
     print(f"Evaluating feedback ablation on F{args.target_frame} across {len(eligible_runs)} eligible runs: {eligible_runs}")
 
     b_conditions = ["B_full", "B_hidden"]
-    strategies = ["A", "B", "C"]
+    strategies = [s for s in ["A", "B", "C", "D", "E"] if s in args.strategies]
+
+    strat_labels = {
+        "A": "Noise, u=1",
+        "B": "Pred-fb",
+        "C": "Oracle (GT, u=0)",
+        "D": "Diag-D (GT, u=1)",
+        "E": "Diag-E (Noise, u=0)",
+    }
 
     results_rows = []
     qualitative_cache = None
@@ -604,18 +653,20 @@ def main():
             hide_magnetic = (b_cond == "B_hidden")
             run_preds = {}
 
-            # Execute preceding online causal rollout for Strategy B (frames 0..23)
-            print(f"  [{b_cond}] Computing online causal history rollout (F0–F23)...")
-            history_pred, history_var = run_online_history_rollout(
-                model=model,
-                target_normalized=run_tensor_norm,
-                probe_mask=probe_mask_2d,
-                global_noise=global_noise,
-                history_steps=args.target_frame,  # evaluates 0..23
-                window_size=24,
-                hide_magnetic=hide_magnetic,
-                amp=True,
-            )
+            history_pred, history_var = None, None
+            if "B" in strategies:
+                # Execute preceding online causal rollout for Strategy B (frames 0..23)
+                print(f"  [{b_cond}] Computing online causal history rollout (F0–F23)...")
+                history_pred, history_var = run_online_history_rollout(
+                    model=model,
+                    target_normalized=run_tensor_norm,
+                    probe_mask=probe_mask_2d,
+                    global_noise=global_noise,
+                    history_steps=args.target_frame,  # evaluates 0..23
+                    window_size=24,
+                    hide_magnetic=hide_magnetic,
+                    amp=True,
+                )
 
             for strat in strategies:
                 res = evaluate_feedback_strategy(
@@ -633,9 +684,9 @@ def main():
                     amp=True,
                 )
 
-                strat_label = {"A": "No-fb", "B": "Pred-fb", "C": "Oracle"}[strat]
+                label = strat_labels.get(strat, strat)
                 print(
-                    f"    [Strategy {strat} ({strat_label})] Hidden MSE: {res['density_mse_hidden']:.5f} | "
+                    f"    [Strategy {strat} ({label})] Hidden MSE: {res['density_mse_hidden']:.5f} | "
                     f"RMSE: {res['density_rmse_hidden']:.4f} | "
                     f"Var u: {res['mean_var_hidden']:.5f} | "
                     f"u/MSE: {res['u_ratio_hidden']:.3f} | "
@@ -670,40 +721,95 @@ def main():
     df_results.to_csv(data_dir / "feedback_results.csv", index=False)
     print(f"\nSaved results: {data_dir / 'feedback_results.csv'}")
 
-    # Generate paired comparison summary: B - A, C - A, B - C
+    # Generate paired comparisons across key scientific contrasts
+    # Specified pairs: A vs D, A vs E, C vs D, C vs E, B vs C, B vs A, C vs A
+    candidate_pairs = [
+        ("D", "A", "GT_vs_Noise_u1 (D - A)"),
+        ("E", "A", "u0_vs_u1_Noise (E - A)"),
+        ("D", "C", "u1_vs_u0_GT (D - C)"),
+        ("E", "C", "Noise_vs_GT_u0 (E - C)"),
+        ("B", "C", "Pred_vs_GT (B - C)"),
+        ("B", "A", "Pred_vs_Noise (B - A)"),
+        ("C", "A", "GT_vs_Noise (C - A)"),
+    ]
+
     paired_rows = []
+    summary_rows = []
+
     for b_cond in b_conditions:
         sub = df_results[df_results["b_condition"] == b_cond]
         p_mse = sub.pivot(index="run_name", columns="strategy", values="density_mse_hidden")
         p_rmse = sub.pivot(index="run_name", columns="strategy", values="density_rmse_hidden")
 
-        diff_mse_B_minus_A = p_mse["B"] - p_mse["A"]
-        diff_mse_C_minus_A = p_mse["C"] - p_mse["A"]
-        diff_mse_B_minus_C = p_mse["B"] - p_mse["C"]
-
-        diff_rmse_B_minus_A = p_rmse["B"] - p_rmse["A"]
-        diff_rmse_C_minus_A = p_rmse["C"] - p_rmse["A"]
-        diff_rmse_B_minus_C = p_rmse["B"] - p_rmse["C"]
+        # Per-strategy summary
+        for strat in strategies:
+            strat_mse = p_mse[strat]
+            strat_sub = sub[sub["strategy"] == strat]
+            summary_rows.append({
+                "b_condition": b_cond,
+                "strategy": strat,
+                "label": strat_labels.get(strat, strat),
+                "mean_hidden_mse": float(strat_mse.mean()),
+                "median_hidden_mse": float(strat_mse.median()),
+                "std_hidden_mse": float(strat_mse.std()),
+                "mean_predicted_var": float(strat_sub["mean_var_hidden"].mean()),
+                "mean_u_ratio": float(strat_sub["u_ratio_hidden"].mean()),
+            })
 
         for r in p_mse.index:
-            paired_rows.append({
+            row = {
                 "run_name": r,
                 "b_condition": b_cond,
                 "target_frame": args.target_frame,
-                "mse_A": p_mse.loc[r, "A"],
-                "mse_B": p_mse.loc[r, "B"],
-                "mse_C": p_mse.loc[r, "C"],
-                "diff_mse_B_minus_A": diff_mse_B_minus_A[r],
-                "diff_mse_C_minus_A": diff_mse_C_minus_A[r],
-                "diff_mse_B_minus_C": diff_mse_B_minus_C[r],
-                "diff_rmse_B_minus_A": diff_rmse_B_minus_A[r],
-                "diff_rmse_C_minus_A": diff_rmse_C_minus_A[r],
-                "diff_rmse_B_minus_C": diff_rmse_B_minus_C[r],
-            })
+            }
+            for strat in strategies:
+                row[f"mse_{strat}"] = p_mse.loc[r, strat]
+                row[f"rmse_{strat}"] = p_rmse.loc[r, strat]
+
+            for s1, s2, pair_key in candidate_pairs:
+                if s1 in p_mse.columns and s2 in p_mse.columns:
+                    diff_m = p_mse.loc[r, s1] - p_mse.loc[r, s2]
+                    ratio_m = p_mse.loc[r, s1] / (p_mse.loc[r, s2] + 1e-12)
+                    diff_r = p_rmse.loc[r, s1] - p_rmse.loc[r, s2]
+                    row[f"diff_mse_{s1}_minus_{s2}"] = diff_m
+                    row[f"ratio_mse_{s1}_to_{s2}"] = ratio_m
+                    row[f"diff_rmse_{s1}_minus_{s2}"] = diff_r
+
+            paired_rows.append(row)
 
     df_paired = pd.DataFrame(paired_rows)
     df_paired.to_csv(data_dir / "feedback_paired_comparisons.csv", index=False)
     print(f"Saved paired comparisons: {data_dir / 'feedback_paired_comparisons.csv'}")
+
+    df_summary = pd.DataFrame(summary_rows)
+    df_summary.to_csv(data_dir / "feedback_summary_table.csv", index=False)
+    print(f"Saved summary table: {data_dir / 'feedback_summary_table.csv'}")
+
+    # Print summary table to console
+    print("\n=== HISTORICAL DENSITY VS. UNCERTAINTY ABLATION SUMMARY ===")
+    for b_cond in b_conditions:
+        print(f"\nCondition: {b_cond}")
+        sub_sum = df_summary[df_summary["b_condition"] == b_cond]
+        for _, r in sub_sum.iterrows():
+            print(f"  Strategy {r['strategy']} ({r['label']}): "
+                  f"MSE Mean={r['mean_hidden_mse']:.5f}, Median={r['median_hidden_mse']:.5f} | "
+                  f"Var u={r['mean_predicted_var']:.5f} | u/MSE={r['mean_u_ratio']:.3f}")
+
+        # Pairwise comparison stats
+        sub_paired = df_paired[df_paired["b_condition"] == b_cond]
+        print(f"  Critical Pairwise Comparisons ({b_cond}):")
+        for s1, s2, desc in candidate_pairs:
+            col_diff = f"diff_mse_{s1}_minus_{s2}"
+            col_ratio = f"ratio_mse_{s1}_to_{s2}"
+            if col_diff in sub_paired.columns:
+                diffs = sub_paired[col_diff]
+                ratios = sub_paired[col_ratio]
+                n_better = int((diffs < 0).sum())
+                n_worse = int((diffs > 0).sum())
+                n_eq = int((diffs == 0).sum())
+                print(f"    {desc}: Mean Diff={diffs.mean():+.5f}, Median Diff={diffs.median():+.5f}, "
+                      f"Mean Ratio={ratios.mean():.3f}x | {s1}<{s2} (improves): {n_better}/{len(diffs)}, "
+                      f"{s1}>{s2} (deteriorates): {n_worse}/{len(diffs)}")
 
     # Generate Figures
     plot_feedback_figures(
@@ -715,7 +821,7 @@ def main():
 
     # Save Manifest
     manifest = {
-        "experiment": "matched_noise_prediction_feedback_ablation",
+        "experiment": "historical_density_vs_uncertainty_ablation",
         "checkpoint": str(args.run_dir / args.checkpoint),
         "split": str(args.split),
         "target_frame": args.target_frame,
@@ -723,13 +829,23 @@ def main():
         "n_runs": len(eligible_runs),
         "b_conditions": b_conditions,
         "strategies": {
-            "A": "No-feedback baseline (historical unobserved Density = Gaussian noise, u_in=1.0)",
-            "B": "Prediction-feedback (historical unobserved Density = prior online filtering rho_hat, u_in=u_hat)",
-            "C": "Oracle-history diagnostic (historical unobserved Density = true Density, u_in=0.0)",
+            "A": "Noise history with u=1.0",
+            "B": "Online prediction feedback with continuous u=u_hat",
+            "C": "Ground truth Density history with u=0.0",
+            "D": "Diagnostic D: Ground truth Density history with u=1.0",
+            "E": "Diagnostic E: Noise history with u=0.0",
         },
+        "critical_comparisons": [
+            "A vs D (Same u=1.0, different Density: Noise vs GT)",
+            "A vs E (Same Noise values, different u: 1.0 vs 0.0)",
+            "C vs D (Same GT values, different u: 0.0 vs 1.0)",
+            "C vs E (Same u=0.0, different Density: GT vs Noise)",
+            "B vs C (Prediction feedback vs Oracle history)",
+        ],
         "output_files": [
             str(data_dir / "feedback_results.csv"),
             str(data_dir / "feedback_paired_comparisons.csv"),
+            str(data_dir / "feedback_summary_table.csv"),
             str(figures_dir / "figure1_mse_across_feedback_strategies.png"),
             str(figures_dir / "figure2_predicted_variance_and_calibration.png"),
             str(figures_dir / "figure3_representative_reconstruction_comparison.png"),
@@ -737,7 +853,7 @@ def main():
     }
     with open(output_dir / "manifest.json", "w") as f:
         json.dump(manifest, f, indent=2)
-    print(f"Saved manifest: {output_dir / 'manifest.json'}")
+    print(f"\nSaved manifest: {output_dir / 'manifest.json'}")
 
 
 if __name__ == "__main__":
