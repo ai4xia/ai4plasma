@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
@@ -648,12 +648,19 @@ def denormalize(y: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch
     return y * (std + 1e-8) + mean
 
 
-def predict_masked_fields(model, target: torch.Tensor, mask: torch.Tensor):
+def predict_masked_fields(
+    model,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    noise: Optional[torch.Tensor] = None,
+):
     """Use the existing training input semantics, retaining deterministic behavior."""
     uncertainty_aware = bool(getattr(model, "uncertainty_aware", False))
     if uncertainty_aware:
         variance = 1.0 - mask
-        model_input = torch.cat([make_uncertain_input(target, variance), variance], dim=1)
+        if noise is not None and noise.shape != target.shape:
+            noise = noise.expand_as(target)
+        model_input = torch.cat([make_uncertain_input(target, variance, noise=noise), variance], dim=1)
     else:
         model_input = torch.cat([make_visible_input(target, mask), mask], dim=1)
     with torch.autocast(
@@ -2088,7 +2095,10 @@ def collect_validation_statistics(
             targets = target_normalized.expand(
                 len(canonical_experiment_rows), -1, -1, -1, -1
             )
-            predictions, _ = predict_masked_fields(model, targets, masks)
+            window_noise = torch.randn_like(target_normalized)
+            predictions, _ = predict_masked_fields(
+                model, targets, masks, noise=window_noise
+            )
             predictions = predictions.float().detach().cpu().numpy()
             for row_index, canonical_row in enumerate(canonical_experiment_rows):
                 row = collected[experiment_name][row_index]
@@ -3098,8 +3108,11 @@ def main():
         for experiment_name, mask_rows in experiment_mask_groups:
             rows_for_plot = []
             print(f"Running experiment: {experiment_name} ({len(mask_rows)} rows)")
+            sample_noise = torch.randn_like(y_norm)
             for short_name, label, mask in mask_rows:
-                pred_norm, output_variance = predict_masked_fields(model, y_norm, mask)
+                pred_norm, output_variance = predict_masked_fields(
+                    model, y_norm, mask, noise=sample_noise
+                )
 
                 if args.plot_units == "normalized":
                     pred_plot_tensor = pred_norm.detach()

@@ -695,7 +695,10 @@ def evaluate_windows(
             pattern_infos = infos
         stacked_mask = torch.cat(masks, dim=0)
         stacked_target = target_norm.expand(len(FIXED_VALIDATION_PATTERNS), -1, -1, -1, -1)
-        prediction, output_variance = predict_masked_fields(model, stacked_target, stacked_mask)
+        window_noise = torch.randn_like(target_norm)
+        prediction, output_variance = predict_masked_fields(
+            model, stacked_target, stacked_mask, noise=window_noise
+        )
         prediction = prediction.float()
         target_np = stacked_target[0].detach().cpu().numpy()
         pred_np = prediction.detach().cpu().numpy()

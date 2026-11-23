@@ -1013,9 +1013,12 @@ def build_spatial_qualitative_cache(ctx: Dict, args: argparse.Namespace) -> Tupl
         "target_density": np.asarray(target_plot[local_time], dtype=np.float32),
     }
     row_meta = []
+    sample_noise = torch.randn_like(y_norm)
     for name in SPATIAL_ROW_ORDER:
         _label, mask = by_name[name]
-        pred_norm, pred_variance = predict_masked_fields(ctx["model"], y_norm, mask)
+        pred_norm, pred_variance = predict_masked_fields(
+            ctx["model"], y_norm, mask, noise=sample_noise
+        )
         if pred_variance is None:
             raise RuntimeError("Journal uncertainty panels require an uncertainty-aware checkpoint.")
         pred_plot = denormalize(pred_norm, mean, std)
@@ -1301,9 +1304,12 @@ def build_journal_statistics_cache(ctx: Dict, args: argparse.Namespace) -> Tuple
         target_np = target_norm[0].cpu().numpy(); target_phys = target[0].cpu().numpy()
         target_jy = compute_jy(target_phys, args.extent)
         run = by_run.setdefault(run_name, {})
+        window_noise = torch.randn_like(target_norm)
         for row_index, row in enumerate(canonical):
             mask = torch.as_tensor(row["mask"], device=ctx["device"], dtype=target_norm.dtype).unsqueeze(0)
-            prediction, variance = predict_masked_fields(ctx["model"], target_norm, mask)
+            prediction, variance = predict_masked_fields(
+                ctx["model"], target_norm, mask, noise=window_noise
+            )
             pred = prediction[0].float().cpu().numpy(); var = variance[0].float().cpu().numpy()
             residual = pred - target_np; unknown = np.asarray(row["mask"]) < .5
             density_nrmse = float(np.sqrt(np.mean(residual[3] ** 2)))
