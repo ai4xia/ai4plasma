@@ -151,17 +151,21 @@ def load_model_and_stats(
     base_channels = int(args.get("base_channels", 24))
     use_attention = bool(args.get("use_attention", True))
     channel_mults = tuple(args.get("channel_mults", (1, 2, 4, 8)))
+    architecture = str(args.get("model_version", "direct_unet3d_no_activation_norm_v3"))
+    spatial_only_pooling = bool(args.get("spatial_only_pooling", True))
+    uncertainty_aware = bool(args.get("uncertainty_aware", True))
 
     model = UNet3D(
         in_channels=8,
         out_channels=4,
         base_channels=base_channels,
         channel_mults=channel_mults,
+        architecture=architecture,
         use_attention=use_attention,
-        dropout=0.0,
-        uncertainty_aware=True,
+        spatial_only_pooling=spatial_only_pooling,
+        uncertainty_aware=uncertainty_aware,
     )
-    model.load_state_dict(ckpt["model"])
+    model.load_state_dict(ckpt["model"], strict=True)
     model.to(device)
     model.eval()
 
