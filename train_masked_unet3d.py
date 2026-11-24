@@ -10,7 +10,7 @@ import os
 import random
 import time
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import AbstractSet, Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -2831,8 +2831,11 @@ def sample_sliding_window_pair(
     std: torch.Tensor,
     device: torch.device,
     generator: Optional[torch.Generator] = None,
+    allowed_runs: Optional[AbstractSet[str]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
     """Extract normalized (window_A, window_B) of shape (4, T, X, Z) from one physical run."""
+    if allowed_runs is not None and run_name not in allowed_runs:
+        raise ValueError(f"Run {run_name!r} is outside allowed split runs")
     physical = dataset.get_run(run_name).to(device, non_blocking=True)
     target = (physical - mean[0]) / (std[0] + 1e-8)
     length = int(target.shape[1])
@@ -3092,6 +3095,7 @@ def train_one_epoch(
     phase_d_sliding_curriculum: bool = False,
     dataset: Optional[Any] = None,
     slide_rng: Optional[torch.Generator] = None,
+    allowed_runs: Optional[AbstractSet[str]] = None,
 ) -> Dict[str, Any]:
     model.train()
     is_gkl = gkl_continuation_20ep or gkl_joint_grad_continuation_20ep
@@ -3196,6 +3200,7 @@ def train_one_epoch(
                     wa, wb, _, _ = sample_sliding_window_pair(
                         dataset, str(r_name), int(t0_h), step_slide,
                         int(y.shape[-3]), mean, std, device, generator=slide_rng,
+                        allowed_runs=allowed_runs,
                     )
                     pair_a.append(wa)
                     pair_b.append(wb)
@@ -3959,10 +3964,12 @@ def validate_sliding_windows(
     for s in slide_steps:
         s_int = int(s)
         mse_vals, u_vals = [], []
+        val_run_set = set(selected_runs)
         for run_idx, run_name in enumerate(selected_runs):
             try:
                 win_a, win_b, _, _ = sample_sliding_window_pair(
                     dataset, run_name, None, s_int, window_size, mean, std, device, generator=rng,
+                    allowed_runs=val_run_set,
                 )
             except ValueError:
                 continue
@@ -4133,6 +4140,28 @@ def build_epoch_wandb_log(
             "curriculum/convergence_segment_age": diagnostic["segment_age"],
             "curriculum/ready_for_phase_d": diagnostic["ready_for_phase_d"],
         })
+    if "sliding_curriculum" in row:
+        sc = row["sliding_curriculum"]
+        for key in (
+            "lambda_slide_start",
+            "lambda_slide_end",
+            "lambda_slide_mean",
+            "s_zero_fraction",
+            "s_positive_fraction",
+            "s_negative_fraction",
+            "abs_s_mean",
+        ):
+            if key in sc:
+                log_data[f"sliding_curriculum/{key}"] = sc[key]
+        for step, count in sc.get("s_counts", {}).items():
+            label = f"neg_{step[1:]}" if step.startswith("-") else f"pos_{step}"
+            if step == "0":
+                label = "zero"
+            log_data[f"sliding_curriculum/s_count/{label}"] = count
+    if "sliding_validation" in row:
+        for step_str, step_metrics in row["sliding_validation"].items():
+            for m_key, m_val in step_metrics.items():
+                log_data[f"val/slide_{step_str}/{m_key}"] = m_val
 
     return log_data
 
@@ -4873,7 +4902,8 @@ def main():
                 args, "gkl_masking_continuation_20ep", False,
             ),
             phase_d_sliding_curriculum=getattr(args, "phase_d_sliding_curriculum", False),
-            dataset=train_set,
+            dataset=dataset,
+            allowed_runs=set(train_runs),
         )
 
         rollout_validation = bool(
@@ -4909,7 +4939,7 @@ def main():
         if getattr(args, "phase_d_sliding_curriculum", False) and is_main_process():
             sliding_val_metrics = validate_sliding_windows(
                 model=(model.module if isinstance(model, DistributedDataParallel) else model),
-                dataset=val_set,
+                dataset=dataset,
                 val_runs=val_runs,
                 device=device,
                 mean=mean,
