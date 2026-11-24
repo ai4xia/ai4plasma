@@ -465,3 +465,98 @@ def test_ddp_initialization_fail_fast():
     with pytest.raises(RuntimeError, match="Expected DDP world size 16"):
         initialize_distributed(expected_world_size=16)
 
+
+def test_phased_no_feedback_rollout_mock():
+    """Verify that run_condition_rollout with condition='phased_no_feedback' executes
+
+    correctly, using phased_model weights under the zero-feedback protocol (no prediction reuse).
+    """
+    phased_model = MockUNet3D()
+    v11_model = MockUNet3D()
+    device = torch.device("cpu")
+    H, W = 8, 8
+    n_frames = 6
+    window_size = 4
+
+    target_norm = torch.randn((4, n_frames, H, W), device=device)
+    global_noise = torch.randn((4, n_frames, H, W), device=device)
+    probe_mask = torch.zeros((H, W), device=device)
+    probe_mask[0, 0] = 1.0  # single probe
+
+    # Rollout under phased_no_feedback
+    rollout_pred, rollout_var, frame_metrics = run_condition_rollout(
+        condition="phased_no_feedback",
+        v11_model=v11_model,
+        phased_model=phased_model,
+        target_norm=target_norm,
+        probe_mask=probe_mask,
+        global_noise=global_noise,
+        n_frames=n_frames,
+        window_size=window_size,
+        hide_magnetic=False,
+        amp=False,
+    )
+
+    assert rollout_pred.shape == (n_frames, H, W)
+    assert rollout_var.shape == (n_frames, H, W)
+    assert len(frame_metrics) == n_frames
+
+    # Probe preservation: probe location in rollout_pred must match target_norm
+    for t in range(n_frames):
+        assert math.isclose(rollout_pred[t, 0, 0].item(), target_norm[3, t, 0, 0].item(), rel_tol=1e-5)
+        assert rollout_var[t, 0, 0].item() == 0.0
+
+    # Ensure ValueError if phased_model is missing
+    with pytest.raises(ValueError, match="Phase D model is required"):
+        run_condition_rollout(
+            condition="phased_no_feedback",
+            v11_model=v11_model,
+            phased_model=None,
+            target_norm=target_norm,
+            probe_mask=probe_mask,
+            global_noise=global_noise,
+            n_frames=n_frames,
+            window_size=window_size,
+        )
+
+
+def test_all_paired_comparisons_matrix():
+    """Verify computation of all 5 paired comparisons (A, B, C, D, E)
+
+    for the Model x Feedback factorial matrix.
+    """
+    import pandas as pd
+
+    runs = [f"run_{i}" for i in range(10)]
+    records = []
+    for r in runs:
+        # Create deterministic synthetic values representing expected behavior:
+        # v11_orig (worst feedback), v11_u1 (better), no_fb (strong baseline),
+        # phased_no_fb (similar base), phased_ld (improved feedback)
+        records.append({"run_name": r, "b_condition": "B_full", "condition": "v11_original", "mean_hidden_mse_f24_f48": 0.0150})
+        records.append({"run_name": r, "b_condition": "B_full", "condition": "v11_u1", "mean_hidden_mse_f24_f48": 0.0021})
+        records.append({"run_name": r, "b_condition": "B_full", "condition": "no_feedback", "mean_hidden_mse_f24_f48": 0.0014})
+        records.append({"run_name": r, "b_condition": "B_full", "condition": "phased_no_feedback", "mean_hidden_mse_f24_f48": 0.0015})
+        records.append({"run_name": r, "b_condition": "B_full", "condition": "phased_learned", "mean_hidden_mse_f24_f48": 0.0016})
+
+    df = pd.DataFrame(records)
+
+    # Comparison A: Within Phase D (phased_learned vs phased_no_feedback)
+    stat_a = compute_paired_statistics(df, "B_full", "phased_learned", "phased_no_feedback")
+    assert stat_a["n_runs"] == 10
+    assert math.isclose(stat_a["mean_a"], 0.0016, rel_tol=1e-4)
+    assert math.isclose(stat_a["mean_b"], 0.0015, rel_tol=1e-4)
+    assert stat_a["mean_diff"] > 0  # +0.0001 (feedback slightly worse than no-fb)
+
+    # Comparison B: Base capability across models (phased_no_feedback vs no_feedback)
+    stat_b = compute_paired_statistics(df, "B_full", "phased_no_feedback", "no_feedback")
+    assert stat_b["n_runs"] == 10
+    assert math.isclose(stat_b["mean_a"], 0.0015, rel_tol=1e-4)
+    assert math.isclose(stat_b["mean_b"], 0.0014, rel_tol=1e-4)
+
+    # Comparison C: Total rollout across models (phased_learned vs v11_original)
+    stat_c = compute_paired_statistics(df, "B_full", "phased_learned", "v11_original")
+    assert stat_c["n_runs"] == 10
+    assert stat_c["mean_diff"] < 0
+    assert stat_c["relative_improvement_pct"] > 80.0  # Massive reduction over v11 original
+

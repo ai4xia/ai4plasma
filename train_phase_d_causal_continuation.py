@@ -46,6 +46,7 @@ from data.masking import (
     predicted_error_mse_loss,
 )
 from data.vpic_hdf5_dataset import (
+    fixed_split_sha256,
     load_fixed_split,
     VPICWindowDataset,
 )
@@ -969,6 +970,8 @@ def main():
         # Save checkpoint
         if is_main_process():
             unwrapped = model.module if hasattr(model, "module") else model
+            saved_args = dict(vars(args))
+            saved_args["final_epoch"] = args.epochs
             ckpt_state = {
                 "epoch": epoch,
                 "global_step": global_step,
@@ -976,7 +979,9 @@ def main():
                 "optimizer": optimizer.state_dict(),
                 "scaler": scaler.state_dict(),
                 "stats": {"mean": mean.squeeze().tolist(), "std": std.squeeze().tolist()},
-                "args": vars(args),
+                "args": saved_args,
+                "split_path": str(args.split),
+                "split_sha256": fixed_split_sha256(),
                 "history": history,
             }
             torch.save(ckpt_state, latest_ckpt_path)
