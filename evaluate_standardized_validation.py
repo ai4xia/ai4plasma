@@ -94,6 +94,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calibration-seed", type=int, default=1234)
     parser.add_argument("--fit-global-scale", action="store_true",
                         help="Fit one scale on half the selected runs per beta; assess the other half.")
+    parser.add_argument("--noise-seed", type=int, default=None,
+                        help="Optional fixed torch seed for input Gaussian noise in standardized 5-mask evaluation.")
     args = parser.parse_args()
     if args.calibration_runs_per_beta < 2 or min(
         args.calibration_windows_per_run, args.calibration_voxels_per_pattern,
@@ -879,6 +881,8 @@ def main() -> None:
             dataset.close()
             return
         sample_indices = select_val_window_indices(dataset, test_runs)
+        if args.noise_seed is not None:
+            torch.manual_seed(args.noise_seed)
         records, pattern_infos = evaluate_windows(
             model=model,
             dataset=dataset,

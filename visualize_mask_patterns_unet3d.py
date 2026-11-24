@@ -632,7 +632,7 @@ def load_checkpoint(run_dir: Path, checkpoint_name: str, device: torch.device, r
     if not ckpt_path.is_absolute():
         ckpt_path = run_dir / checkpoint_name
 
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     (validate_final_checkpoint if require_final else validate_checkpoint_split)(ckpt)
     print(f"Loaded checkpoint: {ckpt_path}")
     print(f"Checkpoint epoch: {ckpt.get('epoch', 'N/A')}")
