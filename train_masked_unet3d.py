@@ -502,11 +502,34 @@ def parse_args(argv=None):
             "and fully differentiable Phase C reuse."
         ),
     )
+    p.add_argument(
+        "--phase-d-sliding-curriculum",
+        action="store_true",
+        help=(
+            "Unified Phase C -> D bidirectional sliding-window curriculum: "
+            "extends settled Phase C (slide_step=0) continuously to slide_step in "
+            "{-24..24} via cosine lambda_slide with full differentiable reuse."
+        ),
+    )
+    p.add_argument(
+        "--slide-ramp-epochs",
+        type=float,
+        default=10.0,
+        help="Epochs over which lambda_slide ramps from 0 to 1 via cosine schedule.",
+    )
+    p.add_argument(
+        "--val-slide-steps",
+        type=int,
+        nargs="+",
+        default=[0, 1, -1, 12, -12],
+        help="Representative sliding steps evaluated on validation runs.",
+    )
 
     args = p.parse_args(argv)
     if args.differentiable_phase_c_reuse and not (
         args.gkl_joint_grad_continuation_20ep
         or args.gkl_masking_continuation_20ep
+        or args.phase_d_sliding_curriculum
         or (args.joint_nll_grad and args.uncertainty_loss in ("generalized_kl", "gkl"))
     ):
         p.error("--differentiable-phase-c-reuse requires fresh or continuation GKL A+B")
@@ -612,7 +635,7 @@ def parse_args(argv=None):
                 "--joint-nll-grad is for from-scratch training and cannot be "
                 "used with --post-final-continuation"
             )
-        if args.init_checkpoint is not None:
+        if args.init_checkpoint is not None and not args.phase_d_sliding_curriculum:
             p.error(
                 "--joint-nll-grad is for from-scratch training and cannot be "
                 "used with --init-checkpoint"
@@ -806,7 +829,7 @@ def parse_args(argv=None):
                 p.error(
                     f"global_cosine requires --final-epoch {args.epochs}"
                 )
-        elif args.curriculum_config == "three_phase_global_cosine":
+        elif args.curriculum_config == "three_phase_global_cosine" and not args.phase_d_sliding_curriculum:
             if (args.epochs, args.warmup_epochs) != (256, 5):
                 p.error(
                     "three_phase_global_cosine requires --epochs 256 "
@@ -869,6 +892,20 @@ def parse_args(argv=None):
             "--magnetic-visible-p-zero + --magnetic-visible-p-full must be <= 1, "
             f"got {args.magnetic_visible_p_zero} + {args.magnetic_visible_p_full}"
         )
+    if args.phase_d_sliding_curriculum:
+        if not args.curriculum_training or args.curriculum_config != "three_phase_global_cosine":
+            p.error("--phase-d-sliding-curriculum requires --curriculum-training --curriculum-config three_phase_global_cosine")
+        if not args.uncertainty_aware or args.uncertainty_loss not in ("generalized_kl", "gkl"):
+            p.error("--phase-d-sliding-curriculum requires --uncertainty-aware and --uncertainty-loss generalized_kl")
+        if not args.joint_nll_grad or not args.differentiable_phase_c_reuse or args.mean_only_phase_c_reuse:
+            p.error("--phase-d-sliding-curriculum requires --joint-nll-grad --differentiable-phase-c-reuse (full mean+var)")
+        if args.delta_t != 24:
+            p.error("--phase-d-sliding-curriculum requires --delta-t 24")
+        if not math.isfinite(args.slide_ramp_epochs) or args.slide_ramp_epochs <= 0:
+            p.error("--slide-ramp-epochs must be positive")
+        for s_val in args.val_slide_steps:
+            if not -args.delta_t <= int(s_val) <= args.delta_t:
+                p.error(f"Invalid validation slide step: {s_val}")
 
     return args
 
@@ -1802,10 +1839,56 @@ def make_curriculum_state(args, updates_per_epoch: int, checkpoint=None) -> Dict
         if checkpoint is None:
             raise ValueError("Ramp arming requires resuming an existing curriculum checkpoint")
         arm_curriculum_ramp(state, prefix)
+    if getattr(args, "phase_d_sliding_curriculum", False):
+        state["phase_d_sliding_curriculum"] = True
+        state["slide_ramp_start_step"] = 0
+        state["slide_ramp_steps"] = float(getattr(args, "slide_ramp_epochs", 10.0)) * updates_per_epoch
+        if not math.isfinite(state["slide_ramp_steps"]) or state["slide_ramp_steps"] <= 0:
+            raise ValueError("Sliding curriculum ramp duration must be positive")
+        if checkpoint is not None:
+            saved = checkpoint.get("curriculum_state", {})
+            if not saved.get("phase_d_sliding_curriculum", False):
+                raise ValueError("Cannot resume non-sliding checkpoint with --phase-d-sliding-curriculum")
+            if state["slide_ramp_steps"] != saved.get("slide_ramp_steps"):
+                raise ValueError(
+                    f"Sliding curriculum resume changed slide_ramp_steps: "
+                    f"{saved.get('slide_ramp_steps')!r} -> {state['slide_ramp_steps']!r}"
+                )
+            state["slide_ramp_start_step"] = int(saved.get("slide_ramp_start_step", 0))
     return state
 
 
+def slide_curriculum_weight(state: Dict[str, Any]) -> float:
+    """Cosine curriculum lambda_slide(p) = (1 - cos(pi * p)) / 2 in [0, 1]."""
+    if not state.get("phase_d_sliding_curriculum", False):
+        return 0.0
+    return cosine_continuation(
+        state["successful_optimizer_steps"],
+        state.get("slide_ramp_start_step", 0),
+        state["slide_ramp_steps"],
+    )
+
+
+def sample_slide_step(
+    lambda_slide: float,
+    window_size: int = 24,
+    generator: Optional[torch.Generator] = None,
+) -> int:
+    """Sample s in {-T..T} from P(s; p) = (1 - lambda_slide) * 1_{s=0} + lambda_slide / (2T + 1)."""
+    lambda_slide = float(lambda_slide)
+    if not 0.0 <= lambda_slide <= 1.0:
+        raise ValueError(f"lambda_slide must be in [0, 1], got {lambda_slide}")
+    if lambda_slide == 0.0:
+        return 0
+    u = float(torch.rand((), generator=generator).item())
+    if u < 1.0 - lambda_slide:
+        return 0
+    return int(torch.randint(-window_size, window_size + 1, (1,), generator=generator).item())
+
+
 def curriculum_weights(state: Dict[str, Any]) -> Tuple[float, float]:
+    if state.get("phase_d_sliding_curriculum", False):
+        return (1.0, 1.0)
     return tuple(cosine_continuation(state["successful_optimizer_steps"],
                                     state[f"{prefix}_ramp_start_step"], state[f"{prefix}_ramp_steps"])
                  if state.get(f"{prefix}_ramp_armed", state[f"{prefix}_ramp_start_step"] is not None) else 0.0
@@ -1813,6 +1896,8 @@ def curriculum_weights(state: Dict[str, Any]) -> Tuple[float, float]:
 
 
 def curriculum_is_complete(state: Dict[str, Any]) -> bool:
+    if state.get("phase_d_sliding_curriculum", False):
+        return True
     steps = state["successful_optimizer_steps"]
     ramps_complete = all(
         state[f"{prefix}_ramp_armed"]
@@ -2673,6 +2758,135 @@ def make_phase_c_reuse_input(
     return torch.cat([values, input_variance], dim=1), observation_mask
 
 
+def build_sliding_reuse_input(
+    target_b: torch.Tensor,
+    mask_b: torch.Tensor,
+    pred_a: torch.Tensor,
+    var_a: torch.Tensor,
+    slide_step: int,
+    *,
+    noise_b: Optional[torch.Tensor] = None,
+    reuse_gradient_scale: float = 1.0,
+    mean_only_phase_c_reuse: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Construct differentiable second-pass input for Window B with temporal shift `slide_step`.
+
+    When `slide_step == 0` and all targets are finite, delegates directly to
+    `make_phase_c_reuse_input` to guarantee exact mathematical and numerical equivalence
+    to settled Phase C.
+    """
+    window_size = int(target_b.shape[2])
+    if not -window_size <= slide_step <= window_size:
+        raise ValueError(f"Invalid slide_step {slide_step} for window_size={window_size}")
+
+    finite = torch.isfinite(target_b)
+    if slide_step == 0 and finite.all():
+        return make_phase_c_reuse_input(
+            target_b,
+            pred_a,
+            var_a,
+            mask_b,
+            reuse_gradient_scale=reuse_gradient_scale,
+            mean_only_phase_c_reuse=mean_only_phase_c_reuse,
+        )
+
+    def scale_gradient(value: torch.Tensor) -> torch.Tensor:
+        if reuse_gradient_scale == 1.0:
+            return value
+        detached = value.detach()
+        if reuse_gradient_scale == 0.0:
+            return detached
+        return detached + reuse_gradient_scale * (value - detached)
+
+    if noise_b is None:
+        noise_b = torch.randn_like(target_b)
+    values = noise_b.clone()
+    input_variance = torch.ones_like(target_b)
+
+    if abs(slide_step) < window_size:
+        curr_slice, prev_slice = PhaseDStreamingBatch.overlap_slices(slide_step, window_size)
+        reused_mean = scale_gradient(pred_a[:, :, prev_slice])
+        reused_var = (
+            var_a[:, :, prev_slice].detach()
+            if mean_only_phase_c_reuse
+            else scale_gradient(var_a[:, :, prev_slice])
+        )
+        values[:, :, curr_slice] = reused_mean
+        input_variance[:, :, curr_slice] = reused_var
+
+    exact = finite & (mask_b > 0.5)
+    values = torch.where(exact, target_b, values)
+    input_variance = torch.where(exact, torch.zeros_like(target_b), input_variance)
+    exact_mask = exact.to(mask_b.dtype) if not finite.all() else mask_b
+    return torch.cat([values, input_variance], dim=1), exact_mask
+
+
+def sample_sliding_window_pair(
+    dataset,
+    run_name: str,
+    t0_hint: Optional[int],
+    slide_step: int,
+    window_size: int,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    device: torch.device,
+    generator: Optional[torch.Generator] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+    """Extract normalized (window_A, window_B) of shape (4, T, X, Z) from one physical run."""
+    physical = dataset.get_run(run_name).to(device, non_blocking=True)
+    target = (physical - mean[0]) / (std[0] + 1e-8)
+    length = int(target.shape[1])
+    if length < window_size:
+        raise ValueError(f"Run {run_name} has length {length} < window_size={window_size}")
+
+    if slide_step == 0:
+        max_start = length - window_size
+        t_a = int(t0_hint) if (t0_hint is not None and 0 <= int(t0_hint) <= max_start) else int(
+            torch.randint(0, max_start + 1, (1,), generator=generator).item()
+        )
+        win_a = target[:, t_a:t_a + window_size]
+        return win_a, win_a, t_a, t_a
+
+    # Prefer pairs where both A and B are 100% finite physical windows
+    valid_full_starts = [
+        s_a for s_a in range(0, length - window_size + 1)
+        if 0 <= s_a + slide_step <= length - window_size
+    ]
+    if valid_full_starts:
+        if t0_hint is not None and int(t0_hint) in valid_full_starts:
+            t_a = int(t0_hint)
+        else:
+            idx = int(torch.randint(len(valid_full_starts), (1,), generator=generator).item())
+            t_a = valid_full_starts[idx]
+        t_b = t_a + slide_step
+        return target[:, t_a:t_a + window_size], target[:, t_b:t_b + window_size], t_a, t_b
+
+    # Fall back to established Phase-D boundary padding when length < window_size + |slide_step|
+    valid_padded_starts = [
+        s_a for s_a in range(0, length - window_size + 1)
+        if PhaseDStreamingBatch.can_advance_start(s_a, slide_step, length, window_size)
+    ]
+    if not valid_padded_starts:
+        raise ValueError(
+            f"Run {run_name} (length={length}) has no valid window pair for slide_step={slide_step}"
+        )
+    if t0_hint is not None and int(t0_hint) in valid_padded_starts:
+        t_a = int(t0_hint)
+    else:
+        idx = int(torch.randint(len(valid_padded_starts), (1,), generator=generator).item())
+        t_a = valid_padded_starts[idx]
+    t_b = t_a + slide_step
+
+    win_a = target[:, t_a:t_a + window_size]
+    win_b = target.new_full((4, window_size, target.shape[2], target.shape[3]), float("nan"))
+    src_start = max(t_b, 0)
+    src_end = min(t_b + window_size, length)
+    if src_start < src_end:
+        dst_start = src_start - t_b
+        win_b[:, dst_start:dst_start + src_end - src_start] = target[:, src_start:src_end]
+    return win_a, win_b, t_a, t_b
+
+
 def curriculum_forward_loss(
     model, model_input, target, mask, lambda_v, lambda_r, reuse_masks=None,
     uncertainty_loss="gaussian_nll", student_t_df=3.0,
@@ -2682,6 +2896,9 @@ def curriculum_forward_loss(
     gkl_alpha=None,
     reuse_gradient_scale=0.0,
     mean_only_phase_c_reuse=False,
+    slide_step: int = 0,
+    reuse_targets: Optional[Sequence[torch.Tensor]] = None,
+    reuse_noises: Optional[Sequence[torch.Tensor]] = None,
 ):
     """Phase A/B pass or Phase-C reuse for the selected curriculum."""
     three_phase = curriculum_config == "three_phase_global_cosine"
@@ -2748,27 +2965,42 @@ def curriculum_forward_loss(
             )
         previous_mean, previous_variance = pred, variance
         for pass_index, reuse_mask in enumerate(reuse_masks, 1):
-            reuse_input, exact_mask = make_phase_c_reuse_input(
-                target, previous_mean, previous_variance, reuse_mask,
+            reuse_target = (
+                reuse_targets[pass_index - 1]
+                if reuse_targets is not None
+                else target
+            )
+            reuse_noise = (
+                reuse_noises[pass_index - 1]
+                if reuse_noises is not None
+                else None
+            )
+            reuse_input, exact_mask = build_sliding_reuse_input(
+                reuse_target,
+                reuse_mask,
+                previous_mean,
+                previous_variance,
+                slide_step=slide_step,
+                noise_b=reuse_noise,
                 reuse_gradient_scale=reuse_gradient_scale,
                 mean_only_phase_c_reuse=mean_only_phase_c_reuse,
             )
             next_mean, next_variance = model(
                 reuse_input, detach_variance_features=detach_variance_features,
             )
-            next_mu_loss = full_mse_loss(next_mean, target, exact_mask)
+            next_mu_loss = full_mse_loss(next_mean, reuse_target, exact_mask)
             if gkl_alpha is not None and lambda_v > 0:
                 alpha = float(gkl_alpha)
                 next_l_st = (
                     predicted_error_mse_loss(
-                        next_variance, next_mean, target, "student_t_nll", student_t_df,
+                        next_variance, next_mean, reuse_target, "student_t_nll", student_t_df,
                         detach_mean=False,
                     )
                     if alpha < 1.0 else next_mu_loss.new_zeros(())
                 )
                 next_l_gkl = (
                     predicted_error_mse_loss(
-                        next_variance, next_mean, target, "generalized_kl", student_t_df,
+                        next_variance, next_mean, reuse_target, "generalized_kl", student_t_df,
                         detach_mean=detach_mean,
                     )
                     if alpha > 0.0 else next_mu_loss.new_zeros(())
@@ -2778,7 +3010,7 @@ def curriculum_forward_loss(
                 components[f"L_gkl_{pass_index}"] = next_l_gkl.detach()
             else:
                 next_var_loss = predicted_error_mse_loss(
-                    next_variance, next_mean, target, uncertainty_loss, student_t_df,
+                    next_variance, next_mean, reuse_target, uncertainty_loss, student_t_df,
                     detach_mean=detach_mean,
                 )
             check_stage1(
@@ -2857,6 +3089,9 @@ def train_one_epoch(
     differentiable_phase_c_reuse: bool = False,
     mean_only_phase_c_reuse: bool = False,
     student_t_unnormalized_control_20ep: bool = False,
+    phase_d_sliding_curriculum: bool = False,
+    dataset: Optional[Any] = None,
+    slide_rng: Optional[torch.Generator] = None,
 ) -> Dict[str, Any]:
     model.train()
     is_gkl = gkl_continuation_20ep or gkl_joint_grad_continuation_20ep
@@ -2910,6 +3145,17 @@ def train_one_epoch(
         if curriculum_state is None or not curriculum_is_complete(curriculum_state):
             raise ValueError("Stateful Phase D requires a complete curriculum")
         phase_d_stream.begin_epoch()
+    sliding_active = bool(phase_d_sliding_curriculum and curriculum_state is not None)
+    if sliding_active and dataset is None:
+        raise ValueError("Unified sliding-window Phase D requires dataset access")
+    if sliding_active and slide_rng is None:
+        rank = dist.get_rank() if distributed_is_initialized() else 0
+        slide_rng = torch.Generator().manual_seed(int(epoch_number) * 1009 + rank)
+    slide_counts = torch.zeros(49, device=device, dtype=torch.float64) if sliding_active else None
+    slide_lambda_sum = 0.0
+    slide_lambda_start = None
+    slide_lambda_end = None
+    slide_batch_count = 0
 
     def count_optimizer_step(_optimizer, _args, _kwargs):
         nonlocal applied_steps
@@ -2928,6 +3174,33 @@ def train_one_epoch(
         else:
             y = batch["block"].to(device, non_blocking=True)
             y = normalize(y, mean, std)
+
+        step_slide = 0
+        reuse_targets = None
+        if sliding_active:
+            lambda_slide = slide_curriculum_weight(curriculum_state)
+            slide_lambda_sum += lambda_slide
+            if slide_lambda_start is None:
+                slide_lambda_start = lambda_slide
+            slide_lambda_end = lambda_slide
+            slide_batch_count += 1
+            step_slide = sample_slide_step(
+                lambda_slide, window_size=int(y.shape[-3]), generator=slide_rng,
+            )
+            slide_counts[step_slide + int(y.shape[-3])] += 1
+            if step_slide != 0:
+                run_names = batch["metadata"]["run_name"]
+                t0_hints = batch["metadata"]["t0"]
+                pair_a, pair_b = [], []
+                for r_name, t0_h in zip(run_names, t0_hints):
+                    wa, wb, _, _ = sample_sliding_window_pair(
+                        dataset, str(r_name), int(t0_h), step_slide,
+                        int(y.shape[-3]), mean, std, device, generator=slide_rng,
+                    )
+                    pair_a.append(wa)
+                    pair_b.append(wb)
+                y = torch.stack(pair_a, dim=0)
+                reuse_targets = (torch.stack(pair_b, dim=0),)
         for beta in batch.get("metadata", {}).get("beta", []):
             key = str(float(beta))
             beta_sample_counts[key] = beta_sample_counts.get(key, 0) + 1
@@ -3046,6 +3319,8 @@ def train_one_epoch(
                     gkl_alpha=gkl_alpha,
                     reuse_gradient_scale=reuse_gradient_scale,
                     mean_only_phase_c_reuse=mean_only_phase_c_reuse,
+                    slide_step=step_slide,
+                    reuse_targets=reuse_targets,
                 )
                 reconstruction_loss = components["L_mu_0"]
                 variance_loss = components["L_var_0"]
@@ -3371,6 +3646,26 @@ def train_one_epoch(
                 str(step): int(values[10 + step + 24]) for step in range(-24, 25)
             },
         }
+    if sliding_active and slide_counts is not None:
+        if distributed_is_initialized():
+            dist.all_reduce(slide_counts, op=dist.ReduceOp.SUM)
+        counts_list = [int(c) for c in slide_counts.cpu().tolist()]
+        total_s = max(sum(counts_list), 1)
+        s_vals = list(range(-24, 25))
+        neg_cnt = sum(c for s, c in zip(s_vals, counts_list) if s < 0)
+        zero_cnt = counts_list[24]
+        pos_cnt = sum(c for s, c in zip(s_vals, counts_list) if s > 0)
+        abs_s_mean = sum(abs(s) * c for s, c in zip(s_vals, counts_list)) / total_s
+        metrics["sliding_curriculum"] = {
+            "lambda_slide_start": float(slide_lambda_start if slide_lambda_start is not None else 0.0),
+            "lambda_slide_end": float(slide_lambda_end if slide_lambda_end is not None else 0.0),
+            "lambda_slide_mean": float(slide_lambda_sum / max(slide_batch_count, 1)),
+            "s_zero_fraction": zero_cnt / total_s,
+            "s_positive_fraction": pos_cnt / total_s,
+            "s_negative_fraction": neg_cnt / total_s,
+            "abs_s_mean": abs_s_mean,
+            "s_counts": {str(s): c for s, c in zip(s_vals, counts_list)},
+        }
     if stage1:
         if distributed_is_initialized():
             dist.all_reduce(gradient_norm_sum, op=dist.ReduceOp.SUM)
@@ -3634,6 +3929,70 @@ def validate(
             np.concatenate([d["samples"] for d in combined.values()], axis=1))
 
     return metrics
+
+
+@torch.no_grad()
+def validate_sliding_windows(
+    model: torch.nn.Module,
+    dataset: Any,
+    val_runs: Sequence[str],
+    device: torch.device,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    slide_steps: Sequence[int] = (0, 1, -1, 12, -12),
+    window_size: int = 24,
+    pattern: str = "spatial_random",
+    amp: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
+    uncertainty_loss: str = "generalized_kl",
+    student_t_df: float = 3.0,
+    seed: int = 4321,
+    max_runs: int = 20,
+) -> Dict[str, Dict[str, float]]:
+    """Evaluate two-forward sliding reconstruction on validation runs."""
+    model.eval()
+    available = [r for r in sorted(val_runs) if r in getattr(dataset, "run_file_indices", {})]
+    selected_runs = available[:max_runs] if max_runs > 0 else available
+    rng = torch.Generator().manual_seed(int(seed))
+    results: Dict[str, Dict[str, float]] = {}
+
+    for s in slide_steps:
+        s_int = int(s)
+        mse_vals, u_vals = [], []
+        for run_idx, run_name in enumerate(selected_runs):
+            try:
+                win_a, win_b, _, _ = sample_sliding_window_pair(
+                    dataset, run_name, None, s_int, window_size, mean, std, device, generator=rng,
+                )
+            except ValueError:
+                continue
+            win_a_b = win_a.unsqueeze(0)
+            win_b_b = win_b.unsqueeze(0)
+            mask_a, _ = make_fixed_validation_mask(pattern, win_a_b.shape, device=device, dtype=win_a_b.dtype)
+            mask_b, _ = make_fixed_validation_mask(pattern, win_b_b.shape, device=device, dtype=win_b_b.dtype)
+            noise_a = torch.randn(win_a_b.shape, generator=rng, device="cpu", dtype=win_a_b.dtype).to(device)
+            noise_b = torch.randn(win_b_b.shape, generator=rng, device="cpu", dtype=win_b_b.dtype).to(device)
+            iv_a = 1.0 - mask_a
+            inp_a = torch.cat([torch.where(iv_a > 0.5, noise_a, win_a_b), iv_a], dim=1)
+            with torch.cuda.amp.autocast(enabled=(amp and device.type == "cuda"), dtype=amp_dtype):
+                pred_a, var_a = model(inp_a, detach_variance_features=True)
+                inp_b, exact_b = build_sliding_reuse_input(
+                    win_b_b, mask_b, pred_a, var_a, s_int,
+                    noise_b=noise_b, reuse_gradient_scale=0.0,
+                )
+                pred_b, var_b = model(inp_b, detach_variance_features=True)
+                mse_b = full_mse_loss(pred_b, win_b_b, exact_b)
+                u_b = predicted_error_mse_loss(
+                    var_b, pred_b, win_b_b, objective=uncertainty_loss, student_t_df=student_t_df,
+                )
+            mse_vals.append(float(mse_b.item()))
+            u_vals.append(float(u_b.item()))
+        results[str(s_int)] = {
+            "mse": float(np.mean(mse_vals)) if mse_vals else float("nan"),
+            uncertainty_loss: float(np.mean(u_vals)) if u_vals else float("nan"),
+            "n_runs": len(mse_vals),
+        }
+    return results
 
 
 def build_epoch_wandb_log(
@@ -4137,6 +4496,9 @@ def main():
     if resume_checkpoint is not None:
         stats = resume_checkpoint["stats"]
         rank_print("Reusing channel statistics from checkpoint")
+    elif getattr(args, "phase_d_sliding_curriculum", False) and init_checkpoint is not None:
+        stats = init_checkpoint["stats"]
+        rank_print("Reusing channel statistics from init checkpoint for Phase C -> D continuation")
     else:
         stats = None
         if is_main_process():
@@ -4510,6 +4872,8 @@ def main():
             gkl_masking_continuation_20ep=getattr(
                 args, "gkl_masking_continuation_20ep", False,
             ),
+            phase_d_sliding_curriculum=getattr(args, "phase_d_sliding_curriculum", False),
+            dataset=train_set,
         )
 
         rollout_validation = bool(
@@ -4517,6 +4881,7 @@ def main():
             and curriculum_is_complete(curriculum_state)
             and (
                 args.curriculum_config == "global_cosine"
+                or getattr(args, "phase_d_sliding_curriculum", False)
                 or (args.curriculum_config == "abcd_symmetric_lr"
                     and curriculum_state.get("phase_d_start_epoch") is None)
             )
@@ -4540,6 +4905,25 @@ def main():
             student_t_df=args.student_t_df,
             rollout_validation=rollout_validation,
         )
+        sliding_val_metrics = None
+        if getattr(args, "phase_d_sliding_curriculum", False) and is_main_process():
+            sliding_val_metrics = validate_sliding_windows(
+                model=(model.module if isinstance(model, DistributedDataParallel) else model),
+                dataset=val_set,
+                val_runs=val_runs,
+                device=device,
+                mean=mean,
+                std=std,
+                slide_steps=args.val_slide_steps,
+                window_size=args.delta_t,
+                amp=args.amp,
+                amp_dtype=getattr(torch, args.amp_dtype),
+                uncertainty_loss=args.uncertainty_loss,
+                student_t_df=args.student_t_df,
+                seed=args.val_mask_seed,
+            )
+        if distributed_is_initialized():
+            dist.barrier()
         validation_seconds = time.perf_counter() - validation_started
 
         row = {
@@ -4547,6 +4931,10 @@ def main():
             "learning_rate": epoch_lr,
             "train_mse": train_metrics["mse"],
             "val_mse": val_metrics["mean"]["mse"],
+            **({"sliding_curriculum": train_metrics["sliding_curriculum"]}
+               if "sliding_curriculum" in train_metrics else {}),
+            **({"sliding_validation": sliding_val_metrics}
+               if sliding_val_metrics is not None else {}),
             "train_mask_target_fraction": train_metrics["target_mask_fraction"],
             "train_mask_actual_fraction": train_metrics["actual_mask_fraction"],
             "train_density_probe_count": train_metrics[
