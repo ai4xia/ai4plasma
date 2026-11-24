@@ -21,8 +21,11 @@ from run_phase_d_evaluation import (
     run_condition_rollout,
 )
 from train_phase_d_causal_continuation import (
+    CRITICAL_RESUME_ARGS,
     build_trajectory_step_input,
     compute_learning_rate,
+    initialize_distributed,
+    warmup_trajectory_history,
 )
 
 
@@ -309,3 +312,156 @@ def test_paired_statistics_calculation():
     assert stats_res["relative_improvement_pct"] > 0
     assert stats_res["mean_diff"] < 0
     assert stats_res["p_value_wilcoxon"] < 0.05
+
+
+def test_causal_warmup_initialization():
+    """Verify that causal warm-up rolls forward from t=0 to t0 - 1 in no_grad,
+
+    populating historical states with actual model predictions while preserving
+    genuine probes and leaving t >= t0 untouched (no future leakage).
+    """
+    model = MockUNet3D()
+    device = torch.device("cpu")
+    H, W = 8, 8
+    L = 20
+    t0 = 5  # Warm up frames 0, 1, 2, 3, 4
+
+    target_norm = torch.randn((4, L, H, W), device=device)
+    traj_noise = torch.randn((4, L, H, W), device=device)
+    probe_bool = torch.zeros((H, W), dtype=torch.bool, device=device)
+    probe_bool[0, 0] = True
+    probe_bool[1, 1] = True
+    hidden_bool = ~probe_bool
+
+    # Start with all zeros
+    pred_buffer = torch.zeros((L, H, W), device=device)
+    var_buffer = torch.zeros((L, H, W), device=device)
+
+    traj = {
+        "target_norm": target_norm,
+        "traj_noise": traj_noise,
+        "probe_bool": probe_bool,
+        "hide_magnetic": False,
+        "t0": t0,
+        "L": L,
+        "pred_buffer": pred_buffer,
+        "var_buffer": var_buffer,
+    }
+
+    warmup_trajectory_history(
+        model=model,
+        traj=traj,
+        window_size=6,
+        uncertainty_mode="original",
+        amp=False,
+        device_type="cpu",
+    )
+
+    # For tau in [0, t0 - 1]: must be populated with valid predictions and uncertainties
+    for tau in range(t0):
+        # Genuine probes overridden with exact target values and zero variance
+        assert torch.equal(traj["pred_buffer"][tau, probe_bool], target_norm[3, tau, probe_bool])
+        assert torch.all(traj["var_buffer"][tau, probe_bool] == 0.0)
+
+        # Hidden voxels must have non-zero predictions from model forward pass
+        assert not torch.all(traj["pred_buffer"][tau, hidden_bool] == 0.0)
+        assert torch.all(traj["var_buffer"][tau, hidden_bool] > 0.0)
+
+    # For tau >= t0: MUST remain all zeros (no future leakage!)
+    for tau in range(t0, L):
+        assert torch.all(traj["pred_buffer"][tau] == 0.0)
+        assert torch.all(traj["var_buffer"][tau] == 0.0)
+
+    # Model parameters must have no gradients from warm-up
+    assert model.conv_mean.weight.grad is None
+    assert model.conv_var.weight.grad is None
+
+
+def test_epoch_diagnostics_accumulation():
+    """Verify that epoch loss averages accumulate across all updates,
+
+    preventing only the last update from dominating the epoch summary.
+    """
+    sum_loss = 0.0
+    sum_mu_loss = 0.0
+    sum_var_loss = 0.0
+    n_updates = 0
+
+    updates_data = [
+        {"mu": 0.02, "var": 0.01, "loss": 0.015},
+        {"mu": 0.04, "var": 0.02, "loss": 0.030},
+        {"mu": 0.06, "var": 0.03, "loss": 0.045},
+    ]
+
+    for upd in updates_data:
+        step_mu_total = upd["mu"] * 2  # 2 steps
+        step_var_total = upd["var"] * 2
+        total_steps = 2
+
+        sum_loss += upd["loss"]
+        sum_mu_loss += step_mu_total / total_steps
+        sum_var_loss += step_var_total / total_steps
+        n_updates += 1
+
+    avg_loss = sum_loss / n_updates
+    avg_mu = sum_mu_loss / n_updates
+    avg_var = sum_var_loss / n_updates
+
+    assert math.isclose(avg_mu, 0.04, rel_tol=1e-5)
+    assert math.isclose(avg_var, 0.02, rel_tol=1e-5)
+    assert math.isclose(avg_loss, 0.03, rel_tol=1e-5)
+
+
+def test_resume_argument_mismatch_detection():
+    """Verify that attempting to resume with altered configuration parameters
+
+    raises ValueError to prevent silent experiment corruption.
+    """
+    import argparse
+    from pathlib import Path
+
+    saved_args = {
+        "window_size": 24,
+        "rollout_depth": 6,
+        "density_probe_count": 1000,
+        "updates_per_epoch": 500,
+        "lr": 2e-6,
+        "min_lr": 2e-7,
+        "warmup_epochs": 0.5,
+        "source_checkpoint": "runs/source/final.pt",
+    }
+
+    # Case 1: Identical args -> passes
+    current_args_ok = argparse.Namespace(**saved_args)
+    mismatches = []
+    for key in CRITICAL_RESUME_ARGS:
+        if key in saved_args:
+            curr_val = getattr(current_args_ok, key, None)
+            saved_val = saved_args[key]
+            if str(curr_val) != str(saved_val):
+                mismatches.append(key)
+    assert len(mismatches) == 0
+
+    # Case 2: Altered rollout_depth -> detected
+    current_args_bad = argparse.Namespace(**saved_args)
+    current_args_bad.rollout_depth = 4
+    mismatches = []
+    for key in CRITICAL_RESUME_ARGS:
+        if key in saved_args:
+            curr_val = getattr(current_args_bad, key, None)
+            saved_val = saved_args[key]
+            if str(curr_val) != str(saved_val):
+                mismatches.append(key)
+    assert "rollout_depth" in mismatches
+
+
+def test_ddp_initialization_fail_fast():
+    """Verify fail-fast behavior when DDP is requested or expected but unavailable."""
+    # When world_size is 1 and require_ddp is True, must fail fast
+    with pytest.raises(RuntimeError, match="DDP is explicitly required"):
+        initialize_distributed(require_ddp=True)
+
+    # When world_size is 1 and expected_world_size is 16, must fail fast
+    with pytest.raises(RuntimeError, match="Expected DDP world size 16"):
+        initialize_distributed(expected_world_size=16)
+

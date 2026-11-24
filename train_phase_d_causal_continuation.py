@@ -64,24 +64,105 @@ def rank_print(*args, **kwargs) -> None:
         print(*args, **kwargs)
 
 
-def initialize_distributed() -> Tuple[torch.device, int, int, int]:
-    """Initialize torchrun DDP state, or fall back to single process."""
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+def initialize_distributed(
+    expected_world_size: int = 0,
+    require_ddp: bool = False,
+) -> Tuple[torch.device, int, int, int]:
+    """Initialize torchrun or Slurm DDP state, or fall back to single process.
+
+    Supports:
+      1. torchrun (via WORLD_SIZE, RANK, LOCAL_RANK, MASTER_ADDR, MASTER_PORT)
+      2. srun-native launch (via SLURM_NTASKS, SLURM_PROCID, SLURM_LOCALID)
+
+    Fails fast if DDP is required or expected world size is not met,
+    preventing silent fallback to uncoordinated single-GPU runs.
+    """
+    ws_env = os.environ.get("WORLD_SIZE") or os.environ.get("SLURM_NTASKS")
+    world_size = int(ws_env) if ws_env is not None else 1
+
+    rank_env = os.environ.get("RANK") or os.environ.get("SLURM_PROCID")
+    rank = int(rank_env) if rank_env is not None else 0
+
+    local_rank_env = os.environ.get("LOCAL_RANK") or os.environ.get("SLURM_LOCALID")
+    local_rank = int(local_rank_env) if local_rank_env is not None else 0
+
     distributed = world_size > 1
 
     if distributed:
         if not torch.cuda.is_available():
-            raise RuntimeError("Multi-process DDP requires CUDA/NCCL GPUs.")
-        local_rank = int(os.environ["LOCAL_RANK"])
+            raise RuntimeError(f"Multi-process DDP (world_size={world_size}) requires CUDA GPUs.")
+        if torch.cuda.device_count() <= local_rank:
+            raise RuntimeError(
+                f"Device local_rank {local_rank} out of bounds for CUDA device count {torch.cuda.device_count()}."
+            )
+
+        # Configure rendezvous host/port if under Slurm and not already exported
+        if "MASTER_ADDR" not in os.environ:
+            if "SLURM_JOB_NODELIST" in os.environ:
+                try:
+                    import subprocess
+                    cmd = f"scontrol show hostnames '{os.environ['SLURM_JOB_NODELIST']}' | head -n 1"
+                    host = subprocess.check_output(cmd, shell=True).decode().strip()
+                    if host:
+                        os.environ["MASTER_ADDR"] = host
+                except Exception:
+                    pass
+            if "MASTER_ADDR" not in os.environ and "SLURM_LAUNCH_NODE_IPADDR" in os.environ:
+                os.environ["MASTER_ADDR"] = os.environ["SLURM_LAUNCH_NODE_IPADDR"]
+
+        if "MASTER_ADDR" not in os.environ:
+            raise RuntimeError(
+                "DDP initialization failed: MASTER_ADDR is not set in environment and cannot be deduced. "
+                "Ensure MASTER_ADDR and MASTER_PORT are exported before srun."
+            )
+
+        if "MASTER_PORT" not in os.environ:
+            slurm_job_id = os.environ.get("SLURM_JOB_ID", "29500")
+            job_num = "".join(filter(str.isdigit, slurm_job_id)) or "29500"
+            os.environ["MASTER_PORT"] = str(10000 + int(job_num) % 50000)
+
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl", init_method="env://")
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
         device = torch.device("cuda", local_rank)
+
+        os.environ["RANK"] = str(rank)
+        os.environ["WORLD_SIZE"] = str(world_size)
+        os.environ["LOCAL_RANK"] = str(local_rank)
+
+        try:
+            dist.init_process_group(
+                backend="nccl",
+                init_method="env://",
+                rank=rank,
+                world_size=world_size,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to initialize NCCL process group (rank={rank}, world_size={world_size}, "
+                f"master={os.environ.get('MASTER_ADDR')}:{os.environ.get('MASTER_PORT')}): {e}"
+            ) from e
+
+        actual_ws = dist.get_world_size()
+        actual_rank = dist.get_rank()
+        if actual_ws != world_size:
+            raise RuntimeError(f"DDP world size mismatch: expected {world_size}, initialized {actual_ws}")
+        world_size = actual_ws
+        rank = actual_rank
     else:
+        if require_ddp:
+            raise RuntimeError("DDP is explicitly required (--require-ddp), but world_size == 1. Refusing to run.")
+        if expected_world_size > 1:
+            raise RuntimeError(
+                f"Expected DDP world size {expected_world_size}, but detected world_size={world_size}. "
+                f"Refusing silent fallback to uncoordinated single-GPU execution."
+            )
         rank = 0
         local_rank = 0
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if expected_world_size > 0 and world_size != expected_world_size:
+        raise RuntimeError(
+            f"DDP world size mismatch: --expected-world-size={expected_world_size}, but actual world_size={world_size}."
+        )
 
     return device, rank, world_size, local_rank
 
@@ -211,7 +292,31 @@ def parse_args() -> argparse.Namespace:
         default=10,
         help="Number of validation runs evaluated per epoch (default: 10).",
     )
+    parser.add_argument(
+        "--expected-world-size",
+        type=int,
+        default=0,
+        help="Expected DDP world size (e.g. 16). Fails if mismatched.",
+    )
+    parser.add_argument(
+        "--require-ddp",
+        action="store_true",
+        default=False,
+        help="Fail fast if DDP is not initialized.",
+    )
     return parser.parse_args()
+
+
+CRITICAL_RESUME_ARGS = [
+    "window_size",
+    "rollout_depth",
+    "density_probe_count",
+    "updates_per_epoch",
+    "lr",
+    "min_lr",
+    "warmup_epochs",
+    "source_checkpoint",
+]
 
 
 def load_source_model(
@@ -419,6 +524,57 @@ def build_trajectory_step_input(
     return model_input, target_frame, visible_mask
 
 
+@torch.no_grad()
+def warmup_trajectory_history(
+    model: torch.nn.Module,
+    traj: Dict,
+    window_size: int = 24,
+    uncertainty_mode: str = "original",
+    amp: bool = True,
+    device_type: str = "cuda",
+) -> None:
+    """Pre-populates pred_buffer and var_buffer from t=0 to t0 - 1 using causal rollout.
+
+    No gradients are tracked during this warm-up. Genuine probes are preserved with u_in=0.0.
+    Ensures that when supervised training begins at t0, all historical context consists
+    of genuine previous model predictions rather than uninitialized zeros, matching deployment.
+    """
+    t0 = traj["t0"]
+    if t0 <= 0:
+        return
+
+    # Use unwrapped model to bypass any DDP synchronization during no-grad warm-up
+    unwrapped = model.module if hasattr(model, "module") else model
+    was_training = unwrapped.training
+    unwrapped.eval()
+
+    probe_bool = traj["probe_bool"]
+    target_norm = traj["target_norm"]
+
+    for t in range(t0):
+        model_input, _, _ = build_trajectory_step_input(
+            t=t,
+            traj=traj,
+            window_size=window_size,
+            uncertainty_mode=uncertainty_mode,
+        )
+        with torch.amp.autocast(device_type, enabled=(amp and device_type == "cuda"), dtype=torch.bfloat16):
+            pred, variance = unwrapped(model_input)
+
+        pred_t = pred[0, 3, window_size - 1].detach().float().clone()
+        var_t = variance[0, 3, window_size - 1].detach().float().clone()
+
+        # Genuine probes override with exact values and zero uncertainty
+        pred_t[probe_bool] = target_norm[3, t, probe_bool]
+        var_t[probe_bool] = 0.0
+
+        traj["pred_buffer"][t] = pred_t
+        traj["var_buffer"][t] = var_t
+
+    if was_training:
+        unwrapped.train()
+
+
 def evaluate_validation(
     model: torch.nn.Module,
     dataset: VPICWindowDataset,
@@ -504,7 +660,10 @@ def evaluate_validation(
 
 def main():
     args = parse_args()
-    device, rank, world_size, local_rank = initialize_distributed()
+    device, rank, world_size, local_rank = initialize_distributed(
+        expected_world_size=args.expected_world_size,
+        require_ddp=args.require_ddp,
+    )
 
     out_dir = args.out_dir
     if is_main_process():
@@ -513,6 +672,7 @@ def main():
     rank_print(f"--- ai4plasma v11: Phase D Stateful Causal Training Pilot ---")
     rank_print(f"World size: {world_size}, Device: {device}, Local rank: {local_rank}")
     rank_print(f"Output directory: {out_dir}")
+    rank_print("Checkpoints: saved per epoch (latest.pt and history.json).")
 
     # Set seeds
     seed = args.seed + rank * 1000
@@ -592,6 +752,28 @@ def main():
     if args.auto_resume and latest_ckpt_path.exists():
         rank_print(f"Resuming training from {latest_ckpt_path}...")
         ckpt = torch.load(latest_ckpt_path, map_location="cpu", weights_only=False)
+
+        # Invariant check: verify that critical resume parameters match saved configuration
+        saved_args = ckpt.get("args", {})
+        mismatches = []
+        for key in CRITICAL_RESUME_ARGS:
+            if key in saved_args:
+                curr_val = getattr(args, key, None)
+                saved_val = saved_args[key]
+                if key == "source_checkpoint":
+                    if str(curr_val) != str(saved_val):
+                        mismatches.append(f"{key}: saved='{saved_val}', current='{curr_val}'")
+                elif curr_val != saved_val:
+                    mismatches.append(f"{key}: saved={saved_val}, current={curr_val}")
+
+        if mismatches:
+            raise ValueError(
+                f"Incompatible resume arguments detected for checkpoint {latest_ckpt_path}!\n"
+                f"Resuming with altered configuration would silently invalidate the experiment.\n"
+                f"Mismatches:\n  " + "\n  ".join(mismatches) + "\n\n"
+                f"Please use matching arguments to resume, or choose a new --out-dir."
+            )
+
         unwrapped = model.module if hasattr(model, "module") else model
         unwrapped.load_state_dict(ckpt["model"], strict=True)
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -600,7 +782,7 @@ def main():
         start_epoch = ckpt["epoch"] + 1
         global_step = ckpt.get("global_step", (start_epoch - 1) * args.updates_per_epoch)
         history = ckpt.get("history", [])
-        rank_print(f"Resumed at epoch {start_epoch}, global step {global_step}")
+        rank_print(f"Resumed at epoch {start_epoch}, global step {global_step} (checkpoint saved per epoch)")
 
     if is_main_process():
         with open(out_dir / "config.json", "w") as f:
@@ -640,13 +822,25 @@ def main():
             trajectories = traj_manager.sample_trajectory_batch(args.batch_size)
 
             batch_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
-            batch_mu = 0.0
-            batch_var = 0.0
+            step_mu_total = 0.0
+            step_var_total = 0.0
+            total_supervised_steps = 0
 
             for traj in trajectories:
                 t0 = traj["t0"]
                 # Sample uncertainty condition for this trajectory
                 unc_mode = random.choices(unc_modes, weights=unc_weights, k=1)[0]
+
+                # Causal Warm-up: pre-populate historical prediction buffers for tau in [0, t0 - 1]
+                # using causal rollout in no_grad, preserving genuine probes
+                warmup_trajectory_history(
+                    model=model,
+                    traj=traj,
+                    window_size=args.window_size,
+                    uncertainty_mode=unc_mode,
+                    amp=args.amp,
+                    device_type=device_type,
+                )
 
                 traj_steps_loss = []
 
@@ -678,8 +872,9 @@ def main():
                         step_loss = 0.5 * (mu_loss + var_loss)
 
                     traj_steps_loss.append(step_loss)
-                    batch_mu += mu_loss.item()
-                    batch_var += var_loss.item()
+                    step_mu_total += mu_loss.item()
+                    step_var_total += var_loss.item()
+                    total_supervised_steps += 1
 
                     # Detach predictions for stateful causal rollout to next physical step
                     with torch.no_grad():
@@ -713,19 +908,24 @@ def main():
             scaler.update()
 
             sum_loss += batch_loss.item()
+            if total_supervised_steps > 0:
+                sum_mu_loss += step_mu_total / total_supervised_steps
+                sum_var_loss += step_var_total / total_supervised_steps
             n_updates += 1
 
             if is_main_process() and hasattr(pbar, "set_postfix"):
                 pbar.set_postfix({
                     "loss": f"{batch_loss.item():.4f}",
+                    "mu": f"{(step_mu_total / max(1, total_supervised_steps)):.4f}",
+                    "var": f"{(step_var_total / max(1, total_supervised_steps)):.4f}",
                     "lr": f"{current_lr:.2e}",
                     "gnorm": f"{grad_norm:.2f}",
                 })
 
         epoch_duration = time.time() - epoch_start_time
         avg_train_loss = sum_loss / max(1, n_updates)
-        avg_mu = batch_mu / max(1, n_updates * args.batch_size * args.rollout_depth)
-        avg_var = batch_var / max(1, n_updates * args.batch_size * args.rollout_depth)
+        avg_mu = sum_mu_loss / max(1, n_updates)
+        avg_var = sum_var_loss / max(1, n_updates)
 
         rank_print(
             f"Epoch {epoch:02d}/{args.epochs:02d} completed in {epoch_duration:.1f}s | "
