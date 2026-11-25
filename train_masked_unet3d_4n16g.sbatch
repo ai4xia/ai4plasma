@@ -928,11 +928,13 @@ expected_epochs = (
     if args.adaptive_phase_d_sliding
     else (256 if args.curriculum_config == "three_phase_global_cosine" else 1000)
 )
-if (args.epochs, args.final_epoch, args.stop_after_epochs) != (
-    expected_epochs, expected_epochs, expected_epochs,
-):
+if (args.epochs, args.final_epoch) != (expected_epochs, expected_epochs):
     raise ValueError(
         f"From-scratch cosine horizon must be exactly {expected_epochs} epochs"
+    )
+if args.stop_after_epochs is None or not (1 <= args.stop_after_epochs <= expected_epochs):
+    raise ValueError(
+        f"From-scratch stop_after_epochs must be in [1, {expected_epochs}], got {args.stop_after_epochs}"
     )
 lrs = {
     1: curriculum_learning_rate_for_epoch(1, args, state),
