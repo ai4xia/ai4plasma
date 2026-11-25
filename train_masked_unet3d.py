@@ -524,12 +524,21 @@ def parse_args(argv=None):
         default=[0, 1, -1, 12, -12],
         help="Representative sliding steps evaluated on validation runs.",
     )
+    p.add_argument(
+        "--adaptive-phase-d-sliding",
+        action="store_true",
+        help=(
+            "Adaptive 4-phase A->B->C->D from-scratch curriculum: convergence-triggered "
+            "40-epoch cosine ramps for lambda_v, lambda_r, and lambda_slide."
+        ),
+    )
 
     args = p.parse_args(argv)
     if args.differentiable_phase_c_reuse and not (
         args.gkl_joint_grad_continuation_20ep
         or args.gkl_masking_continuation_20ep
         or args.phase_d_sliding_curriculum
+        or args.adaptive_phase_d_sliding
         or (args.joint_nll_grad and args.uncertainty_loss in ("generalized_kl", "gkl"))
     ):
         p.error("--differentiable-phase-c-reuse requires fresh or continuation GKL A+B")
@@ -830,7 +839,7 @@ def parse_args(argv=None):
                     f"global_cosine requires --final-epoch {args.epochs}"
                 )
         elif args.curriculum_config == "three_phase_global_cosine" and not args.phase_d_sliding_curriculum:
-            if (args.epochs, args.warmup_epochs) != (256, 5):
+            if not args.adaptive_phase_d_sliding and (args.epochs, args.warmup_epochs) != (256, 5):
                 p.error(
                     "three_phase_global_cosine requires --epochs 256 "
                     "--warmup-epochs 5"
@@ -854,7 +863,7 @@ def parse_args(argv=None):
                     "three_phase_global_cosine uses convergence-triggered ramps; "
                     "scheduled starts are not supported"
                 )
-            if args.post_final_continuation is None and args.final_epoch != 256:
+            if args.post_final_continuation is None and not args.adaptive_phase_d_sliding and args.final_epoch != 256:
                 p.error("three_phase_global_cosine requires --final-epoch 256")
     if not (0 <= args.warmup_epochs < args.epochs):
         p.error(
@@ -901,6 +910,22 @@ def parse_args(argv=None):
             p.error("--phase-d-sliding-curriculum requires --joint-nll-grad --differentiable-phase-c-reuse (full mean+var)")
         if args.delta_t != 24:
             p.error("--phase-d-sliding-curriculum requires --delta-t 24")
+        if not math.isfinite(args.slide_ramp_epochs) or args.slide_ramp_epochs <= 0:
+            p.error("--slide-ramp-epochs must be positive")
+        for s_val in args.val_slide_steps:
+            if not -args.delta_t <= int(s_val) <= args.delta_t:
+                p.error(f"Invalid validation slide step: {s_val}")
+    if args.adaptive_phase_d_sliding:
+        if args.phase_d_sliding_curriculum or args.post_final_continuation is not None or args.init_checkpoint is not None:
+            p.error("--adaptive-phase-d-sliding is for from-scratch training and cannot be combined with continuation/pilot flags")
+        if not args.curriculum_training or args.curriculum_config != "three_phase_global_cosine":
+            p.error("--adaptive-phase-d-sliding requires --curriculum-training --curriculum-config three_phase_global_cosine")
+        if not args.uncertainty_aware or args.uncertainty_loss not in ("generalized_kl", "gkl"):
+            p.error("--adaptive-phase-d-sliding requires --uncertainty-aware and --uncertainty-loss generalized_kl")
+        if not args.joint_nll_grad or not args.differentiable_phase_c_reuse or args.mean_only_phase_c_reuse:
+            p.error("--adaptive-phase-d-sliding requires --joint-nll-grad --differentiable-phase-c-reuse (full mean+var)")
+        if args.delta_t != 24:
+            p.error("--adaptive-phase-d-sliding requires --delta-t 24")
         if not math.isfinite(args.slide_ramp_epochs) or args.slide_ramp_epochs <= 0:
             p.error("--slide-ramp-epochs must be positive")
         for s_val in args.val_slide_steps:
@@ -1733,7 +1758,7 @@ def cosine_continuation(step: int, start: float, duration: float) -> float:
 
 def arm_curriculum_ramp(state: Dict[str, Any], prefix: str) -> int:
     """Arm one immutable ramp at the current successful optimizer step."""
-    if prefix not in ("variance", "rollout"):
+    if prefix not in ("variance", "rollout", "slide"):
         raise ValueError(f"Unknown curriculum ramp: {prefix}")
     if state[f"{prefix}_ramp_armed"]:
         raise ValueError(f"The {prefix} ramp is already armed; its start is immutable")
@@ -1741,6 +1766,10 @@ def arm_curriculum_ramp(state: Dict[str, Any], prefix: str) -> int:
             state["successful_optimizer_steps"] < state["variance_ramp_start_step"] + state["variance_ramp_steps"] or
             curriculum_weights(state)[0] != 1.0):
         raise ValueError("Rollout arming requires a fully completed variance ramp (lambda_v == 1)")
+    if prefix == "slide" and (not state["rollout_ramp_armed"] or
+            state["successful_optimizer_steps"] < state["rollout_ramp_start_step"] + state["rollout_ramp_steps"] or
+            curriculum_weights(state) != (1.0, 1.0)):
+        raise ValueError("Slide arming requires a fully completed rollout ramp (lambda_v == lambda_r == 1)")
     start = state["successful_optimizer_steps"]
     state[f"{prefix}_ramp_start_step"] = start
     state[f"{prefix}_ramp_armed"] = True
@@ -1753,12 +1782,15 @@ def apply_ready_curriculum_transition(
     """Apply the ramp named by an existing readiness detector result."""
     if diagnostic is None:
         return None
-    ready = [prefix for prefix, key in (
+    candidates = [
         ("variance", "ready_for_variance_ramp"),
         ("rollout", "ready_for_rollout_ramp"),
-    ) if diagnostic.get(key, False)]
+    ]
+    if state.get("adaptive_phase_d_sliding", False):
+        candidates.append(("slide", "ready_for_phase_d"))
+    ready = [prefix for prefix, key in candidates if diagnostic.get(key, False)]
     if len(ready) > 1:
-        raise ValueError("A convergence diagnostic cannot arm both curriculum ramps")
+        raise ValueError("A convergence diagnostic cannot arm multiple curriculum ramps")
     if not ready:
         return None
     prefix = ready[0]
@@ -1839,7 +1871,32 @@ def make_curriculum_state(args, updates_per_epoch: int, checkpoint=None) -> Dict
         if checkpoint is None:
             raise ValueError("Ramp arming requires resuming an existing curriculum checkpoint")
         arm_curriculum_ramp(state, prefix)
-    if getattr(args, "phase_d_sliding_curriculum", False):
+    if getattr(args, "adaptive_phase_d_sliding", False):
+        state["adaptive_phase_d_sliding"] = True
+        state["slide_ramp_start_step"] = None
+        state["slide_ramp_armed"] = False
+        state["slide_ramp_steps"] = float(getattr(args, "slide_ramp_epochs", 40.0)) * updates_per_epoch
+        if not math.isfinite(state["slide_ramp_steps"]) or state["slide_ramp_steps"] <= 0:
+            raise ValueError("Adaptive Phase-D slide ramp duration must be positive")
+        if checkpoint is not None:
+            saved = checkpoint.get("curriculum_state", {})
+            if not saved.get("adaptive_phase_d_sliding", False):
+                raise ValueError("Cannot resume non-adaptive-sliding checkpoint with --adaptive-phase-d-sliding")
+            if state["slide_ramp_steps"] != saved.get("slide_ramp_steps"):
+                raise ValueError(
+                    f"Adaptive sliding resume changed slide_ramp_steps: "
+                    f"{saved.get('slide_ramp_steps')!r} -> {state['slide_ramp_steps']!r}"
+                )
+            s_start = saved.get("slide_ramp_start_step")
+            s_armed = bool(saved.get("slide_ramp_armed", s_start is not None))
+            if s_armed != (s_start is not None):
+                raise ValueError("Invalid saved slide armed/start state")
+            if s_armed and (not state["rollout_ramp_armed"] or
+                    s_start < state["rollout_ramp_start_step"] + state["rollout_ramp_steps"]):
+                raise ValueError("Slide ramp cannot start before rollout ramp completes")
+            state["slide_ramp_start_step"] = s_start
+            state["slide_ramp_armed"] = s_armed
+    elif getattr(args, "phase_d_sliding_curriculum", False):
         state["phase_d_sliding_curriculum"] = True
         state["slide_ramp_start_step"] = 0
         state["slide_ramp_steps"] = float(getattr(args, "slide_ramp_epochs", 10.0)) * updates_per_epoch
@@ -1860,6 +1917,14 @@ def make_curriculum_state(args, updates_per_epoch: int, checkpoint=None) -> Dict
 
 def slide_curriculum_weight(state: Dict[str, Any]) -> float:
     """Cosine curriculum lambda_slide(p) = (1 - cos(pi * p)) / 2 in [0, 1]."""
+    if state.get("adaptive_phase_d_sliding", False):
+        if not state.get("slide_ramp_armed", False) or state.get("slide_ramp_start_step") is None:
+            return 0.0
+        return cosine_continuation(
+            state["successful_optimizer_steps"],
+            state["slide_ramp_start_step"],
+            state["slide_ramp_steps"],
+        )
     if not state.get("phase_d_sliding_curriculum", False):
         return 0.0
     return cosine_continuation(
@@ -1905,6 +1970,14 @@ def curriculum_is_complete(state: Dict[str, Any]) -> bool:
         and steps >= state[f"{prefix}_ramp_start_step"] + state[f"{prefix}_ramp_steps"]
         for prefix in ("variance", "rollout")
     )
+    if state.get("adaptive_phase_d_sliding", False):
+        slide_done = (
+            state.get("slide_ramp_armed", False)
+            and state.get("slide_ramp_start_step") is not None
+            and steps >= state["slide_ramp_start_step"] + state["slide_ramp_steps"]
+            and slide_curriculum_weight(state) == 1.0
+        )
+        return ramps_complete and curriculum_weights(state) == (1.0, 1.0) and slide_done
     return ramps_complete and curriculum_weights(state) == (1.0, 1.0)
 
 
@@ -1941,6 +2014,8 @@ def curriculum_phase(
     config: str = "adaptive",
 ) -> Tuple[int, str]:
     if config == "three_phase_global_cosine":
+        if state.get("adaptive_phase_d_sliding", False) and state.get("slide_ramp_armed", False):
+            return (3, "sliding_ramp") if slide_curriculum_weight(state) < 1.0 else (3, "sliding_settled")
         if lambda_v == 0:
             return 0, "mean_only"
         if lambda_r == 0:
@@ -1970,9 +2045,11 @@ def require_complete_curriculum(state: Dict[str, Any], epoch: int) -> None:
     if curriculum_is_complete(state):
         return
     lambda_v, lambda_r = curriculum_weights(state)
+    lambda_slide = slide_curriculum_weight(state)
+    extra = f", lambda_slide={lambda_slide:g}" if state.get("adaptive_phase_d_sliding", False) else ""
     raise RuntimeError(
         f"Predetermined final epoch {epoch} reached before the curriculum completed: "
-        f"lambda_v={lambda_v:g}, lambda_r={lambda_r:g}. latest.pt and history.json "
+        f"lambda_v={lambda_v:g}, lambda_r={lambda_r:g}{extra}. latest.pt and history.json "
         "were saved, but final.pt was not created."
     )
 
@@ -2180,16 +2257,22 @@ def phase_c_convergence(history, args, curriculum_state):
         and state.get("successful_optimizer_steps", -1) >= start + duration
         and curriculum_weights(state) == (1.0, 1.0)
     )
+    is_adaptive_sliding = (
+        getattr(args, "curriculum_config", "adaptive") == "three_phase_global_cosine"
+        and getattr(args, "adaptive_phase_d_sliding", False)
+    )
     candidate = bool(
         getattr(args, "curriculum_training", False)
-        and getattr(args, "curriculum_config", "adaptive") == "abcd_symmetric_lr"
+        and (getattr(args, "curriculum_config", "adaptive") == "abcd_symmetric_lr" or is_adaptive_sliding)
         and completed and state.get("phase_d_start_epoch") is None
+        and not state.get("slide_ramp_armed", False)
     )
     segment_start = None
     objective = getattr(args, "uncertainty_loss", "gaussian_nll")
+    is_gkl = objective in ("generalized_kl", "gkl")
     rollout_nll_metric = (
         f"val_rollout_{objective}"
-        if objective in ("gaussian_nll", "student_t_nll")
+        if objective in ("gaussian_nll", "student_t_nll", "generalized_kl", "gkl")
         else "val_rollout_gaussian_nll"
     )
     if candidate:
@@ -2210,10 +2293,16 @@ def phase_c_convergence(history, args, curriculum_state):
         history, metric="val_rollout_mse", half_life=half_life, window=window,
         threshold=threshold, patience=patience, segment_start_epoch=cutoff,
     )
-    nll_rows = nll_metric_convergence(
-        history, metric=rollout_nll_metric, half_life=half_life,
-        window=window, segment_start_epoch=cutoff,
-    )
+    if is_gkl:
+        nll_rows = positive_metric_convergence(
+            history, metric=rollout_nll_metric, half_life=half_life, window=window,
+            threshold=threshold, patience=patience, segment_start_epoch=cutoff,
+        )
+    else:
+        nll_rows = nll_metric_convergence(
+            history, metric=rollout_nll_metric, half_life=half_life,
+            window=window, segment_start_epoch=cutoff,
+        )
     stable_count, previous_epoch = 0, None
     for mse, nll in zip(mse_rows, nll_rows):
         if previous_epoch is not None and mse["epoch"] != previous_epoch + 1:
@@ -3119,6 +3208,7 @@ def train_one_epoch(
     mean_only_phase_c_reuse: bool = False,
     student_t_unnormalized_control_20ep: bool = False,
     phase_d_sliding_curriculum: bool = False,
+    adaptive_phase_d_sliding: bool = False,
     dataset: Optional[Any] = None,
     slide_rng: Optional[torch.Generator] = None,
     allowed_runs: Optional[AbstractSet[str]] = None,
@@ -3175,7 +3265,7 @@ def train_one_epoch(
         if curriculum_state is None or not curriculum_is_complete(curriculum_state):
             raise ValueError("Stateful Phase D requires a complete curriculum")
         phase_d_stream.begin_epoch()
-    sliding_active = bool(phase_d_sliding_curriculum and curriculum_state is not None)
+    sliding_active = bool((phase_d_sliding_curriculum or adaptive_phase_d_sliding) and curriculum_state is not None)
     if sliding_active and dataset is None:
         raise ValueError("Unified sliding-window Phase D requires dataset access")
     if sliding_active and slide_rng is None:
@@ -4219,6 +4309,8 @@ def save_checkpoint(
     if curriculum_state is not None:
         ckpt["curriculum_state"] = dict(curriculum_state)
         ckpt["curriculum_state"].update(zip(("lambda_v", "lambda_r"), curriculum_weights(curriculum_state)))
+        if curriculum_state.get("adaptive_phase_d_sliding", False) or curriculum_state.get("phase_d_sliding_curriculum", False):
+            ckpt["curriculum_state"]["lambda_slide"] = slide_curriculum_weight(curriculum_state)
         ckpt["lr_schedule"] = dict(horizon_epochs=args.epochs, warmup_epochs=args.warmup_epochs,
                                    base_lr=args.lr, min_lr=args.min_lr,
                                    current_lr=[group["lr"] for group in optimizer.param_groups])
@@ -4928,18 +5020,28 @@ def main():
                 args, "gkl_masking_continuation_20ep", False,
             ),
             phase_d_sliding_curriculum=getattr(args, "phase_d_sliding_curriculum", False),
+            adaptive_phase_d_sliding=getattr(args, "adaptive_phase_d_sliding", False),
             dataset=dataset,
             allowed_runs=set(train_runs),
         )
 
         rollout_validation = bool(
             curriculum_state is not None
-            and curriculum_is_complete(curriculum_state)
             and (
-                args.curriculum_config == "global_cosine"
-                or getattr(args, "phase_d_sliding_curriculum", False)
-                or (args.curriculum_config == "abcd_symmetric_lr"
-                    and curriculum_state.get("phase_d_start_epoch") is None)
+                (
+                    curriculum_is_complete(curriculum_state)
+                    and (
+                        args.curriculum_config == "global_cosine"
+                        or getattr(args, "phase_d_sliding_curriculum", False)
+                        or (args.curriculum_config == "abcd_symmetric_lr"
+                            and curriculum_state.get("phase_d_start_epoch") is None)
+                    )
+                )
+                or (
+                    getattr(args, "adaptive_phase_d_sliding", False)
+                    and curriculum_state.get("rollout_ramp_armed", False)
+                    and curriculum_weights(curriculum_state) == (1.0, 1.0)
+                )
             )
         )
         validation_started = time.perf_counter()
@@ -4962,7 +5064,14 @@ def main():
             rollout_validation=rollout_validation,
         )
         sliding_val_metrics = None
-        if getattr(args, "phase_d_sliding_curriculum", False) and is_main_process():
+        if (
+            getattr(args, "phase_d_sliding_curriculum", False)
+            or (
+                getattr(args, "adaptive_phase_d_sliding", False)
+                and curriculum_state is not None
+                and curriculum_state.get("slide_ramp_armed", False)
+            )
+        ) and is_main_process():
             sliding_val_metrics = validate_sliding_windows(
                 model=(model.module if isinstance(model, DistributedDataParallel) else model),
                 dataset=dataset,
@@ -5148,7 +5257,10 @@ def main():
             transition = apply_ready_curriculum_transition(curriculum_state, transition_diagnostic)
             if transition is not None:
                 ramp, start_step = transition
-                curriculum_state[f"{ramp}_phase_start_epoch"] = epoch + 1
+                if ramp == "slide":
+                    curriculum_state["phase_d_start_epoch"] = epoch + 1
+                else:
+                    curriculum_state[f"{ramp}_phase_start_epoch"] = epoch + 1
                 if is_main_process():
                     row["automatic_curriculum_transition"] = {
                         "ramp": ramp,

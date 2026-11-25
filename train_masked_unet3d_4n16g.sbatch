@@ -37,6 +37,7 @@ GKL_MASKING_CONTINUATION=false
 DIFFERENTIABLE_PHASE_C_REUSE=false
 MEAN_ONLY_PHASE_C_REUSE=false
 FRESH_GKL_JOINT_GRAD=false
+ADAPTIVE_PHASE_D_SLIDING=false
 STUDENT_T_UNNORMALIZED_CONTROL=false
 PHASE_D_PROBE=false
 PHASE_C_K2_PROBE=false
@@ -220,6 +221,13 @@ case "${1:-}" in
         if [[ "$1" == --gkl-joint-grad-globalcosine-256ep ]]; then RESUMING=false; fi
         CURRICULUM_STOP=256; FINAL_EPOCH=256
         MODEL_ARGS=(--model-version direct_unet3d_no_activation_norm_v3); shift ;;
+    --adaptive-abcd-sliding-240ep|--resume-adaptive-abcd-sliding-240ep)
+        CURRICULUM=true; GLOBAL_COSINE=true; THREE_PHASE_GLOBAL_COSINE=true
+        THREE_PHASE_JOINT_NLL_GRAD=true; FRESH_GKL_JOINT_GRAD=true
+        ADAPTIVE_PHASE_D_SLIDING=true; FROMSCRATCH_48H=true
+        if [[ "$1" == --adaptive-abcd-sliding-240ep ]]; then RESUMING=false; fi
+        CURRICULUM_STOP=240; FINAL_EPOCH=240
+        MODEL_ARGS=(--model-version direct_unet3d_no_activation_norm_v3); shift ;;
     "") ;;
     *) echo "Unknown training mode: $1" >&2; exit 2 ;;
 esac
@@ -389,6 +397,8 @@ elif ${TEMPORAL_EXTRAPOLATION_CONTINUATION}; then
     RUN_NAME=${CURRICULUM_RUN_NAME:-multi_beta_three_phase_temporal_extrapolation_continuation_20ep_20261116}
 elif ${TEMPORAL_EXTRAPOLATION_ONLY_CONTINUATION}; then
     RUN_NAME=${CURRICULUM_RUN_NAME:-multi_beta_three_phase_temporal_extrapolation_only_continuation_10ep_20261117}
+elif ${ADAPTIVE_PHASE_D_SLIDING}; then
+    RUN_NAME=${CURRICULUM_RUN_NAME:-multi_beta_gkl_v11_adaptive_abcd_sliding_240ep}
 elif ${FRESH_GKL_JOINT_GRAD}; then
     RUN_NAME=${CURRICULUM_RUN_NAME:-multi_beta_three_phase_gkl_joint_grad_globalcosine_256ep_20261119}
 elif ${THREE_PHASE_JOINT_NLL_GRAD}; then
@@ -709,7 +719,10 @@ if ${STAGE1_NLL} || ${CURRICULUM}; then
             TRAIN_ARGS+=(
                 --wandb-tags from-scratch global-cosine-2e4-1e5 48h
             )
-            if ${FRESH_GKL_JOINT_GRAD}; then
+            if ${ADAPTIVE_PHASE_D_SLIDING}; then
+                TRAIN_ARGS+=(four-phase adaptive-abcd-sliding joint-gkl-gradient differentiable-phase-c-reuse)
+                TRAIN_ARGS+=(--joint-nll-grad --differentiable-phase-c-reuse --adaptive-phase-d-sliding --slide-ramp-epochs 40.0)
+            elif ${FRESH_GKL_JOINT_GRAD}; then
                 TRAIN_ARGS+=(three-phase k1-reuse joint-gkl-gradient differentiable-phase-c-reuse no-phase-d)
                 TRAIN_ARGS+=(--joint-nll-grad --differentiable-phase-c-reuse)
             elif ${THREE_PHASE_JOINT_NLL_GRAD}; then
