@@ -1003,14 +1003,17 @@ def symmetric_lr_cycle(
 def global_cosine_learning_rate(
     epoch: int, total_epochs: int, warmup_epochs: int,
     min_lr: float, peak_lr: float,
+    allow_post_horizon_min_lr: bool = False,
 ) -> float:
     """Inclusive low-to-peak warmup followed by one inclusive global cosine."""
-    if not (1 <= epoch <= total_epochs):
+    if epoch < 1 or (not allow_post_horizon_min_lr and epoch > total_epochs):
         raise ValueError(f"epoch must lie in [1, {total_epochs}], got {epoch}")
     if not (1 < warmup_epochs < total_epochs - 1):
         raise ValueError("Global cosine requires at least two warmup and cosine epochs")
     if not (0 <= min_lr <= peak_lr):
         raise ValueError(f"Expected 0 <= min_lr <= peak_lr, got {min_lr} and {peak_lr}")
+    if epoch > total_epochs:
+        return min_lr
     if epoch <= warmup_epochs:
         progress = float(epoch - 1) / float(warmup_epochs - 1)
         return min_lr + (peak_lr - min_lr) * progress
@@ -1028,8 +1031,13 @@ def curriculum_learning_rate_for_epoch(epoch: int, args, state: Dict[str, Any]) 
     if getattr(args, "curriculum_config", "adaptive") in (
         "global_cosine", "three_phase_global_cosine",
     ):
+        allow_tail = bool(
+            getattr(args, "adaptive_phase_d_sliding", False)
+            or (state is not None and state.get("adaptive_phase_d_sliding", False))
+        )
         return global_cosine_learning_rate(
             epoch, args.epochs, args.warmup_epochs, args.min_lr, args.lr,
+            allow_post_horizon_min_lr=allow_tail,
         )
     if getattr(args, "curriculum_config", "adaptive") == "abcd_symmetric_lr":
         return symmetric_lr_cycle(
@@ -2327,6 +2335,175 @@ def phase_c_convergence(history, args, curriculum_state):
         minimum_segment_age=2.0 * half_life, burn_in_complete=burn_in_complete,
         threshold=threshold, patience_target=patience,
         ready_for_phase_d=phase_c and burn_in_complete and stable_count >= patience,
+    )
+
+
+def is_slide_cosine_complete(state: Optional[Dict[str, Any]]) -> bool:
+    """Return True iff the Phase D sliding-window cosine ramp has completed."""
+    if not state or not state.get("adaptive_phase_d_sliding", False):
+        return False
+    start = state.get("slide_ramp_start_step")
+    steps_req = state.get("slide_ramp_steps")
+    return bool(
+        state.get("phase_d_start_epoch") is not None
+        and state.get("slide_ramp_armed", False)
+        and start is not None
+        and steps_req is not None
+        and steps_req > 0
+        and state.get("successful_optimizer_steps", -1) >= start + steps_req
+        and slide_curriculum_weight(state) == 1.0
+    )
+
+
+def _aggregate_nonzero_sliding_validation(
+    row: Dict[str, Any],
+    expected_steps: Sequence[int],
+    gkl_key: str,
+) -> Tuple[Optional[float], Optional[float]]:
+    """Aggregate nonzero positive and negative sliding validation MSE and GKL."""
+    sv = row.get("sliding_validation")
+    if not isinstance(sv, dict) or not expected_steps:
+        return None, None
+    mse_weighted, gkl_weighted, total_runs = 0.0, 0.0, 0
+    for step in expected_steps:
+        entry = sv.get(str(step))
+        if not isinstance(entry, dict):
+            return None, None
+        n_runs = entry.get("n_runs")
+        mse_val = entry.get("mse")
+        gkl_val = entry.get(gkl_key)
+        if (
+            n_runs is None or not isinstance(n_runs, (int, float)) or n_runs <= 0
+            or mse_val is None or not math.isfinite(mse_val) or mse_val <= 0
+            or gkl_val is None or not math.isfinite(gkl_val) or gkl_val <= 0
+        ):
+            return None, None
+        n_int = int(n_runs)
+        mse_weighted += float(mse_val) * n_int
+        gkl_weighted += float(gkl_val) * n_int
+        total_runs += n_int
+    if total_runs <= 0:
+        return None, None
+    return mse_weighted / total_runs, gkl_weighted / total_runs
+
+
+def phase_d_convergence(history, args, curriculum_state):
+    """Evaluate the three-condition completion status for adaptive Phase D sliding."""
+    state = curriculum_state or {}
+    current_epoch = int(history[-1]["epoch"]) if history else 0
+    lr_cosine_complete = bool(current_epoch >= int(args.epochs))
+    slide_cosine_complete = is_slide_cosine_complete(state)
+
+    half_life = getattr(args, "transition_ema_half_life", 5.0)
+    window = getattr(args, "transition_rate_window", 5)
+    threshold = getattr(args, "transition_rate_threshold", 0.005)
+    patience = getattr(args, "transition_patience", 4)
+    objective = getattr(args, "uncertainty_loss", "generalized_kl")
+    gkl_key = "gkl" if objective == "gkl" else "generalized_kl"
+
+    expected_steps = sorted({int(s) for s in getattr(args, "val_slide_steps", (0, 1, -1, 12, -12)) if int(s) != 0})
+    has_both_dirs = any(s > 0 for s in expected_steps) and any(s < 0 for s in expected_steps)
+
+    if not history or not has_both_dirs:
+        return dict(
+            epoch=current_epoch,
+            lr_cosine_complete=lr_cosine_complete,
+            slide_cosine_complete=slide_cosine_complete,
+            phase_d_settled=False,
+            val_sliding_mse_agg=None,
+            val_sliding_gkl_agg=None,
+            ema_val_sliding_mse=None,
+            sliding_mse_rate_per_epoch=None,
+            ema_val_sliding_gkl=None,
+            sliding_gkl_rate_per_epoch=None,
+            stable_count=0,
+            patience_target=patience,
+            segment_start_epoch=None,
+            segment_age=None,
+            minimum_segment_age=2.0 * half_life,
+            burn_in_complete=False,
+            threshold=threshold,
+            phase_d_converged=False,
+            training_complete=False,
+        )
+
+    slide_start = state.get("slide_ramp_start_step")
+    slide_steps = state.get("slide_ramp_steps")
+    slide_complete_step = (slide_start + slide_steps) if (slide_start is not None and slide_steps is not None) else None
+
+    agg_history = []
+    segment_start = None
+    for row in history:
+        ep = int(row["epoch"])
+        agg_mse, agg_gkl = _aggregate_nonzero_sliding_validation(row, expected_steps, gkl_key)
+        count = row.get("curriculum", {}).get("successful_optimizer_steps", -1)
+        settled_row = bool(
+            slide_cosine_complete
+            and slide_complete_step is not None
+            and count >= slide_complete_step
+            and agg_mse is not None
+            and agg_gkl is not None
+        )
+        if not settled_row:
+            segment_start = None
+        elif segment_start is None:
+            segment_start = ep
+        agg_history.append({
+            "epoch": ep,
+            "val_sliding_mse_agg": agg_mse,
+            "val_sliding_gkl_agg": agg_gkl,
+        })
+
+    cutoff = segment_start if segment_start is not None else current_epoch + 1
+    mse_rows = positive_metric_convergence(
+        agg_history, metric="val_sliding_mse_agg", half_life=half_life, window=window,
+        threshold=threshold, patience=patience, segment_start_epoch=cutoff,
+    )
+    gkl_rows = positive_metric_convergence(
+        agg_history, metric="val_sliding_gkl_agg", half_life=half_life, window=window,
+        threshold=threshold, patience=patience, segment_start_epoch=cutoff,
+    )
+
+    stable_count, previous_epoch = 0, None
+    last_mse, last_gkl = mse_rows[-1], gkl_rows[-1]
+    burn_in_complete = False
+    for m_row, g_row in zip(mse_rows, gkl_rows):
+        if previous_epoch is not None and m_row["epoch"] != previous_epoch + 1:
+            stable_count = 0
+        previous_epoch = m_row["epoch"]
+        burn_in_complete = bool(m_row["burn_in_complete"] and g_row["burn_in_complete"])
+        rates = (m_row["smoothed_rate_per_epoch"], g_row["smoothed_rate_per_epoch"])
+        stable = burn_in_complete and all(
+            r is not None and math.isfinite(r) and abs(r) < threshold for r in rates
+        )
+        stable_count = stable_count + 1 if stable else 0
+
+    ages = (last_mse["segment_age"], last_gkl["segment_age"])
+    segment_age = min(ages) if all(age is not None for age in ages) else None
+    phase_d_settled = bool(slide_cosine_complete and segment_start is not None)
+    phase_d_converged = bool(phase_d_settled and burn_in_complete and stable_count >= patience)
+    training_complete = bool(lr_cosine_complete and slide_cosine_complete and phase_d_converged)
+
+    return dict(
+        epoch=current_epoch,
+        lr_cosine_complete=lr_cosine_complete,
+        slide_cosine_complete=slide_cosine_complete,
+        phase_d_settled=phase_d_settled,
+        val_sliding_mse_agg=agg_history[-1]["val_sliding_mse_agg"],
+        val_sliding_gkl_agg=agg_history[-1]["val_sliding_gkl_agg"],
+        ema_val_sliding_mse=last_mse["ema_value"],
+        sliding_mse_rate_per_epoch=last_mse["smoothed_rate_per_epoch"],
+        ema_val_sliding_gkl=last_gkl["ema_value"],
+        sliding_gkl_rate_per_epoch=last_gkl["smoothed_rate_per_epoch"],
+        stable_count=stable_count,
+        patience_target=patience,
+        segment_start_epoch=segment_start,
+        segment_age=segment_age,
+        minimum_segment_age=2.0 * half_life,
+        burn_in_complete=burn_in_complete,
+        threshold=threshold,
+        phase_d_converged=phase_d_converged,
+        training_complete=training_complete,
     )
 
 
@@ -4278,6 +4455,19 @@ def build_epoch_wandb_log(
         for step_str, step_metrics in row["sliding_validation"].items():
             for m_key, m_val in step_metrics.items():
                 log_data[f"val/slide_{step_str}/{m_key}"] = m_val
+    if "phase_d_convergence" in row:
+        pd_diag = row["phase_d_convergence"]
+        for key, value in pd_diag.items():
+            if value is not None:
+                log_data[f"phase_d_convergence/{key}"] = value
+        for key in (
+            "lr_cosine_complete",
+            "slide_cosine_complete",
+            "phase_d_converged",
+            "training_complete",
+        ):
+            if key in pd_diag:
+                log_data[f"curriculum/{key}"] = pd_diag[key]
 
     return log_data
 
@@ -4797,6 +4987,10 @@ def main():
         with open(out_dir / "config.json", "w") as f:
             json.dump({**vars(args), "data_split": split_metadata}, f, indent=2)
 
+    dynamic_termination = bool(
+        getattr(args, "adaptive_phase_d_sliding", False)
+        and args.stop_after_epochs is None
+    )
     final_epoch = args.stop_after_epochs or args.epochs
     if (curriculum_state is not None and resume_checkpoint is not None
             and not args.post_final_continuation
@@ -4808,7 +5002,15 @@ def main():
             )
     if (args.arm_variance_ramp or args.arm_rollout_ramp) and start_epoch > final_epoch:
         raise ValueError("Arming requires --stop-after-epochs beyond the completed checkpoint epoch")
-    if start_epoch > final_epoch:
+    if dynamic_termination and (out_dir / "final.pt").is_file():
+        rank_print(
+            f"Training is already complete at epoch {start_epoch - 1} (final.pt exists); "
+            "no further optimizer updates."
+        )
+        if distributed_is_initialized():
+            dist.destroy_process_group()
+        return
+    if not dynamic_termination and start_epoch > final_epoch:
         rank_print(
             f"Training is already complete at epoch {start_epoch - 1}; "
             f"requested final epoch={final_epoch}. Extend --stop-after-epochs to continue curriculum training."
@@ -4922,8 +5124,9 @@ def main():
 
     epoch_progress = None
     if is_main_process():
+        progress_total = float(max(final_epoch, start_epoch)) if dynamic_termination else float(final_epoch)
         epoch_progress = tqdm(
-            total=float(final_epoch),
+            total=progress_total,
             initial=float(start_epoch - 1),
             desc="Training",
             unit="epoch",
@@ -4940,7 +5143,11 @@ def main():
         else:
             rank_print(message)
 
-    for epoch in range(start_epoch, final_epoch + 1):
+    actual_final_epoch = None
+    epoch = start_epoch
+    while dynamic_termination or epoch <= final_epoch:
+        if dynamic_termination and epoch_progress is not None and epoch > epoch_progress.total:
+            epoch_progress.total = float(epoch)
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         epoch_started = time.perf_counter()
@@ -5292,6 +5499,42 @@ def main():
                 phase_d_start_epoch=curriculum_state.get("phase_d_start_epoch"),
             )
 
+        phase_d_diag = None
+        if getattr(args, "adaptive_phase_d_sliding", False) and curriculum_state is not None:
+            if is_main_process():
+                phase_d_diag = phase_d_convergence(history, args, curriculum_state)
+                row["phase_d_convergence"] = phase_d_diag
+                row["training_complete"] = bool(phase_d_diag["training_complete"])
+                mse_r = phase_d_diag["sliding_mse_rate_per_epoch"]
+                gkl_r = phase_d_diag["sliding_gkl_rate_per_epoch"]
+                mse_r_txt = f"{100 * mse_r:+.3f}%" if mse_r is not None else "n/a"
+                gkl_r_txt = f"{100 * gkl_r:+.3f}%" if gkl_r is not None else "n/a"
+                age_txt = (
+                    f"{phase_d_diag['segment_age']}"
+                    if phase_d_diag["segment_age"] is not None else "n/a"
+                )
+                epoch_log(
+                    "Phase D termination check: "
+                    f"lr_cosine_complete={phase_d_diag['lr_cosine_complete']} "
+                    f"slide_cosine_complete={phase_d_diag['slide_cosine_complete']} "
+                    f"phase_d_converged={phase_d_diag['phase_d_converged']} "
+                    f"training_complete={phase_d_diag['training_complete']} | "
+                    f"mse_rate={mse_r_txt} gkl_rate={gkl_r_txt} "
+                    f"stable={phase_d_diag['stable_count']}/{phase_d_diag['patience_target']} "
+                    f"burn_in={age_txt}/{phase_d_diag['minimum_segment_age']:g}"
+                )
+            synced_pd = [phase_d_diag]
+            if distributed_is_initialized():
+                dist.broadcast_object_list(synced_pd, src=0)
+            phase_d_diag = synced_pd[0]
+            if phase_d_diag["training_complete"]:
+                curriculum_state["completion_conditions"] = {
+                    "lr_cosine_complete": True,
+                    "slide_cosine_complete": True,
+                    "phase_d_converged": True,
+                    "actual_final_epoch": epoch,
+                }
+
         if wandb_run is not None:
             wandb_run.log(
                 build_epoch_wandb_log(
@@ -5368,7 +5611,29 @@ def main():
             )
         if distributed_is_initialized():
             dist.barrier()
-        if epoch == args.final_epoch:
+        if dynamic_termination:
+            if phase_d_diag is not None and phase_d_diag["training_complete"]:
+                if is_main_process():
+                    save_checkpoint(
+                        out_dir / "final.pt",
+                        model=model,
+                        optimizer=optimizer,
+                        epoch=epoch,
+                        args=args,
+                        stats=stats,
+                        wandb_run_id=wandb_run.id if wandb_run is not None else None,
+                        scaler=scaler,
+                        curriculum_state=curriculum_state,
+                    )
+                    epoch_log(
+                        f"Saved final checkpoint at epoch {epoch} "
+                        "(LR cosine complete AND Phase D lambda_slide complete AND Phase D converged)"
+                    )
+                if distributed_is_initialized():
+                    dist.barrier()
+                actual_final_epoch = epoch
+                break
+        elif epoch == args.final_epoch:
             if distributed_is_initialized():
                 dist.barrier()
             if curriculum_state is not None:
@@ -5388,6 +5653,7 @@ def main():
                 epoch_log(f"Saved predetermined final checkpoint at epoch {epoch}")
             if distributed_is_initialized():
                 dist.barrier()
+        epoch += 1
 
     if epoch_progress is not None:
         epoch_progress.close()
@@ -5396,7 +5662,14 @@ def main():
                    f"LR horizon remains {args.epochs}; no further optimizer updates.")
 
     if wandb_run is not None:
-        wandb_run.summary["final_epoch"] = args.final_epoch
+        wandb_run.summary["final_epoch"] = (
+            actual_final_epoch if actual_final_epoch is not None else args.final_epoch
+        )
+        if actual_final_epoch is not None:
+            wandb_run.summary["training_complete"] = True
+            wandb_run.summary["lr_cosine_complete"] = True
+            wandb_run.summary["slide_cosine_complete"] = True
+            wandb_run.summary["phase_d_converged"] = True
         if args.wandb_log_model and (out_dir / "final.pt").is_file():
             import wandb
 

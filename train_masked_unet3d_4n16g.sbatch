@@ -226,7 +226,7 @@ case "${1:-}" in
         THREE_PHASE_JOINT_NLL_GRAD=true; FRESH_GKL_JOINT_GRAD=true
         ADAPTIVE_PHASE_D_SLIDING=true; FROMSCRATCH_48H=true
         if [[ "$1" == --adaptive-abcd-sliding-240ep ]]; then RESUMING=false; fi
-        CURRICULUM_STOP=240; FINAL_EPOCH=240
+        CURRICULUM_STOP=""; FINAL_EPOCH=240
         MODEL_ARGS=(--model-version direct_unet3d_no_activation_norm_v3); shift ;;
     "") ;;
     *) echo "Unknown training mode: $1" >&2; exit 2 ;;
@@ -661,7 +661,9 @@ if ${STAGE1_NLL} || ${CURRICULUM}; then
     else
         TRAIN_ARGS+=(--uncertainty-loss gaussian_nll)
     fi
-    TRAIN_ARGS+=(--stop-after-epochs "${STOP_EPOCH}")
+    if [[ -n "${STOP_EPOCH}" ]]; then
+        TRAIN_ARGS+=(--stop-after-epochs "${STOP_EPOCH}")
+    fi
     if ${CURRICULUM}; then
         TRAIN_ARGS+=(--curriculum-training "${ARM_ARGS[@]}")
         if ${THREE_PHASE_GLOBAL_COSINE}; then
@@ -836,10 +838,14 @@ if initial_continuation:
 else:
     validate_resume_parameters(args, checkpoint["args"])
 epoch = int(checkpoint["epoch"])
-limit = (args.stop_after_epochs or args.epochs) if args.curriculum_training else args.epochs
-minimum_epoch = args.epochs if args.post_final_continuation else (1 if args.curriculum_training else 6)
-if not minimum_epoch <= epoch <= limit:
-    raise ValueError(f"Unexpected completed epoch {epoch} for final epoch {limit}")
+if args.adaptive_phase_d_sliding and args.stop_after_epochs is None:
+    if epoch < 1:
+        raise ValueError(f"Unexpected completed epoch {epoch}")
+else:
+    limit = (args.stop_after_epochs or args.epochs) if args.curriculum_training else args.epochs
+    minimum_epoch = args.epochs if args.post_final_continuation else (1 if args.curriculum_training else 6)
+    if not minimum_epoch <= epoch <= limit:
+        raise ValueError(f"Unexpected completed epoch {epoch} for final epoch {limit}")
 if args.curriculum_training:
     state = make_curriculum_state(args, checkpoint["curriculum_state"]["updates_per_epoch"], checkpoint)
     if args.post_final_continuation and curriculum_weights(state) != (1.0, 1.0):
@@ -932,7 +938,12 @@ if (args.epochs, args.final_epoch) != (expected_epochs, expected_epochs):
     raise ValueError(
         f"From-scratch cosine horizon must be exactly {expected_epochs} epochs"
     )
-if args.stop_after_epochs is None or not (1 <= args.stop_after_epochs <= expected_epochs):
+if args.adaptive_phase_d_sliding:
+    if args.stop_after_epochs is not None and not (1 <= args.stop_after_epochs <= expected_epochs):
+        raise ValueError(
+            f"From-scratch stop_after_epochs must be in [1, {expected_epochs}], got {args.stop_after_epochs}"
+        )
+elif args.stop_after_epochs is None or not (1 <= args.stop_after_epochs <= expected_epochs):
     raise ValueError(
         f"From-scratch stop_after_epochs must be in [1, {expected_epochs}], got {args.stop_after_epochs}"
     )
@@ -968,7 +979,11 @@ elif ${PHASE_C_K2_PROBE}; then
     COMPLETED_EPOCH=${PROBE_SOURCE_EPOCH}
 elif ${RESUMING} || ${POST_FINAL_CONTINUATION}; then
 COMPLETED_EPOCH=$(resume_checkpoint_preflight)
-if (( COMPLETED_EPOCH >= STOP_EPOCH )); then
+if ${ADAPTIVE_PHASE_D_SLIDING} && [[ -z "${STOP_EPOCH}" ]] && [[ -s "${OUT_DIR}/final.pt" ]]; then
+    echo "Training is already complete (final.pt exists at epoch ${COMPLETED_EPOCH}); no workers launched."
+    exit 0
+fi
+if [[ -n "${STOP_EPOCH}" ]] && (( COMPLETED_EPOCH >= STOP_EPOCH )); then
     echo "Training is already complete through epoch ${STOP_EPOCH}; no workers launched."
     exit 0
 fi
@@ -987,7 +1002,7 @@ if ${FROMSCRATCH_48H} && ${RESUMING} && [[ "${JOB_INFO}" == *" BatchFlag=1 "* ]]
         cancel_registered_active_salloc
         COMPLETED_EPOCH=$(resume_checkpoint_preflight)
         echo "Handoff: checkpoint revalidated successfully at epoch ${COMPLETED_EPOCH}; DDP resume may proceed."
-        if (( COMPLETED_EPOCH >= STOP_EPOCH )); then
+        if [[ -n "${STOP_EPOCH}" ]] && (( COMPLETED_EPOCH >= STOP_EPOCH )); then
             echo "Training is already complete through epoch ${STOP_EPOCH}; no workers launched."
             exit 0
         fi
@@ -1022,7 +1037,7 @@ echo "GPUs per node: ${GPUS_PER_NODE}"
 echo "DDP world size: ${WORLD_SIZE}"
 echo "Per-GPU batch size: ${BATCH_SIZE}"
 echo "Global batch size: $((BATCH_SIZE * WORLD_SIZE))"
-echo "Epochs: $((COMPLETED_EPOCH + 1)) through ${STOP_EPOCH} (original ${EPOCHS}-epoch LR horizon)"
+echo "Epochs: $((COMPLETED_EPOCH + 1)) through ${STOP_EPOCH:-dynamic-convergence} (original ${EPOCHS}-epoch LR horizon)"
 echo "Predetermined official final epoch: ${FINAL_EPOCH}"
 if ${CURRICULUM}; then
     if ${PHASE_C_K2_PROBE}; then

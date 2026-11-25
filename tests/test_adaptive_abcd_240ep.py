@@ -20,11 +20,14 @@ from train_masked_unet3d import (
     curriculum_learning_rate_for_epoch,
     curriculum_phase,
     curriculum_weights,
+    global_cosine_learning_rate,
+    is_slide_cosine_complete,
     make_curriculum_state,
     parse_args,
     phase_a_convergence,
     phase_b_convergence,
     phase_c_convergence,
+    phase_d_convergence,
     require_complete_curriculum,
     sample_slide_step,
     save_checkpoint,
@@ -222,12 +225,23 @@ mkdir -p "${PWD}/runs/test_run"
 LOG_FLAGS="${PWD}/runs/test_run/invocations.log"
 echo "$1" >> "${LOG_FLAGS}"
 COUNT=$(wc -l < "${LOG_FLAGS}")
-if [[ "${MOCK_MODE:-normal}" == "incomplete_at_target" ]]; then
-    python3 -c "
+if [[ "${MOCK_MODE:-normal}" == "continue_past_target" ]]; then
+    if [[ "${COUNT}" -eq 1 ]]; then
+        python3 -c "
 import json, torch
-torch.save({'epoch': 10, 'curriculum_state': {'adaptive_phase_d_sliding': True, 'slide_ramp_armed': False}}, '${PWD}/runs/test_run/latest.pt')
+cs = {'adaptive_phase_d_sliding': True, 'variance_ramp_armed': True, 'rollout_ramp_armed': True, 'slide_ramp_armed': True, 'slide_ramp_start_step': 40, 'slide_ramp_steps': 20, 'successful_optimizer_steps': 60}
+torch.save({'epoch': 10, 'curriculum_state': cs}, '${PWD}/runs/test_run/latest.pt')
 json.dump([{'epoch': 10}], open('${PWD}/runs/test_run/history.json', 'w'))
 "
+    else
+        python3 -c "
+import json, torch
+cs = {'adaptive_phase_d_sliding': True, 'variance_ramp_armed': True, 'rollout_ramp_armed': True, 'slide_ramp_armed': True, 'slide_ramp_start_step': 40, 'slide_ramp_steps': 20, 'successful_optimizer_steps': 80, 'completion_conditions': {'lr_cosine_complete': True, 'slide_cosine_complete': True, 'phase_d_converged': True, 'actual_final_epoch': 12}}
+torch.save({'epoch': 12, 'curriculum_state': cs}, '${PWD}/runs/test_run/latest.pt')
+torch.save({'epoch': 12, 'curriculum_state': cs}, '${PWD}/runs/test_run/final.pt')
+json.dump([{'epoch': 10}, {'epoch': 12}], open('${PWD}/runs/test_run/history.json', 'w'))
+"
+    fi
     exit 0
 fi
 if [[ "${COUNT}" -eq 1 ]]; then
@@ -300,14 +314,140 @@ bash -c "$1"
     mon_log2 = proj2 / "runs" / f".monitor_{run_name}" / "auto_resume_monitor.log"
     assert "consecutive sessions made zero progress" in mon_log2.read_text()
 
-    # 3. Test incomplete curriculum at target epoch halt
+    # 3. Test continuing past TARGET_EPOCH without final.pt, then completing at epoch 12
     proj3 = tmp_path / "proj3"
     proj3.mkdir()
     (proj3 / "train_masked_unet3d_4n16g.sbatch").write_text(mock_sbatch.read_text())
     (proj3 / "train_masked_unet3d_4n16g.sbatch").chmod(0o755)
     env3 = env.copy()
-    env3.update({"PROJECT_DIR": str(proj3), "MOCK_MODE": "incomplete_at_target", "MOCK_FAIL_FIRST": "0"})
+    env3.update({"PROJECT_DIR": str(proj3), "MOCK_MODE": "continue_past_target", "MOCK_FAIL_FIRST": "0"})
     res3 = subprocess.run(["bash", str(script)], cwd=str(proj3), env=env3, capture_output=True, text=True, timeout=30)
-    assert res3.returncode != 0
-    mon_log3 = proj3 / "runs" / f".monitor_{run_name}" / "auto_resume_monitor.log"
-    assert "curriculum incomplete" in mon_log3.read_text()
+    assert res3.returncode == 0, res3.stderr + "\n" + res3.stdout
+    inv3 = (proj3 / "runs" / run_name / "invocations.log").read_text().splitlines()
+    assert inv3 == ["--adaptive-abcd-sliding-240ep", "--resume-adaptive-abcd-sliding-240ep"]
+    assert (proj3 / "runs" / run_name / "final.pt").is_file()
+
+
+def test_post_240_lr_tail_and_three_condition_termination(tmp_path: Path):
+    """Verify post-240 constant min LR, three-condition gating, Phase D burn-in/patience, and resume."""
+    args = _make_240ep_args(240)
+    updates_per_ep = 100
+    state = make_curriculum_state(args, updates_per_epoch=updates_per_ep)
+
+    # 1. LR 1..240 identical to original global_cosine_learning_rate, and 241..300 == 1e-5
+    orig_lrs = [global_cosine_learning_rate(ep, 240, 5, 1e-5, 2e-4) for ep in range(1, 241)]
+    new_lrs = [curriculum_learning_rate_for_epoch(ep, args, state) for ep in range(1, 301)]
+    assert new_lrs[:240] == orig_lrs
+    assert math.isclose(new_lrs[0], 1e-5, rel_tol=1e-9)
+    assert math.isclose(new_lrs[4], 2e-4, rel_tol=1e-9)
+    assert math.isclose(new_lrs[239], 1e-5, rel_tol=1e-9)
+    assert math.isclose(new_lrs[240], 1e-5, rel_tol=1e-9)
+    assert math.isclose(new_lrs[259], 1e-5, rel_tol=1e-9)
+    assert math.isclose(new_lrs[299], 1e-5, rel_tol=1e-9)
+    with pytest.raises(ValueError):
+        global_cosine_learning_rate(241, 240, 5, 1e-5, 2e-4)
+
+    # Helper to build sliding_validation dict for an epoch
+    def _sv(mse: float, gkl: float, zero_mse: float = 9.9, n_runs: int = 20):
+        return {
+            "0": {"mse": zero_mse, "generalized_kl": zero_mse, "n_runs": n_runs},
+            "1": {"mse": mse, "generalized_kl": gkl, "n_runs": n_runs},
+            "-1": {"mse": mse, "generalized_kl": gkl, "n_runs": n_runs},
+            "12": {"mse": mse, "generalized_kl": gkl, "n_runs": n_runs},
+            "-12": {"mse": mse, "generalized_kl": gkl, "n_runs": n_runs},
+        }
+
+    # 2. Simulate Phase D starting at epoch 180 (slide ramp 181..220, settled 221+)
+    state["variance_ramp_armed"] = True
+    state["variance_ramp_start_step"] = 20 * updates_per_ep
+    state["rollout_ramp_armed"] = True
+    state["rollout_ramp_start_step"] = 80 * updates_per_ep
+    state["slide_ramp_armed"] = True
+    state["slide_ramp_start_step"] = 180 * updates_per_ep
+    state["phase_d_start_epoch"] = 181
+
+    history = []
+    # Epochs 181..219: still in slide ramp -> must NOT count toward Phase D burn-in
+    for ep in range(181, 220):
+        state["successful_optimizer_steps"] = ep * updates_per_ep
+        history.append({
+            "epoch": ep,
+            "curriculum": {"successful_optimizer_steps": state["successful_optimizer_steps"]},
+            "sliding_validation": _sv(0.01, 0.01),
+        })
+    diag_ramp = phase_d_convergence(history, args, state)
+    assert not diag_ramp["slide_cosine_complete"]
+    assert not diag_ramp["phase_d_converged"]
+    assert not diag_ramp["training_complete"]
+
+    # Epochs 220..235: settled slide (lambda_slide=1.0), converges by ep 235, but LR < 240!
+    for ep in range(220, 236):
+        state["successful_optimizer_steps"] = ep * updates_per_ep
+        history.append({
+            "epoch": ep,
+            "curriculum": {"successful_optimizer_steps": state["successful_optimizer_steps"]},
+            "sliding_validation": _sv(0.01, 0.01),
+        })
+    diag_pre240 = phase_d_convergence(history, args, state)
+    assert not diag_pre240["lr_cosine_complete"]
+    assert diag_pre240["slide_cosine_complete"]
+    assert diag_pre240["phase_d_converged"]
+    assert not diag_pre240["training_complete"]
+
+    # Nonfinite / missing direction at ep 236 resets burn-in & patience!
+    state["successful_optimizer_steps"] = 236 * updates_per_ep
+    bad_sv = _sv(0.01, 0.01)
+    bad_sv["-12"]["generalized_kl"] = float("nan")
+    history.append({
+        "epoch": 236,
+        "curriculum": {"successful_optimizer_steps": state["successful_optimizer_steps"]},
+        "sliding_validation": bad_sv,
+    })
+    diag_bad = phase_d_convergence(history, args, state)
+    assert not diag_bad["phase_d_converged"]
+    assert diag_bad["stable_count"] == 0
+
+    # Recover for epochs 237..246 (10 burn-in epochs -> segment_age=10 at ep 247, patience=4 -> ep 250)
+    for ep in range(237, 250):
+        state["successful_optimizer_steps"] = ep * updates_per_ep
+        history.append({
+            "epoch": ep,
+            "curriculum": {"successful_optimizer_steps": state["successful_optimizer_steps"]},
+            "sliding_validation": _sv(0.01, 0.01),
+        })
+        d = phase_d_convergence(history, args, state)
+        assert not d["training_complete"], f"Unexpectedly completed at epoch {ep}"
+
+    # At epoch 250 (14th valid settled epoch: 0..10 burn-in, 11..13 stable 1..3, 14th stable=4):
+    state["successful_optimizer_steps"] = 250 * updates_per_ep
+    history.append({
+        "epoch": 250,
+        "curriculum": {"successful_optimizer_steps": state["successful_optimizer_steps"]},
+        "sliding_validation": _sv(0.01, 0.01),
+    })
+    diag_final = phase_d_convergence(history, args, state)
+    assert diag_final["lr_cosine_complete"]
+    assert diag_final["slide_cosine_complete"]
+    assert diag_final["phase_d_converged"]
+    assert diag_final["training_complete"]
+    assert diag_final["stable_count"] == 4
+
+    # Verify s=0 is excluded from aggregate (changing s=0 does not change agg)
+    assert math.isclose(diag_final["val_sliding_mse_agg"], 0.01, rel_tol=1e-9)
+    assert math.isclose(diag_final["val_sliding_gkl_agg"], 0.01, rel_tol=1e-9)
+
+    # Verify checkpoint save & resume at epoch 241 preserves exact convergence decision
+    model = UNet3D(
+        in_channels=8, out_channels=4, base_channels=8, channel_mults=(1, 2, 4),
+        architecture="direct_unet3d_no_activation_norm_v3", uncertainty_aware=True,
+    )
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-5)
+    ckpt_path = tmp_path / "latest_241.pt"
+    save_checkpoint(
+        ckpt_path, model=model, optimizer=opt, epoch=241, args=args,
+        stats={"mean": [0.0]*4, "std": [1.0]*4}, curriculum_state=state,
+    )
+    loaded = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    restored = make_curriculum_state(args, updates_per_epoch=updates_per_ep, checkpoint=loaded)
+    assert is_slide_cosine_complete(restored)
+    assert phase_d_convergence(history[:61], args, restored)["stable_count"] == phase_d_convergence(history[:61], args, state)["stable_count"]

@@ -85,6 +85,12 @@ try:
     ep = int(ckpt.get('epoch', 0))
     cs = ckpt.get('curriculum_state') or {}
     steps = cs.get('successful_optimizer_steps', -1)
+    cc = cs.get('completion_conditions')
+    cond_ok = True if cc is None else (
+        bool(cc.get('lr_cosine_complete', False))
+        and bool(cc.get('slide_cosine_complete', False))
+        and bool(cc.get('phase_d_converged', False))
+    )
     done = (
         ep >= ${TARGET_EPOCH}
         and bool(cs.get('adaptive_phase_d_sliding', False))
@@ -92,6 +98,7 @@ try:
         and bool(cs.get('rollout_ramp_armed', False))
         and bool(cs.get('slide_ramp_armed', False))
         and steps >= cs.get('slide_ramp_start_step', 0) + cs.get('slide_ramp_steps', 1)
+        and cond_ok
     )
     sys.exit(0 if done else 1)
 except Exception:
@@ -225,11 +232,6 @@ while true; do
 
     epoch_after=$(get_completed_epoch)
     log "Epoch before allocation: ${epoch_before} | Epoch after allocation: ${epoch_after}"
-
-    if (( epoch_after >= TARGET_EPOCH )); then
-        log "FATAL: Reached target epoch ${TARGET_EPOCH} without verified final.pt (curriculum incomplete). Halting monitor."
-        exit 1
-    fi
 
     if (( epoch_after > epoch_before )); then
         NO_PROGRESS_STREAK=0
