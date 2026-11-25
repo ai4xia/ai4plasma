@@ -209,6 +209,7 @@ class VPICWindowDataset(Dataset):
         self.file_infos: List[Dict] = []
         self.samples: List[Tuple[int, str, int]] = []
         self.run_file_indices: Dict[str, int] = {}
+        self.run_lengths: Dict[str, int] = {}
 
         self.h5_dir = Path(os.path.expandvars(str(h5_dir))).expanduser().resolve()
         self.h5_files = find_h5_files(self.h5_dir, betas=betas)
@@ -254,6 +255,7 @@ class VPICWindowDataset(Dataset):
                         raise ValueError(f"Duplicate HDF5 run name: {run_name}")
                     self.run_file_indices[run_name] = file_idx
                     Ti = int(T[i])
+                    self.run_lengths[run_name] = Ti
 
                     if Ti < self.delta_t:
                         continue
@@ -330,13 +332,8 @@ class VPICWindowDataset(Dataset):
             "metadata": metadata,
         }
 
-    def get_run(self, run_name: str) -> torch.Tensor:
-        """Load one complete included run with the ordinary spatial preprocessing."""
-        if run_name not in self.run_file_indices:
-            raise KeyError(f"Run is not available in this dataset: {run_name}")
-        file_idx = self.run_file_indices[run_name]
-        fields = self._get_file(file_idx)["runs"][run_name]["fields"]
-        block = torch.from_numpy(np.asarray(fields, dtype=np.float32))
+    def _preprocess_fields(self, raw_fields: np.ndarray) -> torch.Tensor:
+        block = torch.from_numpy(np.asarray(raw_fields, dtype=np.float32))
         if block.shape[-2:] != TARGET_SPATIAL_SHAPE:
             block = F.interpolate(
                 block, size=TARGET_SPATIAL_SHAPE, mode="bicubic",
@@ -345,6 +342,36 @@ class VPICWindowDataset(Dataset):
         if self.layout == "C T X Z":
             return block.permute(1, 0, 2, 3)
         return block.permute(1, 2, 3, 0)
+
+    def get_run_length(self, run_name: str) -> int:
+        """Return total temporal frame count for an included run without loading field data."""
+        if run_name not in self.run_file_indices:
+            raise KeyError(f"Run is not available in this dataset: {run_name}")
+        if run_name in self.run_lengths:
+            return self.run_lengths[run_name]
+        file_idx = self.run_file_indices[run_name]
+        return int(self._get_file(file_idx)["runs"][run_name]["fields"].shape[0])
+
+    def get_run_slice(self, run_name: str, start: int, end: int) -> torch.Tensor:
+        """Load temporal slice [start:end) of one included run with ordinary preprocessing."""
+        if run_name not in self.run_file_indices:
+            raise KeyError(f"Run is not available in this dataset: {run_name}")
+        file_idx = self.run_file_indices[run_name]
+        fields = self._get_file(file_idx)["runs"][run_name]["fields"]
+        total = int(fields.shape[0])
+        if not (0 <= start <= end <= total):
+            raise ValueError(
+                f"Invalid temporal slice [{start}:{end}) for run {run_name} of length {total}"
+            )
+        return self._preprocess_fields(fields[start:end])
+
+    def get_run(self, run_name: str) -> torch.Tensor:
+        """Load one complete included run with the ordinary spatial preprocessing."""
+        if run_name not in self.run_file_indices:
+            raise KeyError(f"Run is not available in this dataset: {run_name}")
+        file_idx = self.run_file_indices[run_name]
+        fields = self._get_file(file_idx)["runs"][run_name]["fields"]
+        return self._preprocess_fields(fields)
 
     def close(self) -> None:
         for f in self._file_handles.values():

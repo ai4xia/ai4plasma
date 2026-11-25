@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import copy
 import math
+from pathlib import Path
 from typing import Dict
 
 import pytest
@@ -285,3 +286,75 @@ def test_cosine_slide_curriculum_schedule_and_resume():
     args_bad.slide_ramp_epochs = 20.0
     with pytest.raises(ValueError, match="slide_ramp_steps"):
         make_curriculum_state(args_bad, updates_per_epoch=100, checkpoint={"curriculum_state": state})
+
+
+@pytest.mark.parametrize("slide_step", [0, 1, -1, 12, -12, 24, -24])
+def test_temporal_slice_equivalence_to_full_run_hdf5(tmp_path: Path, slide_step: int):
+    """Verify get_run_slice + sample_sliding_window_pair matches full-run get_run exactly."""
+    import h5py
+    import numpy as np
+    from data.vpic_hdf5_dataset import VPICWindowDataset
+
+    rng = np.random.default_rng(12345)
+    # Two HDF5 files: one native (154, 62) long run (L=80), one non-native (77, 31) short run (L=29)
+    specs = [
+        ("VPIC_PPPL_CSV_Data_official2500_beta0.2_none.h5", 0.2, "beta0.2_nu0_Bz0.1_dt2_tau100", 80, 154, 62),
+        ("VPIC_PPPL_CSV_Data_official2500_beta0.01_none.h5", 0.01, "beta0.01_nu0_Bz0.1_dt2_tau100", 29, 77, 31),
+    ]
+    for fname, beta_val, rname, L, Nx, Nz in specs:
+        fpath = tmp_path / fname
+        with h5py.File(fpath, "w") as f:
+            f.attrs["beta_file"] = beta_val
+            idx = f.create_group("index")
+            idx.create_dataset("run_names", data=np.array([rname], dtype=h5py.string_dtype()))
+            idx.create_dataset("beta", data=np.array([beta_val], dtype=np.float32))
+            idx.create_dataset("nu", data=np.array([0], dtype=np.int32))
+            idx.create_dataset("Bz0", data=np.array([0.1], dtype=np.float32))
+            idx.create_dataset("dt", data=np.array([2], dtype=np.int32))
+            idx.create_dataset("tau", data=np.array([100], dtype=np.int32))
+            idx.create_dataset("T", data=np.array([L], dtype=np.int32))
+            idx.create_dataset("Nx", data=np.array([Nx], dtype=np.int32))
+            idx.create_dataset("Nz", data=np.array([Nz], dtype=np.int32))
+            rgrp = f.create_group("runs").create_group(rname)
+            rgrp.create_dataset("fields", data=rng.standard_normal((L, 4, Nx, Nz), dtype=np.float32))
+
+    ds = VPICWindowDataset(h5_dir=tmp_path, betas=[0.01, 0.2], delta_t=24, stride_t=2, layout="C T X Z")
+    mean = torch.tensor([0.1, -0.2, 0.3, 0.7]).view(1, 4, 1, 1, 1)
+    std = torch.tensor([0.5, 0.4, 0.8, 0.3]).view(1, 4, 1, 1, 1)
+
+    for _, _, rname, L, _, _ in specs:
+        # Reference full-run extraction
+        full_phys = ds.get_run(rname)
+        full_norm = (full_phys - mean[0]) / (std[0] + 1e-8)
+
+        # Optimized slice extraction
+        g_new = torch.Generator().manual_seed(777)
+        win_a, win_b, t_a, t_b = sample_sliding_window_pair(
+            ds, rname, t0_hint=None, slide_step=slide_step, window_size=24,
+            mean=mean, std=std, device=torch.device("cpu"), generator=g_new,
+            allowed_runs={rname},
+        )
+        assert t_b == t_a + slide_step
+
+        ref_a = full_norm[:, t_a:t_a + 24]
+        assert win_a.shape == ref_a.shape == (4, 24, 154, 62)
+        assert torch.equal(torch.isfinite(win_a), torch.isfinite(ref_a))
+        assert torch.allclose(win_a, ref_a, atol=1e-6, rtol=1e-6)
+
+        ref_b = torch.full((4, 24, 154, 62), float("nan"))
+        src_s, src_e = max(t_b, 0), min(t_b + 24, L)
+        if src_s < src_e:
+            dst_s = src_s - t_b
+            ref_b[:, dst_s:dst_s + src_e - src_s] = full_norm[:, src_s:src_e]
+        assert win_b.shape == ref_b.shape == (4, 24, 154, 62)
+        fin_mask = torch.isfinite(ref_b)
+        assert torch.equal(torch.isfinite(win_b), fin_mask)
+        assert torch.allclose(win_b[fin_mask], ref_b[fin_mask], atol=1e-6, rtol=1e-6)
+
+    # Unauthorized run blocked
+    with pytest.raises(ValueError, match="outside allowed split"):
+        sample_sliding_window_pair(
+            ds, specs[0][2], 0, slide_step, 24, mean, std, torch.device("cpu"), allowed_runs={"other_run"}
+        )
+    ds.close()
+

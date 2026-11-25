@@ -2836,9 +2836,15 @@ def sample_sliding_window_pair(
     """Extract normalized (window_A, window_B) of shape (4, T, X, Z) from one physical run."""
     if allowed_runs is not None and run_name not in allowed_runs:
         raise ValueError(f"Run {run_name!r} is outside allowed split runs")
-    physical = dataset.get_run(run_name).to(device, non_blocking=True)
-    target = (physical - mean[0]) / (std[0] + 1e-8)
-    length = int(target.shape[1])
+
+    if hasattr(dataset, "get_run_length"):
+        length = int(dataset.get_run_length(run_name))
+    elif hasattr(dataset, "run_lengths") and run_name in dataset.run_lengths:
+        length = int(dataset.run_lengths[run_name])
+    else:
+        full_physical = dataset.get_run(run_name)
+        length = int(full_physical.shape[1])
+
     if length < window_size:
         raise ValueError(f"Run {run_name} has length {length} < window_size={window_size}")
 
@@ -2847,46 +2853,66 @@ def sample_sliding_window_pair(
         t_a = int(t0_hint) if (t0_hint is not None and 0 <= int(t0_hint) <= max_start) else int(
             torch.randint(0, max_start + 1, (1,), generator=generator).item()
         )
-        win_a = target[:, t_a:t_a + window_size]
+        t_b = t_a
+    else:
+        # Prefer pairs where both A and B are 100% finite physical windows
+        valid_full_starts = [
+            s_a for s_a in range(0, length - window_size + 1)
+            if 0 <= s_a + slide_step <= length - window_size
+        ]
+        if valid_full_starts:
+            if t0_hint is not None and int(t0_hint) in valid_full_starts:
+                t_a = int(t0_hint)
+            else:
+                idx = int(torch.randint(len(valid_full_starts), (1,), generator=generator).item())
+                t_a = valid_full_starts[idx]
+            t_b = t_a + slide_step
+        else:
+            # Fall back to established Phase-D boundary padding when length < window_size + |slide_step|
+            valid_padded_starts = [
+                s_a for s_a in range(0, length - window_size + 1)
+                if PhaseDStreamingBatch.can_advance_start(s_a, slide_step, length, window_size)
+            ]
+            if not valid_padded_starts:
+                raise ValueError(
+                    f"Run {run_name} (length={length}) has no valid window pair for slide_step={slide_step}"
+                )
+            if t0_hint is not None and int(t0_hint) in valid_padded_starts:
+                t_a = int(t0_hint)
+            else:
+                idx = int(torch.randint(len(valid_padded_starts), (1,), generator=generator).item())
+                t_a = valid_padded_starts[idx]
+            t_b = t_a + slide_step
+
+    read_start = max(0, min(t_a, t_b))
+    read_end = min(length, max(t_a + window_size, t_b + window_size))
+
+    if hasattr(dataset, "get_run_slice"):
+        physical_union = dataset.get_run_slice(run_name, read_start, read_end).to(device, non_blocking=True)
+    else:
+        physical_union = dataset.get_run(run_name)[:, read_start:read_end].to(device, non_blocking=True)
+    target_union = (physical_union - mean[0]) / (std[0] + 1e-8)
+
+    off_a = t_a - read_start
+    win_a = target_union[:, off_a:off_a + window_size]
+
+    if slide_step == 0:
         return win_a, win_a, t_a, t_a
 
-    # Prefer pairs where both A and B are 100% finite physical windows
-    valid_full_starts = [
-        s_a for s_a in range(0, length - window_size + 1)
-        if 0 <= s_a + slide_step <= length - window_size
-    ]
-    if valid_full_starts:
-        if t0_hint is not None and int(t0_hint) in valid_full_starts:
-            t_a = int(t0_hint)
-        else:
-            idx = int(torch.randint(len(valid_full_starts), (1,), generator=generator).item())
-            t_a = valid_full_starts[idx]
-        t_b = t_a + slide_step
-        return target[:, t_a:t_a + window_size], target[:, t_b:t_b + window_size], t_a, t_b
+    if 0 <= t_b and t_b + window_size <= length:
+        off_b = t_b - read_start
+        return win_a, target_union[:, off_b:off_b + window_size], t_a, t_b
 
-    # Fall back to established Phase-D boundary padding when length < window_size + |slide_step|
-    valid_padded_starts = [
-        s_a for s_a in range(0, length - window_size + 1)
-        if PhaseDStreamingBatch.can_advance_start(s_a, slide_step, length, window_size)
-    ]
-    if not valid_padded_starts:
-        raise ValueError(
-            f"Run {run_name} (length={length}) has no valid window pair for slide_step={slide_step}"
-        )
-    if t0_hint is not None and int(t0_hint) in valid_padded_starts:
-        t_a = int(t0_hint)
-    else:
-        idx = int(torch.randint(len(valid_padded_starts), (1,), generator=generator).item())
-        t_a = valid_padded_starts[idx]
-    t_b = t_a + slide_step
-
-    win_a = target[:, t_a:t_a + window_size]
-    win_b = target.new_full((4, window_size, target.shape[2], target.shape[3]), float("nan"))
+    win_b = target_union.new_full(
+        (4, window_size, target_union.shape[2], target_union.shape[3]), float("nan")
+    )
     src_start = max(t_b, 0)
     src_end = min(t_b + window_size, length)
     if src_start < src_end:
         dst_start = src_start - t_b
-        win_b[:, dst_start:dst_start + src_end - src_start] = target[:, src_start:src_end]
+        u_start = src_start - read_start
+        u_end = src_end - read_start
+        win_b[:, dst_start:dst_start + src_end - src_start] = target_union[:, u_start:u_end]
     return win_a, win_b, t_a, t_b
 
 
