@@ -438,6 +438,7 @@ if ${ABCD_SYMMETRIC}; then EPOCHS=45; fi
 if ${GLOBAL_COSINE}; then EPOCHS=240; fi
 if ${FROMSCRATCH_48H}; then EPOCHS=1000; fi
 if ${THREE_PHASE_GLOBAL_COSINE}; then EPOCHS=256; fi
+if ${ADAPTIVE_PHASE_D_SLIDING}; then EPOCHS=240; fi
 if ${PHASE_D_PROBE}; then EPOCHS=1000; fi
 if ${PHASE_C_K2_PROBE}; then EPOCHS=${PROBE_EPOCHS}; fi
 STOP_EPOCH=${EPOCHS}
@@ -923,7 +924,9 @@ phase_a = phase_a_convergence(
 if not phase_a["phase_a"] or phase_a["stable_count"] != 0 or phase_a["ready_for_variance_ramp"]:
     raise ValueError(f"Phase-A convergence state is not fresh: {phase_a}")
 expected_epochs = (
-    256 if args.curriculum_config == "three_phase_global_cosine" else 1000
+    240
+    if args.adaptive_phase_d_sliding
+    else (256 if args.curriculum_config == "three_phase_global_cosine" else 1000)
 )
 if (args.epochs, args.final_epoch, args.stop_after_epochs) != (
     expected_epochs, expected_epochs, expected_epochs,

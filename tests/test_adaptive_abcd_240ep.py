@@ -211,11 +211,23 @@ def test_auto_train_monitor_mock_lifecycle(tmp_path: Path):
     mock_sbatch = proj / "train_masked_unet3d_4n16g.sbatch"
     mock_sbatch.write_text("""#!/bin/bash
 set -euo pipefail
+if [[ "$1" == "--adaptive-abcd-sliding-240ep" ]] && [[ -e "${PWD}/runs/test_run" ]]; then
+    echo "ERROR: fresh output directory already exists: ${PWD}/runs/test_run; refusing overwrite/resume." >&2
+    exit 1
+fi
+if [[ "${MOCK_MODE:-normal}" == "no_progress" ]]; then
+    exit 0
+fi
 mkdir -p "${PWD}/runs/test_run"
 LOG_FLAGS="${PWD}/runs/test_run/invocations.log"
 echo "$1" >> "${LOG_FLAGS}"
 COUNT=$(wc -l < "${LOG_FLAGS}")
-if [[ "${MOCK_MODE:-normal}" == "no_progress" ]]; then
+if [[ "${MOCK_MODE:-normal}" == "incomplete_at_target" ]]; then
+    python3 -c "
+import json, torch
+torch.save({'epoch': 10, 'curriculum_state': {'adaptive_phase_d_sliding': True, 'slide_ramp_armed': False}}, '${PWD}/runs/test_run/latest.pt')
+json.dump([{'epoch': 10}], open('${PWD}/runs/test_run/history.json', 'w'))
+"
     exit 0
 fi
 if [[ "${COUNT}" -eq 1 ]]; then
@@ -276,7 +288,7 @@ bash -c "$1"
     invocations = (run_dir / "invocations.log").read_text().splitlines()
     assert invocations == ["--adaptive-abcd-sliding-240ep", "--resume-adaptive-abcd-sliding-240ep"]
 
-    # 2. Test no-progress failure halt
+    # 2. Test no-progress failure halt (and monitor log location outside RUN_DIR)
     proj2 = tmp_path / "proj2"
     proj2.mkdir()
     (proj2 / "train_masked_unet3d_4n16g.sbatch").write_text(mock_sbatch.read_text())
@@ -285,4 +297,17 @@ bash -c "$1"
     env2.update({"PROJECT_DIR": str(proj2), "MOCK_MODE": "no_progress", "MOCK_FAIL_FIRST": "0"})
     res2 = subprocess.run(["bash", str(script)], cwd=str(proj2), env=env2, capture_output=True, text=True, timeout=30)
     assert res2.returncode != 0
-    assert "consecutive sessions made zero progress" in (proj2 / "runs" / run_name / "auto_resume_monitor.log").read_text()
+    mon_log2 = proj2 / "runs" / f".monitor_{run_name}" / "auto_resume_monitor.log"
+    assert "consecutive sessions made zero progress" in mon_log2.read_text()
+
+    # 3. Test incomplete curriculum at target epoch halt
+    proj3 = tmp_path / "proj3"
+    proj3.mkdir()
+    (proj3 / "train_masked_unet3d_4n16g.sbatch").write_text(mock_sbatch.read_text())
+    (proj3 / "train_masked_unet3d_4n16g.sbatch").chmod(0o755)
+    env3 = env.copy()
+    env3.update({"PROJECT_DIR": str(proj3), "MOCK_MODE": "incomplete_at_target", "MOCK_FAIL_FIRST": "0"})
+    res3 = subprocess.run(["bash", str(script)], cwd=str(proj3), env=env3, capture_output=True, text=True, timeout=30)
+    assert res3.returncode != 0
+    mon_log3 = proj3 / "runs" / f".monitor_{run_name}" / "auto_resume_monitor.log"
+    assert "curriculum incomplete" in mon_log3.read_text()
