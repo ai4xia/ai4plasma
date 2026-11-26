@@ -3775,8 +3775,10 @@ def train_one_epoch(
                         components.get("L_gkl_1", component_zero),
                     ]).detach().double()
             if step % curriculum_log_every == 0 or step + 1 == len(loader):
-                region = ("D" if phase_d_active else
-                          ("A" if lambda_v == 0 else ("B" if lambda_r == 0 else "C")))
+                region = "ABCD"[curriculum_phase(
+                    epoch_number, curriculum_state,
+                    lambda_v, lambda_r, curriculum_config,
+                )[0]]
                 message = (f"Curriculum {region}: successful_step={coordinate} "
                            f"next_successful_step={curriculum_state['successful_optimizer_steps']} "
                            f"lambda_v={lambda_v:.9g} lambda_r={lambda_r:.9g} "
