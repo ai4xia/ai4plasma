@@ -1349,6 +1349,50 @@ def full_mse_loss(
     return torch.stack(group_losses).mean()
 
 
+def four_channel_equal_mse_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    visible_mask: torch.Tensor,
+) -> torch.Tensor:
+    """MSE equally weighted across all physical channels and visible/hidden regions."""
+    num_channels = int(pred.shape[1])
+    channel_losses = []
+    for c_idx in range(num_channels):
+        ch_pred = pred[:, c_idx : c_idx + 1]
+        ch_target = target[:, c_idx : c_idx + 1]
+        ch_visible = visible_mask[:, c_idx : c_idx + 1]
+        finite = torch.isfinite(ch_target)
+        component_losses = []
+        for selected in (
+            finite & (ch_visible > 0.5),
+            finite & (ch_visible <= 0.5),
+        ):
+            if selected.any():
+                component_losses.append(
+                    (ch_pred[selected] - ch_target[selected]).square().mean()
+                )
+        if component_losses:
+            channel_losses.append(torch.stack(component_losses).mean())
+
+    if not channel_losses:
+        raise ValueError("The reconstruction objective requires at least one finite target")
+    return torch.stack(channel_losses).mean()
+
+
+def reconstruction_mse_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    visible_mask: torch.Tensor,
+    weighting: str = "group_balanced",
+) -> torch.Tensor:
+    """Dispatch reconstruction MSE by channel-weighting convention."""
+    if weighting == "group_balanced":
+        return full_mse_loss(pred, target, visible_mask)
+    if weighting == "channel_equal":
+        return four_channel_equal_mse_loss(pred, target, visible_mask)
+    raise ValueError(f"Unknown reconstruction_loss_weighting: {weighting!r}")
+
+
 def full_mae_loss(
     pred: torch.Tensor,
     target: torch.Tensor,

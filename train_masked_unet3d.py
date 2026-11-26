@@ -45,11 +45,14 @@ from data.masking import (
     predicted_error_mse_loss,
     GAUSSIAN_NLL_VARIANCE_FLOOR,
     parse_pattern_weights,
+    reconstruction_mse_loss,
     sample_independent_batch_masks,
     sample_patterns,
     sample_training_severity_counts,
     temporal_extrapolation_frames,
     make_fixed_validation_mask,
+    _checkerboard_spatial_plane,
+    _sparse_probe_grid_plane,
 )
 try:
     from data.masking import sample_training_patterns
@@ -531,6 +534,24 @@ def parse_args(argv=None):
             "Adaptive 4-phase A->B->C->D from-scratch curriculum: convergence-triggered "
             "40-epoch cosine ramps for lambda_v, lambda_r, and lambda_slide."
         ),
+    )
+    p.add_argument(
+        "--reconstruction-loss-weighting",
+        choices=("group_balanced", "channel_equal"),
+        default="group_balanced",
+        help="Channel weighting for reconstruction MSE: group_balanced (B/Density 50/50) or channel_equal (25%% each).",
+    )
+    p.add_argument(
+        "--grid-match-prob",
+        type=float,
+        default=0.0,
+        help="Optional per-sample probability of injecting a 50%% spatial_grid mask for ablation studies.",
+    )
+    p.add_argument(
+        "--grid-match-mode",
+        choices=("checkerboard_shared", "severity50_grid"),
+        default="checkerboard_shared",
+        help="Targeted grid ablation mode when --grid-match-prob > 0.",
     )
 
     args = p.parse_args(argv)
@@ -1328,6 +1349,9 @@ def validate_resume_parameters(args, checkpoint_args: Dict[str, Any]) -> None:
         new_value = getattr(args, key)
         if (key == "final_epoch" and getattr(args, "curriculum_training", False)
                 and old_value == 240 and new_value == 200):
+            continue
+        if (key == "final_epoch" and getattr(args, "adaptive_phase_d_sliding", False)
+                and old_value == 240 and new_value >= 240):
             continue
         if (key in {"channel_mults", "betas", "val_patterns"}
                 and isinstance(old_value, (list, tuple))
@@ -2510,7 +2534,9 @@ def phase_d_convergence(history, args, curriculum_state):
 def sample_training_mask(y, pattern_weights, density_p_zero, density_p_full,
                          magnetic_p_zero, magnetic_p_full,
                          temporal_extrapolation=False,
-                         temporal_extrapolation_only=False):
+                         temporal_extrapolation_only=False,
+                         grid_match_prob: float = 0.0,
+                         grid_match_mode: str = "checkerboard_shared"):
     """Shared existing mask sampling for the ordinary pass and rollout pass."""
     batch_size, _, time_steps, nx, nz = y.shape
     spatial_sites = nx * nz
@@ -2641,6 +2667,39 @@ def sample_training_mask(y, pattern_weights, density_p_zero, density_p_full,
                     3.0 * infos[i]["magnetic_actual_mask_fraction"]
                     + infos[i]["density_actual_mask_fraction"]
                 ) / 4.0
+    if grid_match_prob > 0.0:
+        for i in range(batch_size):
+            if float(torch.rand(()).item()) >= grid_match_prob:
+                continue
+            if grid_match_mode == "checkerboard_shared":
+                parity = int(torch.randint(0, 2, (1,)).item())
+                cb = _checkerboard_spatial_plane(nx, nz)
+                if parity == 1:
+                    cb = 1.0 - cb
+                plane = cb[0].expand(4, time_steps, nx, nz).to(device=y.device, dtype=y.dtype)
+                mask[i] = plane
+                c_vis = int(cb.sum().item())
+                magnetic_patterns[i] = "spatial_grid"
+                density_patterns[i] = "spatial_grid"
+                magnetic_counts[i] = c_vis
+                density_counts[i] = c_vis
+                magnetic_fractions[i] = 1.0 - c_vis / float(spatial_sites)
+                density_fractions[i] = 1.0 - c_vis / float(spatial_sites)
+            elif grid_match_mode == "severity50_grid":
+                lo_c = int(round(0.45 * spatial_sites))
+                hi_c = int(round(0.55 * spatial_sites))
+                cm = int(torch.randint(lo_c, hi_c + 1, (1,)).item())
+                cd = int(torch.randint(lo_c, hi_c + 1, (1,)).item())
+                pm, _ = _sparse_probe_grid_plane(1, 1, nx, nz, cm, None)
+                pd_p, _ = _sparse_probe_grid_plane(1, 1, nx, nz, cd, None)
+                mask[i, :3] = pm[0].expand(3, time_steps, nx, nz).to(device=y.device, dtype=y.dtype)
+                mask[i, 3:4] = pd_p[0].expand(1, time_steps, nx, nz).to(device=y.device, dtype=y.dtype)
+                magnetic_patterns[i] = "spatial_grid"
+                density_patterns[i] = "spatial_grid"
+                magnetic_counts[i] = cm
+                density_counts[i] = cd
+                magnetic_fractions[i] = 1.0 - cm / float(spatial_sites)
+                density_fractions[i] = 1.0 - cd / float(spatial_sites)
     return (mask, infos, magnetic_patterns, density_patterns, magnetic_fractions,
             density_fractions, magnetic_counts, density_counts)
 
@@ -3194,6 +3253,7 @@ def curriculum_forward_loss(
     slide_step: int = 0,
     reuse_targets: Optional[Sequence[torch.Tensor]] = None,
     reuse_noises: Optional[Sequence[torch.Tensor]] = None,
+    reconstruction_loss_weighting: str = "group_balanced",
 ):
     """Phase A/B pass or Phase-C reuse for the selected curriculum."""
     three_phase = curriculum_config == "three_phase_global_cosine"
@@ -3210,7 +3270,9 @@ def curriculum_forward_loss(
         return combined / (1.0 + lambda_v) if three_phase else combined
 
     pred, variance = model(model_input, detach_variance_features=detach_variance_features)
-    mu_loss = full_mse_loss(pred, target, mask)
+    mu_loss = reconstruction_mse_loss(
+        pred, target, mask, weighting=reconstruction_loss_weighting
+    )
     if gkl_alpha is not None and lambda_v > 0:
         alpha = float(gkl_alpha)
         l_st = (
@@ -3283,7 +3345,9 @@ def curriculum_forward_loss(
             next_mean, next_variance = model(
                 reuse_input, detach_variance_features=detach_variance_features,
             )
-            next_mu_loss = full_mse_loss(next_mean, reuse_target, exact_mask)
+            next_mu_loss = reconstruction_mse_loss(
+                next_mean, reuse_target, exact_mask, weighting=reconstruction_loss_weighting
+            )
             if gkl_alpha is not None and lambda_v > 0:
                 alpha = float(gkl_alpha)
                 next_l_st = (
@@ -3389,6 +3453,9 @@ def train_one_epoch(
     dataset: Optional[Any] = None,
     slide_rng: Optional[torch.Generator] = None,
     allowed_runs: Optional[AbstractSet[str]] = None,
+    reconstruction_loss_weighting: str = "group_balanced",
+    grid_match_prob: float = 0.0,
+    grid_match_mode: str = "checkerboard_shared",
 ) -> Dict[str, Any]:
     model.train()
     is_gkl = gkl_continuation_20ep or gkl_joint_grad_continuation_20ep
@@ -3512,7 +3579,9 @@ def train_one_epoch(
             y, pattern_weights, density_visible_p_zero, density_visible_p_full,
             magnetic_visible_p_zero, magnetic_visible_p_full,
             temporal_extrapolation_continuation,
-            temporal_extrapolation_only_continuation)
+            temporal_extrapolation_only_continuation,
+            grid_match_prob=grid_match_prob,
+            grid_match_mode=grid_match_mode)
         for pattern, count in zip(density_patterns, density_visible_counts):
             if pattern not in PROBE_COUNT_PATTERNS:
                 continue
@@ -3564,6 +3633,8 @@ def train_one_epoch(
                     magnetic_visible_p_zero, magnetic_visible_p_full,
                     temporal_extrapolation_continuation,
                     temporal_extrapolation_only_continuation,
+                    grid_match_prob=grid_match_prob,
+                    grid_match_mode=grid_match_mode,
                 )[0]
                 for _ in range(reuse_steps)
             ) if lambda_r > 0 and not phase_d_active else None)
@@ -3571,7 +3642,9 @@ def train_one_epoch(
         with torch.cuda.amp.autocast(enabled=(amp and device.type == "cuda"), dtype=amp_dtype):
             if phase_d_active:
                 pred, output_variance = model(model_input, detach_variance_features=True)
-                reconstruction_loss = full_mse_loss(pred, y, mask)
+                reconstruction_loss = reconstruction_mse_loss(
+                    pred, y, mask, weighting=reconstruction_loss_weighting
+                )
                 variance_loss = predicted_error_mse_loss(
                     output_variance, pred, y, uncertainty_loss, student_t_df,
                 )
@@ -3619,6 +3692,7 @@ def train_one_epoch(
                     mean_only_phase_c_reuse=mean_only_phase_c_reuse,
                     slide_step=step_slide,
                     reuse_targets=reuse_targets,
+                    reconstruction_loss_weighting=reconstruction_loss_weighting,
                 )
                 reconstruction_loss = components["L_mu_0"]
                 variance_loss = components["L_var_0"]
@@ -3626,7 +3700,9 @@ def train_one_epoch(
                 pred = model(model_input)
                 if uncertainty_aware:
                     pred, output_variance = pred
-                reconstruction_loss = full_mse_loss(pred, y, mask)
+                reconstruction_loss = reconstruction_mse_loss(
+                    pred, y, mask, weighting=reconstruction_loss_weighting
+                )
                 loss = reconstruction_loss
                 if uncertainty_aware:
                     variance_loss = predicted_error_mse_loss(
@@ -5230,6 +5306,11 @@ def main():
             adaptive_phase_d_sliding=getattr(args, "adaptive_phase_d_sliding", False),
             dataset=dataset,
             allowed_runs=set(train_runs),
+            reconstruction_loss_weighting=getattr(
+                args, "reconstruction_loss_weighting", "group_balanced"
+            ),
+            grid_match_prob=float(getattr(args, "grid_match_prob", 0.0)),
+            grid_match_mode=str(getattr(args, "grid_match_mode", "checkerboard_shared")),
         )
 
         rollout_validation = bool(
