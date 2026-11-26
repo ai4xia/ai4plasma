@@ -226,7 +226,7 @@ case "${1:-}" in
         THREE_PHASE_JOINT_NLL_GRAD=true; FRESH_GKL_JOINT_GRAD=true
         ADAPTIVE_PHASE_D_SLIDING=true; FROMSCRATCH_48H=true
         if [[ "$1" == --adaptive-abcd-sliding-240ep ]]; then RESUMING=false; fi
-        CURRICULUM_STOP=""; FINAL_EPOCH=240
+        CURRICULUM_STOP=""; FINAL_EPOCH=256
         MODEL_ARGS=(--model-version direct_unet3d_no_activation_norm_v3); shift ;;
     "") ;;
     *) echo "Unknown training mode: $1" >&2; exit 2 ;;
@@ -438,7 +438,6 @@ if ${ABCD_SYMMETRIC}; then EPOCHS=45; fi
 if ${GLOBAL_COSINE}; then EPOCHS=240; fi
 if ${FROMSCRATCH_48H}; then EPOCHS=1000; fi
 if ${THREE_PHASE_GLOBAL_COSINE}; then EPOCHS=256; fi
-if ${ADAPTIVE_PHASE_D_SLIDING}; then EPOCHS=240; fi
 if ${PHASE_D_PROBE}; then EPOCHS=1000; fi
 if ${PHASE_C_K2_PROBE}; then EPOCHS=${PROBE_EPOCHS}; fi
 STOP_EPOCH=${EPOCHS}
@@ -723,8 +722,8 @@ if ${STAGE1_NLL} || ${CURRICULUM}; then
                 --wandb-tags from-scratch global-cosine-2e4-1e5 48h
             )
             if ${ADAPTIVE_PHASE_D_SLIDING}; then
-                TRAIN_ARGS+=(four-phase adaptive-abcd-sliding joint-gkl-gradient differentiable-phase-c-reuse)
-                TRAIN_ARGS+=(--joint-nll-grad --differentiable-phase-c-reuse --adaptive-phase-d-sliding --slide-ramp-epochs 40.0)
+                TRAIN_ARGS+=(four-phase adaptive-abcd-sliding joint-gkl-gradient differentiable-phase-c-reuse channel-equal grid-match-15)
+                TRAIN_ARGS+=(--joint-nll-grad --differentiable-phase-c-reuse --adaptive-phase-d-sliding --slide-ramp-epochs 40.0 --reconstruction-loss-weighting channel_equal --grid-match-prob 0.15 --grid-match-mode checkerboard_shared)
             elif ${FRESH_GKL_JOINT_GRAD}; then
                 TRAIN_ARGS+=(three-phase k1-reuse joint-gkl-gradient differentiable-phase-c-reuse no-phase-d)
                 TRAIN_ARGS+=(--joint-nll-grad --differentiable-phase-c-reuse)
@@ -930,9 +929,9 @@ phase_a = phase_a_convergence(
 if not phase_a["phase_a"] or phase_a["stable_count"] != 0 or phase_a["ready_for_variance_ramp"]:
     raise ValueError(f"Phase-A convergence state is not fresh: {phase_a}")
 expected_epochs = (
-    240
-    if args.adaptive_phase_d_sliding
-    else (256 if args.curriculum_config == "three_phase_global_cosine" else 1000)
+    256
+    if (args.adaptive_phase_d_sliding or args.curriculum_config == "three_phase_global_cosine")
+    else 1000
 )
 if (args.epochs, args.final_epoch) != (expected_epochs, expected_epochs):
     raise ValueError(
