@@ -103,13 +103,24 @@ def run_targeted_tests() -> dict:
             saw_mag_only = saw_mag_only or (has_b and not has_d)
             saw_den_only = saw_den_only or (has_d and not has_b)
     assert saw_mag_only and saw_den_only
-    # Bounded retry when p_zero=1.0
-    m_imp, *_ = sample_training_mask(
+    # Bounded retry raises RuntimeError when p_zero=1.0 and reject_joint_empty=True
+    try:
+        sample_training_mask(
+            y, {"spatial_random": 1.0}, 1.0, 0.0, 1.0, 0.0,
+            reject_joint_empty=True, _max_empty_retries=4,
+        )
+        raise AssertionError("Expected RuntimeError when all retries yield joint-empty masks!")
+    except RuntimeError as exc:
+        assert "nonempty" in str(exc).lower() and "_max_empty_retries=4" in str(exc)
+    # Legacy reject_joint_empty=False remains unchanged
+    m_leg_empty, *_ = sample_training_mask(
         y, {"spatial_random": 1.0}, 1.0, 0.0, 1.0, 0.0,
-        reject_joint_empty=True, _max_empty_retries=4,
+        reject_joint_empty=False,
     )
-    assert m_imp.shape == y.shape
-    results["test_8_9_single_modality_and_nonempty"] = "PASS (mag_only=True, den_only=True, joint_empty=0, bounded_retry=PASS)"
+    assert m_leg_empty.shape == y.shape and float(m_leg_empty.sum().item()) == 0.0
+    results["test_8_9_single_modality_and_nonempty"] = (
+        "PASS (mag_only=True, den_only=True, joint_empty=0, exhausted_retry_raises=PASS, legacy_allow_empty=PASS)"
+    )
 
     # 10 & 11. Legacy reproducibility + masking_version & resume compatibility
     a_leg = parse_args(["--masking-sampler", "legacy_v11", "--grid-match-prob", "0.15"])

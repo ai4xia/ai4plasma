@@ -2791,6 +2791,12 @@ def sample_training_mask(y, pattern_weights, density_p_zero, density_p_full,
                     magnetic_counts[i] = r_mc[0]
                     density_counts[i] = r_dc[0]
                     break
+            else:
+                raise RuntimeError(
+                    f"Failed to sample a nonempty observation mask for sample {i} "
+                    f"within _max_empty_retries={_max_empty_retries} attempts "
+                    f"(density_p_zero={density_p_zero}, magnetic_p_zero={magnetic_p_zero})."
+                )
     return (mask, infos, magnetic_patterns, density_patterns, magnetic_fractions,
             density_fractions, magnetic_counts, density_counts)
 
