@@ -24,7 +24,9 @@ TEMPORAL_EXTRAPOLATION_PATTERN = "temporal_extrapolation"
 # Increment this whenever the training-time meaning of a mask changes. It is
 # stored in checkpoints so auto-resume cannot silently mix incompatible mask
 # distributions in one run.
-MASKING_VERSION = "independentBD_fiveMask_logUniformCounts_orientedSpatialBlock_sharedTemporal_v11"
+LEGACY_MASKING_VERSION_V11 = "independentBD_fiveMask_logUniformCounts_orientedSpatialBlock_sharedTemporal_v11"
+GENERAL_MASKING_VERSION_V12 = "independentBD_fiveMask_mixedLogUniform50_diverseGrid_nonEmpty_v12"
+MASKING_VERSION = GENERAL_MASKING_VERSION_V12
 
 PATTERN_TO_ID: Dict[str, int] = {name: i for i, name in enumerate(MASK_PATTERNS)}
 
@@ -251,6 +253,40 @@ def sample_endpoint_log_uniform_count(
     )
 
 
+def sample_endpoint_mixed_count(
+    n_max: int,
+    p_zero: float,
+    p_full: float,
+    interior_uniform_weight: float = 0.5,
+    generator: Optional[torch.Generator] = None,
+) -> int:
+    """Draw 0, a mixed log-uniform/uniform interior count in [1, n_max-1], or n_max."""
+    n_max = int(n_max)
+    if n_max < 1:
+        raise ValueError(f"n_max must be >= 1, got {n_max}.")
+    _validate_endpoint_probabilities(p_zero, p_full)
+    w_uni = float(interior_uniform_weight)
+    if not (0.0 <= w_uni <= 1.0):
+        raise ValueError(
+            f"interior_uniform_weight must lie in [0, 1], got {interior_uniform_weight}."
+        )
+
+    u = _rand(generator)
+    if u < p_zero:
+        return 0
+    if u < p_zero + p_full:
+        return n_max
+    if n_max == 1:
+        return n_max
+    if n_max == 2:
+        return 1
+    if w_uni > 0.0 and (w_uni >= 1.0 or _rand(generator) < w_uni):
+        return int(torch.randint(1, n_max, (1,), generator=generator).item())
+    return _round_clamp(
+        _log_uniform(1.0, float(n_max - 1), generator), 1, n_max - 1
+    )
+
+
 def sample_training_severity_counts(
     patterns: Sequence[str],
     *,
@@ -258,13 +294,15 @@ def sample_training_severity_counts(
     time_steps: int,
     p_zero: float,
     p_full: float,
+    interior_uniform_weight: float = 0.0,
     generator: Optional[torch.Generator] = None,
 ) -> List[Optional[int]]:
     """Draw training-time visible counts for one modality.
 
-    Probe patterns use the 0 / log-uniform / full mixture. temporal_random
-    draws a uniform visible-frame count in [0, T]. temporal_block draws a
-    uniform visible-frame count in [1, T-1]. spatial_block keeps its
+    Probe patterns use the 0 / interior / full mixture (pure log-uniform when
+    interior_uniform_weight=0.0, or mixed uniform/log-uniform when > 0.0).
+    temporal_random draws a uniform visible-frame count in [0, T]. temporal_block
+    draws a uniform visible-frame count in [1, T-1]. spatial_block keeps its
     Uniform(0, 1) area fraction and therefore returns None.
     """
     _validate_endpoint_probabilities(p_zero, p_full)
@@ -282,11 +320,22 @@ def sample_training_severity_counts(
                 f"Unknown mask pattern {pattern!r}. Available: {list(MASK_PATTERNS)}"
             )
         if pattern in PROBE_COUNT_PATTERNS:
-            counts.append(
-                sample_endpoint_log_uniform_count(
-                    spatial_sites, p_zero, p_full, generator
+            if float(interior_uniform_weight) > 0.0:
+                counts.append(
+                    sample_endpoint_mixed_count(
+                        spatial_sites,
+                        p_zero,
+                        p_full,
+                        interior_uniform_weight=interior_uniform_weight,
+                        generator=generator,
+                    )
                 )
-            )
+            else:
+                counts.append(
+                    sample_endpoint_log_uniform_count(
+                        spatial_sites, p_zero, p_full, generator
+                    )
+                )
         elif pattern == "temporal_random":
             counts.append(
                 int(
@@ -426,6 +475,117 @@ def _sparse_probe_grid_plane(B, C, X, Z, probe_count, generator):
     plane[..., grid_x[selected], grid_z[selected]] = 1.0
     return plane, {
         "probe_count": probe_count,
+        "grid_count_x": count_x,
+        "grid_count_z": count_z,
+        "offset_x": offset_x,
+        "offset_z": offset_z,
+    }
+
+
+def _diverse_probe_grid_plane(B, C, X, Z, probe_count, generator):
+    """Create a diverse regular/staggered/jittered spatial layout with exact N probes."""
+    probe_count = int(probe_count)
+    spatial_sites = X * Z
+    if not (0 <= probe_count <= spatial_sites):
+        raise ValueError(
+            f"probe_count must lie in [0, {spatial_sites}], got {probe_count}."
+        )
+
+    plane = torch.zeros(1, C, 1, X, Z)
+    if probe_count == 0:
+        return plane, {
+            "probe_count": 0,
+            "grid_family": "empty",
+            "grid_count_x": 0,
+            "grid_count_z": 0,
+            "offset_x": 0,
+            "offset_z": 0,
+        }
+    if probe_count == spatial_sites:
+        plane.fill_(1.0)
+        return plane, {
+            "probe_count": probe_count,
+            "grid_family": "full",
+            "grid_count_x": X,
+            "grid_count_z": Z,
+            "offset_x": 0,
+            "offset_z": 0,
+        }
+
+    domain_aspect = float(X) / float(Z)
+    candidates = []
+    for count_x in range(1, min(X, probe_count) + 1):
+        count_z = int(math.ceil(probe_count / count_x))
+        if count_z > Z:
+            continue
+        grid_sites = count_x * count_z
+        aspect_error = abs(math.log((count_x / count_z) / domain_aspect))
+        excess_fraction = float(grid_sites - probe_count) / float(probe_count)
+        candidates.append((aspect_error + 0.1 * excess_fraction, aspect_error, count_x, count_z))
+    if not candidates:
+        raise RuntimeError(
+            f"Could not place {probe_count} probes on a {X}x{Z} domain."
+        )
+    candidates.sort(key=lambda item: item[0])
+    diverse_pool = [c for c in candidates if c[1] <= 1.2] or candidates[:1]
+    diverse_pool = diverse_pool[:6]
+    pick_idx = _randint(len(diverse_pool), generator)
+    _, _, count_x, count_z = diverse_pool[pick_idx]
+
+    step_x = max(1, X // count_x)
+    step_z = max(1, Z // count_z)
+    offset_x = _randint(step_x, generator)
+    offset_z = _randint(step_z, generator)
+    x_base = torch.floor(torch.arange(count_x, dtype=torch.float32) * X / count_x).long()
+    z_base = torch.floor(torch.arange(count_z, dtype=torch.float32) * Z / count_z).long()
+
+    family_idx = _randint(3, generator)
+    if family_idx == 0:
+        grid_family = "aligned"
+        gx = x_base.add(offset_x).remainder(X)[:, None].expand(count_x, count_z).reshape(-1)
+        gz = z_base.add(offset_z).remainder(Z)[None, :].expand(count_x, count_z).reshape(-1)
+    elif family_idx == 1:
+        grid_family = "staggered"
+        if count_x >= 2 and step_z >= 2:
+            half_z = max(1, step_z // 2)
+            row_shift = (torch.arange(count_x, dtype=torch.long) % 2) * half_z
+            gx = x_base.add(offset_x).remainder(X)[:, None].expand(count_x, count_z).reshape(-1)
+            gz = (z_base[None, :] + offset_z + row_shift[:, None]).remainder(Z).reshape(-1)
+        elif count_z >= 2 and step_x >= 2:
+            half_x = max(1, step_x // 2)
+            col_shift = (torch.arange(count_z, dtype=torch.long) % 2) * half_x
+            gx = (x_base[:, None] + offset_x + col_shift[None, :]).remainder(X).reshape(-1)
+            gz = z_base.add(offset_z).remainder(Z)[None, :].expand(count_x, count_z).reshape(-1)
+        else:
+            gx = x_base.add(offset_x).remainder(X)[:, None].expand(count_x, count_z).reshape(-1)
+            gz = z_base.add(offset_z).remainder(Z)[None, :].expand(count_x, count_z).reshape(-1)
+    else:
+        grid_family = "jittered"
+        gx0 = x_base.add(offset_x).remainder(X)[:, None].expand(count_x, count_z).reshape(-1)
+        gz0 = z_base.add(offset_z).remainder(Z)[None, :].expand(count_x, count_z).reshape(-1)
+        jx = torch.randint(-1, 2, (gx0.numel(),), generator=generator)
+        jz = torch.randint(-1, 2, (gz0.numel(),), generator=generator)
+        gx = (gx0 + jx).clamp(0, X - 1)
+        gz = (gz0 + jz).clamp(0, Z - 1)
+
+    if grid_family == "jittered":
+        plane[..., gx, gz] = 1.0
+        cur = int(plane[0, 0, 0].sum().item())
+        if cur > probe_count:
+            ones = (plane[0, 0, 0] > 0.5).nonzero(as_tuple=False)
+            drop = ones[torch.randperm(ones.shape[0], generator=generator)[: cur - probe_count]]
+            plane[..., drop[:, 0], drop[:, 1]] = 0.0
+        elif cur < probe_count:
+            zeros = (plane[0, 0, 0] < 0.5).nonzero(as_tuple=False)
+            add = zeros[torch.randperm(zeros.shape[0], generator=generator)[: probe_count - cur]]
+            plane[..., add[:, 0], add[:, 1]] = 1.0
+    else:
+        selected = torch.randperm(gx.numel(), generator=generator)[:probe_count]
+        plane[..., gx[selected], gz[selected]] = 1.0
+
+    return plane, {
+        "probe_count": probe_count,
+        "grid_family": grid_family,
         "grid_count_x": count_x,
         "grid_count_z": count_z,
         "offset_x": offset_x,
@@ -669,6 +829,7 @@ def _sample_modality_mask(
     mask_fraction: float,
     generator: Optional[torch.Generator],
     visible_count: Optional[int] = None,
+    diverse_spatial_grid: bool = False,
 ):
     """Sample one B or Density layout without sampling the other modality."""
     p = float(mask_fraction)
@@ -679,6 +840,8 @@ def _sample_modality_mask(
     if pattern == "spatial_grid":
         if visible_count is None:
             return _spatial_grid_plane(1, 1, X, Z, p, generator)
+        if diverse_spatial_grid:
+            return _diverse_probe_grid_plane(1, 1, X, Z, visible_count, generator)
         return _sparse_probe_grid_plane(1, 1, X, Z, visible_count, generator)
     if pattern == "spatial_block":
         return _spatial_block_plane(
@@ -1030,6 +1193,7 @@ def sample_independent_batch_masks(
     generator: Optional[torch.Generator] = None,
     density_probe_counts: Optional[Sequence[Optional[int]]] = None,
     magnetic_visible_counts: Optional[Sequence[Optional[int]]] = None,
+    diverse_spatial_grid: bool = False,
 ) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
     """Sample independent magnetic and Density patterns for every sample.
 
@@ -1136,6 +1300,7 @@ def sample_independent_batch_masks(
                 mask_fraction=magnetic_fraction,
                 generator=generator,
                 visible_count=magnetic_visible_counts[i],
+                diverse_spatial_grid=diverse_spatial_grid,
             )
             density_small, density_info = _sample_modality_mask(
                 modality="density",
@@ -1146,6 +1311,7 @@ def sample_independent_batch_masks(
                 mask_fraction=density_fraction,
                 generator=generator,
                 visible_count=density_probe_counts[i],
+                diverse_spatial_grid=diverse_spatial_grid,
             )
             magnetic_small = magnetic_small.expand(1, 3, T, X, Z)
             density_small = density_small.expand(1, 1, T, X, Z)

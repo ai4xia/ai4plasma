@@ -33,6 +33,8 @@ from data.vpic_hdf5_dataset import (
 )
 from data.masking import (
     DEFAULT_PATTERN_WEIGHTS,
+    GENERAL_MASKING_VERSION_V12,
+    LEGACY_MASKING_VERSION_V11,
     MASKING_VERSION,
     MASK_PATTERNS,
     PATTERN_TO_ID,
@@ -553,8 +555,41 @@ def parse_args(argv=None):
         default="checkerboard_shared",
         help="Targeted grid ablation mode when --grid-match-prob > 0.",
     )
+    p.add_argument(
+        "--masking-sampler",
+        choices=("general_v12", "legacy_v11"),
+        default="general_v12",
+        help="Training masking sampler preset: general_v12 (mixed counts, diverse grid, non-empty) or legacy_v11.",
+    )
+    p.add_argument(
+        "--interior-uniform-weight",
+        type=float,
+        default=None,
+        help="Override uniform mixture weight in [0, 1] for interior probe counts (default: 0.5 for general_v12, 0.0 for legacy_v11).",
+    )
+    p.add_argument(
+        "--diverse-spatial-grid",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use diverse regular/staggered/jittered spatial_grid generator (default: True for general_v12, False for legacy_v11).",
+    )
+    p.add_argument(
+        "--reject-joint-empty",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Reject and resample masks where both Magnetic and Density are completely unobserved (default: True for general_v12, False for legacy_v11).",
+    )
 
     args = p.parse_args(argv)
+    is_legacy_v11 = args.masking_sampler == "legacy_v11"
+    if args.interior_uniform_weight is None:
+        args.interior_uniform_weight = 0.0 if is_legacy_v11 else 0.5
+    if not (0.0 <= float(args.interior_uniform_weight) <= 1.0):
+        p.error("--interior-uniform-weight must lie in [0, 1]")
+    if args.diverse_spatial_grid is None:
+        args.diverse_spatial_grid = not is_legacy_v11
+    if args.reject_joint_empty is None:
+        args.reject_joint_empty = not is_legacy_v11
     if args.differentiable_phase_c_reuse and not (
         args.gkl_joint_grad_continuation_20ep
         or args.gkl_masking_continuation_20ep
@@ -574,7 +609,16 @@ def parse_args(argv=None):
         args.mask_pattern_weights = dict(DEFAULT_PATTERN_WEIGHTS)
     else:
         args.mask_pattern_weights = parse_pattern_weights(args.mask_patterns)
-    args.masking_version = MASKING_VERSION
+    args.masking_version = (
+        LEGACY_MASKING_VERSION_V11
+        if (
+            args.masking_sampler == "legacy_v11"
+            and float(args.interior_uniform_weight) == 0.0
+            and not bool(args.diverse_spatial_grid)
+            and not bool(args.reject_joint_empty)
+        )
+        else GENERAL_MASKING_VERSION_V12
+    )
     split_metadata = fixed_split_metadata()
     args.split_path = split_metadata["path"]
     args.split_sha256 = split_metadata["sha256"]
@@ -1218,6 +1262,10 @@ def init_wandb(
 RESUME_PARAMETER_KEYS = (
     "model_version",
     "masking_version",
+    "masking_sampler",
+    "interior_uniform_weight",
+    "diverse_spatial_grid",
+    "reject_joint_empty",
     "h5_dir",
     "betas",
     "delta_t",
@@ -2536,7 +2584,11 @@ def sample_training_mask(y, pattern_weights, density_p_zero, density_p_full,
                          temporal_extrapolation=False,
                          temporal_extrapolation_only=False,
                          grid_match_prob: float = 0.0,
-                         grid_match_mode: str = "checkerboard_shared"):
+                         grid_match_mode: str = "checkerboard_shared",
+                         interior_uniform_weight: float = 0.0,
+                         diverse_spatial_grid: bool = False,
+                         reject_joint_empty: bool = False,
+                         _max_empty_retries: int = 32):
     """Shared existing mask sampling for the ordinary pass and rollout pass."""
     batch_size, _, time_steps, nx, nz = y.shape
     spatial_sites = nx * nz
@@ -2564,6 +2616,7 @@ def sample_training_mask(y, pattern_weights, density_p_zero, density_p_full,
                 c = sample_training_severity_counts(
                     [m_pat], spatial_sites=spatial_sites, time_steps=time_steps,
                     p_zero=magnetic_p_zero, p_full=magnetic_p_full,
+                    interior_uniform_weight=interior_uniform_weight,
                 )[0]
                 magnetic_counts[i] = c
                 density_counts[i] = c
@@ -2572,10 +2625,12 @@ def sample_training_mask(y, pattern_weights, density_p_zero, density_p_full,
                 magnetic_counts[i] = sample_training_severity_counts(
                     [m_pat], spatial_sites=spatial_sites, time_steps=time_steps,
                     p_zero=magnetic_p_zero, p_full=magnetic_p_full,
+                    interior_uniform_weight=interior_uniform_weight,
                 )[0]
                 density_counts[i] = sample_training_severity_counts(
                     [d_pat], spatial_sites=spatial_sites, time_steps=time_steps,
                     p_zero=density_p_zero, p_full=density_p_full,
+                    interior_uniform_weight=interior_uniform_weight,
                 )[0]
 
         for patterns, counts, fractions, modality in (
@@ -2588,7 +2643,8 @@ def sample_training_mask(y, pattern_weights, density_p_zero, density_p_full,
             y.shape, magnetic_patterns=magnetic_patterns, density_patterns=density_patterns,
             magnetic_mask_fractions=magnetic_fractions, density_mask_fractions=density_fractions,
             device=y.device, dtype=y.dtype, density_probe_counts=density_counts,
-            magnetic_visible_counts=magnetic_counts)
+            magnetic_visible_counts=magnetic_counts,
+            diverse_spatial_grid=diverse_spatial_grid)
     else:
         magnetic_patterns = sample_patterns(pattern_weights, batch_size)
         density_patterns = sample_patterns(pattern_weights, batch_size)
@@ -2596,10 +2652,12 @@ def sample_training_mask(y, pattern_weights, density_p_zero, density_p_full,
         density_fractions = torch.rand(batch_size).tolist()
         density_counts = sample_training_severity_counts(
             density_patterns, spatial_sites=spatial_sites, time_steps=time_steps,
-            p_zero=density_p_zero, p_full=density_p_full)
+            p_zero=density_p_zero, p_full=density_p_full,
+            interior_uniform_weight=interior_uniform_weight)
         magnetic_counts = sample_training_severity_counts(
             magnetic_patterns, spatial_sites=spatial_sites, time_steps=time_steps,
-            p_zero=magnetic_p_zero, p_full=magnetic_p_full)
+            p_zero=magnetic_p_zero, p_full=magnetic_p_full,
+            interior_uniform_weight=interior_uniform_weight)
         for patterns, counts, fractions, modality in (
             (density_patterns, density_counts, density_fractions, "Density"),
             (magnetic_patterns, magnetic_counts, magnetic_fractions, "magnetic"),
@@ -2610,7 +2668,8 @@ def sample_training_mask(y, pattern_weights, density_p_zero, density_p_full,
             y.shape, magnetic_patterns=magnetic_patterns, density_patterns=density_patterns,
             magnetic_mask_fractions=magnetic_fractions, density_mask_fractions=density_fractions,
             device=y.device, dtype=y.dtype, density_probe_counts=density_counts,
-            magnetic_visible_counts=magnetic_counts)
+            magnetic_visible_counts=magnetic_counts,
+            diverse_spatial_grid=diverse_spatial_grid)
     if temporal_extrapolation or temporal_extrapolation_only:
         if sample_training_patterns is not None:
             for i in range(batch_size):
@@ -2700,6 +2759,38 @@ def sample_training_mask(y, pattern_weights, density_p_zero, density_p_full,
                 density_counts[i] = cd
                 magnetic_fractions[i] = 1.0 - cm / float(spatial_sites)
                 density_fractions[i] = 1.0 - cd / float(spatial_sites)
+    if reject_joint_empty:
+        for i in range(batch_size):
+            if bool((mask[i] > 0.5).any().item()):
+                continue
+            for _attempt in range(_max_empty_retries):
+                (
+                    r_mask, r_infos, r_mp, r_dp, r_mf, r_df, r_mc, r_dc,
+                ) = sample_training_mask(
+                    y[i : i + 1],
+                    pattern_weights,
+                    density_p_zero,
+                    density_p_full,
+                    magnetic_p_zero,
+                    magnetic_p_full,
+                    temporal_extrapolation=temporal_extrapolation,
+                    temporal_extrapolation_only=temporal_extrapolation_only,
+                    grid_match_prob=grid_match_prob,
+                    grid_match_mode=grid_match_mode,
+                    interior_uniform_weight=interior_uniform_weight,
+                    diverse_spatial_grid=diverse_spatial_grid,
+                    reject_joint_empty=False,
+                )
+                if bool((r_mask[0] > 0.5).any().item()):
+                    mask[i] = r_mask[0]
+                    infos[i] = r_infos[0]
+                    magnetic_patterns[i] = r_mp[0]
+                    density_patterns[i] = r_dp[0]
+                    magnetic_fractions[i] = r_mf[0]
+                    density_fractions[i] = r_df[0]
+                    magnetic_counts[i] = r_mc[0]
+                    density_counts[i] = r_dc[0]
+                    break
     return (mask, infos, magnetic_patterns, density_patterns, magnetic_fractions,
             density_fractions, magnetic_counts, density_counts)
 
@@ -3456,6 +3547,9 @@ def train_one_epoch(
     reconstruction_loss_weighting: str = "group_balanced",
     grid_match_prob: float = 0.0,
     grid_match_mode: str = "checkerboard_shared",
+    interior_uniform_weight: float = 0.0,
+    diverse_spatial_grid: bool = False,
+    reject_joint_empty: bool = False,
 ) -> Dict[str, Any]:
     model.train()
     is_gkl = gkl_continuation_20ep or gkl_joint_grad_continuation_20ep
@@ -3581,7 +3675,10 @@ def train_one_epoch(
             temporal_extrapolation_continuation,
             temporal_extrapolation_only_continuation,
             grid_match_prob=grid_match_prob,
-            grid_match_mode=grid_match_mode)
+            grid_match_mode=grid_match_mode,
+            interior_uniform_weight=interior_uniform_weight,
+            diverse_spatial_grid=diverse_spatial_grid,
+            reject_joint_empty=reject_joint_empty)
         for pattern, count in zip(density_patterns, density_visible_counts):
             if pattern not in PROBE_COUNT_PATTERNS:
                 continue
@@ -3635,6 +3732,9 @@ def train_one_epoch(
                     temporal_extrapolation_only_continuation,
                     grid_match_prob=grid_match_prob,
                     grid_match_mode=grid_match_mode,
+                    interior_uniform_weight=interior_uniform_weight,
+                    diverse_spatial_grid=diverse_spatial_grid,
+                    reject_joint_empty=reject_joint_empty,
                 )[0]
                 for _ in range(reuse_steps)
             ) if lambda_r > 0 and not phase_d_active else None)
@@ -5313,6 +5413,9 @@ def main():
             ),
             grid_match_prob=float(getattr(args, "grid_match_prob", 0.0)),
             grid_match_mode=str(getattr(args, "grid_match_mode", "checkerboard_shared")),
+            interior_uniform_weight=float(getattr(args, "interior_uniform_weight", 0.0)),
+            diverse_spatial_grid=bool(getattr(args, "diverse_spatial_grid", False)),
+            reject_joint_empty=bool(getattr(args, "reject_joint_empty", False)),
         )
 
         rollout_validation = bool(

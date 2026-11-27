@@ -722,8 +722,8 @@ if ${STAGE1_NLL} || ${CURRICULUM}; then
                 --wandb-tags from-scratch global-cosine-2e4-1e5 48h
             )
             if ${ADAPTIVE_PHASE_D_SLIDING}; then
-                TRAIN_ARGS+=(four-phase adaptive-abcd-sliding joint-gkl-gradient differentiable-phase-c-reuse channel-equal grid-match-15)
-                TRAIN_ARGS+=(--joint-nll-grad --differentiable-phase-c-reuse --adaptive-phase-d-sliding --slide-ramp-epochs 40.0 --reconstruction-loss-weighting channel_equal --grid-match-prob 0.15 --grid-match-mode checkerboard_shared)
+                TRAIN_ARGS+=(four-phase adaptive-abcd-sliding joint-gkl-gradient differentiable-phase-c-reuse channel-equal general-masking-v12)
+                TRAIN_ARGS+=(--joint-nll-grad --differentiable-phase-c-reuse --adaptive-phase-d-sliding --slide-ramp-epochs 40.0 --reconstruction-loss-weighting channel_equal --masking-sampler general_v12 --grid-match-prob 0.0)
             elif ${FRESH_GKL_JOINT_GRAD}; then
                 TRAIN_ARGS+=(three-phase k1-reuse joint-gkl-gradient differentiable-phase-c-reuse no-phase-d)
                 TRAIN_ARGS+=(--joint-nll-grad --differentiable-phase-c-reuse)
